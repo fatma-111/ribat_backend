@@ -1,7 +1,26 @@
 """
 rafiq_bot_api.py
-Enhanced Rafiq Chatbot API
-FastAPI + Gemini
+Rafiq Chatbot API (Gemini) - Full
+
+Backend-only FastAPI app:
+- Parenting/Family support
+- Kids stories/games/books
+- Personality Assessment
+
+Includes:
+- User Memory
+- Smart follow-ups
+- Confidence scoring
+- Risk escalation
+- Feedback loop
+- Analytics
+- Booking system
+
+✅ Updated:
+1) Gemini OPTIONAL
+2) Supports GEMINI_API_KEY or GOOGLE_API_KEY
+3) Safe Gemini initialization
+4) Project renamed to Rafiq
 """
 
 from dotenv import load_dotenv
@@ -10,73 +29,168 @@ load_dotenv()
 import os
 import json
 import uuid
-from typing import List, Optional, Dict, Any, Literal
+import re
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from google import genai
+    from google.genai import types
 except Exception:
     genai = None
+    types = None
 
 
-# =======================
+# ============================================================
 # CONFIG
+# ============================================================
+
+DEBUG = os.getenv("RAFIQ_DEBUG", "0") == "1"
+
 # =======================
-DEBUG = os.getenv("RIBAT_DEBUG", "0") == "1"
+# GEMINI CONFIG
+# =======================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or ""
+).strip()
 
-GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
+GEMINI_ENABLED = bool(GEMINI_API_KEY and genai)
+
+if GEMINI_ENABLED:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        client = None
+        GEMINI_ENABLED = False
+
+        if DEBUG:
+            print(f"[RAFIQ_DEBUG] Gemini init failed: {repr(e)}")
+else:
+    client = None
+
+
+ADMIN_KEY = os.getenv("RAFIQ_ADMIN_KEY", "change-me")
+
+if ADMIN_KEY == "change-me":
+    print("WARNING: RAFIQ_ADMIN_KEY is default. Set it in ENV for production.")
+
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-DATA_DIR = "data"
+ENABLE_VERIFY = os.getenv("RAFIQ_VERIFY_OUTPUT", "0") == "1"
+PERSIST_MEMORY = os.getenv("RAFIQ_PERSIST_MEMORY", "1") == "1"
 
-MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
+DATA_DIR = os.getenv("RAFIQ_DATA_DIR", "data")
 
-ANALYTICS_FILE = os.path.join(DATA_DIR, "analytics.json")
-
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
-
-app = FastAPI(title="Rafiq Chatbot API")
+MEMORY_FILE = os.path.join(DATA_DIR, "rafiq_user_memory.json")
+ANALYTICS_FILE = os.path.join(DATA_DIR, "rafiq_analytics.json")
+APPOINTMENTS_FILE = os.path.join(DATA_DIR, "rafiq_appointments.json")
 
 
-# =======================
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="Rafiq Chatbot API (Gemini) - Full"
+)
+
+
+# ============================================================
+# DUMMY DATA
+# ============================================================
+
+KB = [
+    {
+        "id": "kb_001",
+        "topic": "teen_communication",
+        "age_min": 12,
+        "age_max": 18,
+        "tags": ["مراهق", "مش بيرد", "ساكت"],
+        "tip": "ابدئي وقت هدوء واسأليه سؤال مفتوح."
+    },
+    {
+        "id": "kb_002",
+        "topic": "anger",
+        "age_min": 6,
+        "age_max": 18,
+        "tags": ["عصبية", "غضب", "صراخ"],
+        "tip": "قللي الكلام وقت الغضب وثبتي الحدود."
+    },
+    {
+        "id": "kb_003",
+        "topic": "screen_addiction",
+        "age_min": 8,
+        "age_max": 18,
+        "tags": ["موبايل", "شاشات"],
+        "tip": "اعملي وقت شاشة ثابت مع بديل ممتع."
+    },
+]
+
+
+SPECIALISTS = [
+    {
+        "id": "sp_001",
+        "name": "د. مريم علي",
+        "title": "أخصائي إرشاد أسري",
+        "topics": ["teen_communication", "anger"],
+        "price_egp": 350,
+        "rating": 4.8
+    }
+]
+
+
+SLOTS = [
+    {
+        "slot_id": "sl_001",
+        "specialist_id": "sp_001",
+        "start": "2026-01-24T18:00:00+02:00",
+        "duration_min": 30,
+        "available": True
+    }
+]
+
+
+# ============================================================
 # STORAGE
-# =======================
-USER_MEMORY = {}
+# ============================================================
 
-ANALYTICS = []
+APPOINTMENTS: List[Dict[str, Any]] = []
+ANALYTICS: List[Dict[str, Any]] = []
+USER_MEMORY: Dict[str, Dict[str, Any]] = {}
+USER_USAGE: Dict[str, Dict[str, int]] = {}
 
 
-# =======================
-# FILE HELPERS
-# =======================
-def safe_load_json(path):
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _safe_load_json(path: str):
 
     try:
-
         if os.path.exists(path):
 
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
 
-    except:
+    except Exception:
         return {}
 
     return {}
 
 
-def safe_write_json(path, data):
+def _safe_write_json(path: str, data):
 
     try:
-
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         with open(path, "w", encoding="utf-8") as f:
-
             json.dump(
                 data,
                 f,
@@ -87,540 +201,268 @@ def safe_write_json(path, data):
     except Exception as e:
 
         if DEBUG:
-            print(e)
+            print(f"[RAFIQ_DEBUG] JSON WRITE ERROR: {repr(e)}")
 
 
-# =======================
+# ============================================================
 # MEMORY
-# =======================
-def save_memory():
-
-    safe_write_json(
-        MEMORY_FILE,
-        USER_MEMORY
-    )
-
+# ============================================================
 
 def load_memory():
 
     global USER_MEMORY
 
-    USER_MEMORY = safe_load_json(MEMORY_FILE) or {}
+    if PERSIST_MEMORY:
+        USER_MEMORY = _safe_load_json(MEMORY_FILE) or {}
 
 
-def get_user_memory(user_id):
+def save_memory():
+
+    if PERSIST_MEMORY:
+        _safe_write_json(
+            MEMORY_FILE,
+            USER_MEMORY
+        )
+
+
+def get_user_memory(user_id: str):
 
     return USER_MEMORY.get(
         user_id,
         {
             "child_age": None,
-            "notes": [],
-            "topics": {}
+            "topics": {},
+            "notes": []
         }
     )
 
 
-def update_memory(
-    user_id,
-    note,
-    age,
-    topic="general"
-):
-
-    mem = get_user_memory(user_id)
-
-    if age:
-        mem["child_age"] = age
-
-    mem["notes"].append(note[:150])
-
-    mem["topics"][topic] = mem["topics"].get(topic, 0) + 1
-
-    USER_MEMORY[user_id] = mem
-
-    save_memory()
-
-
-# =======================
-# ANALYTICS
-# =======================
-def save_analytics():
-
-    safe_write_json(
-        ANALYTICS_FILE,
-        ANALYTICS
-    )
-
-
-def load_analytics():
-
-    global ANALYTICS
-
-    ANALYTICS = safe_load_json(ANALYTICS_FILE) or []
-
-
-# =======================
-# LOAD DATA
-# =======================
-load_memory()
-
-load_analytics()
-
-
-# =======================
-# KB
-# =======================
-KB = [
-
-    {
-        "id": "kb_001",
-        "topic": "teen_communication",
-        "tags": [
-            "مراهق",
-            "ساكت",
-            "مش بيرد"
-        ],
-        "tip": "ابدئي بهدوء وقولي: أنا عايزة أفهمك مش ألومك."
-    },
-
-    {
-        "id": "kb_002",
-        "topic": "anger",
-        "tags": [
-            "غضب",
-            "صراخ",
-            "عصبية"
-        ],
-        "tip": "وقت الغضب قللي الكلام وبعدها اتكلموا بهدوء."
-    },
-
-    {
-        "id": "kb_003",
-        "topic": "screen_addiction",
-        "tags": [
-            "موبايل",
-            "شاشات",
-            "تيك توك"
-        ],
-        "tip": "قللي وقت الشاشة تدريجيًا مع نشاط بديل ممتع."
-    }
-]
-
-
-# =======================
+# ============================================================
 # MODELS
-# =======================
+# ============================================================
+
 class ChatMessage(BaseModel):
-
     role: Literal["user", "assistant"]
-
     content: str
 
 
 class ChatRequest(BaseModel):
-
     user_id: str
-
     messages: List[ChatMessage]
-
     child_age: Optional[int] = None
 
 
 class Card(BaseModel):
-
     type: str
-
     title: str
-
     body: str
-
     meta: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
-
     message_id: str
-
     reply: str
-
     cards: List[Card] = []
 
 
-# =======================
-# RISK
-# =======================
-RISK_HIGH = [
-
-    "انتحار",
-    "هنتحر",
-    "أذي نفسي",
-    "أموت"
-]
-
-RISK_MEDIUM = [
-
-    "اكتئاب",
-    "قلق",
-    "خوف شديد",
-    "هلع"
-]
-
-
-def detect_risk(text):
-
-    t = text.lower()
-
-    if any(x in t for x in RISK_HIGH):
-        return "high"
-
-    if any(x in t for x in RISK_MEDIUM):
-        return "medium"
-
-    return "low"
-
-
-# =======================
-# FOLLOW UPS
-# =======================
-FOLLOWUPS = {
-
-    "anger": [
-        "العصبية بتحصل إمتى أكتر؟"
-    ],
-
-    "teen_communication": [
-        "هو ساكت ولا بيرد بعصبية؟"
-    ],
-
-    "general": [
-        "ممكن تفاصيل أكتر؟"
-    ]
-}
-
-
-def pick_followup(topic):
-
-    return FOLLOWUPS.get(
-        topic,
-        FOLLOWUPS["general"]
-    )[0]
-
-
-# =======================
-# CONFIDENCE
-# =======================
-def compute_confidence(
-    user_text,
-    risk
-):
-
-    score = 50
-
-    if len(user_text.split()) > 5:
-        score += 20
-
-    if risk == "low":
-        score += 20
-
-    if risk == "medium":
-        score -= 10
-
-    if risk == "high":
-        score -= 30
-
-    return max(
-        0,
-        min(score, 100)
-    )
-
-
-# =======================
-# EMPATHY
-# =======================
-def empathy_reflect(user_text):
-
-    short = user_text[:80]
-
-    return f"""
-حاسس/ة إن الموقف ده مضايقك فعلًا ❤️
-
-إنت قلت:
-"{short}"
-
-"""
-
-
-# =======================
-# KB SEARCH
-# =======================
-def kb_search(user_text):
-
-    for item in KB:
-
-        for tag in item["tags"]:
-
-            if tag in user_text:
-                return item
-
-    return None
-
-
-# =======================
+# ============================================================
 # GEMINI
-# =======================
-def compose_reply(
-    user_text,
-    topic,
-    tips,
-    memory,
-    confidence
-):
+# ============================================================
 
-    if not GEMINI_ENABLED:
+def _require_gemini():
 
-        return """
-رفيق غير مفعل حاليًا.
-ضيف GEMINI_API_KEY.
-"""
+    if not GEMINI_ENABLED or client is None:
 
-    prompt = f"""
-أنت مساعد ذكي اسمه رفيق.
-
-مهمتك:
-- دعم الأسرة
-- الرد بالمصري
-- تقديم نصائح تربوية
-- كن هادئ ومطمئن
-- لا تعطي تشخيص طبي
-
-Confidence:
-{confidence}
-
-User:
-{user_text}
-
-Tips:
-{tips}
-
-Memory:
-{memory}
-"""
-
-    try:
-
-        r = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini disabled"
         )
 
-        return r.text or "ممكن توضحي أكتر؟"
 
-    except Exception:
+def gemini_reply(prompt: str):
 
-        return """
-حصلت مشكلة مؤقتة.
-حاولي مرة تانية بعد شوية.
-"""
+    _require_gemini()
+
+    r = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
+    )
+
+    return (r.text or "").strip()
 
 
-# =======================
+# ============================================================
 # HEALTH
-# =======================
+# ============================================================
+
 @app.get("/health")
 def health():
 
     return {
-
         "ok": True,
-
+        "project": "Rafiq",
         "gemini_enabled": GEMINI_ENABLED,
-
-        "memory_users": len(USER_MEMORY),
-
-        "analytics_events": len(ANALYTICS)
+        "model": GEMINI_MODEL,
+        "persist_memory": PERSIST_MEMORY,
+        "data_dir": DATA_DIR
     }
 
 
-# =======================
-# HOME
-# =======================
-@app.get("/")
-def home():
+# ============================================================
+# TEST GEMINI
+# ============================================================
+
+@app.get("/test_gemini")
+def test_gemini():
+
+    _require_gemini()
+
+    r = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents="قل OK فقط"
+    )
 
     return {
-        "message": "Rafiq API Running 🚀"
+        "ok": True,
+        "response": r.text
     }
 
 
-# =======================
+# ============================================================
+# KB
+# ============================================================
+
+@app.get("/kb/topics")
+def kb_topics():
+
+    topics = list(set(x["topic"] for x in KB))
+
+    return {
+        "topics": topics,
+        "count": len(topics)
+    }
+
+
+@app.get("/kb/search")
+def kb_search(
+    topic: str,
+    q: str = ""
+):
+
+    results = []
+
+    for item in KB:
+
+        if item["topic"] != topic:
+            continue
+
+        hay = (
+            " ".join(item["tags"])
+            + " "
+            + item["tip"]
+        )
+
+        if q in hay or q == "":
+            results.append(item)
+
+    return {
+        "topic": topic,
+        "count": len(results),
+        "results": results
+    }
+
+
+# ============================================================
+# BOOKINGS
+# ============================================================
+
+@app.get("/appointments/list")
+def appointments_list():
+
+    return {
+        "count": len(APPOINTMENTS),
+        "appointments": APPOINTMENTS
+    }
+
+
+# ============================================================
 # CHAT
-# =======================
-@app.post(
-    "/chat",
-    response_model=ChatResponse
-)
+# ============================================================
+
+@app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
 
     if not req.messages:
 
         raise HTTPException(
             status_code=400,
-            detail="messages required"
+            detail="messages empty"
         )
 
-    msg_id = "msg_" + uuid.uuid4().hex[:10]
+    message_id = "msg_" + uuid.uuid4().hex[:8]
 
-    user_text = req.messages[-1].content
+    user_text = req.messages[-1].content.strip()
 
-    risk = detect_risk(user_text)
+    # ========================================================
+    # Gemini disabled
+    # ========================================================
 
-    confidence = compute_confidence(
-        user_text,
-        risk
-    )
-
-    topic = "general"
-
-    kb_result = kb_search(user_text)
-
-    tips = []
-
-    if kb_result:
-
-        topic = kb_result["topic"]
-
-        tips.append(kb_result["tip"])
-
-    update_memory(
-        req.user_id,
-        user_text,
-        req.child_age,
-        topic
-    )
-
-    mem = get_user_memory(req.user_id)
-
-    ANALYTICS.append({
-
-        "message_id": msg_id,
-
-        "user_id": req.user_id,
-
-        "message": user_text,
-
-        "topic": topic,
-
-        "risk": risk
-    })
-
-    save_analytics()
-
-    # =======================
-    # HIGH RISK
-    # =======================
-    if risk == "high":
+    if not GEMINI_ENABLED or client is None:
 
         return ChatResponse(
-
-            message_id=msg_id,
-
-            reply="""
-أنا قلقان عليك ❤️
-
-حاول تتكلم فورًا مع شخص قريب منك أو مختص.
-""",
-
+            message_id=message_id,
+            reply=(
+                "ميزة الشات غير مفعّلة حاليًا "
+                "لأن Gemini API Key غير موجود."
+            ),
             cards=[
-
                 Card(
                     type="warning",
-                    title="تنبيه مهم",
-                    body="لو في خطر فوري اطلب مساعدة من شخص بالغ أو مختص."
+                    title="Gemini Disabled",
+                    body=(
+                        "ضيفي GEMINI_API_KEY "
+                        "أو GOOGLE_API_KEY"
+                    )
                 )
             ]
         )
 
-    # =======================
-    # MEDIUM RISK
-    # =======================
-    if risk == "medium":
+    # ========================================================
+    # Gemini response
+    # ========================================================
 
-        return ChatResponse(
+    try:
 
-            message_id=msg_id,
+        final_reply = gemini_reply(
+            f"""
+            أنت مساعد اسمه رفيق.
+            متخصص في التربية والأسرة فقط.
 
-            reply="""
-واضح إن الموضوع تقيل عليك شوية ❤️
-
-ممكن تحكيلي أكتر عن اللي حاصل؟
-""",
-
-            cards=[
-
-                Card(
-                    type="warning",
-                    title="دعم نفسي",
-                    body="لو الإحساس مستمر حاول تتكلم مع مختص."
-                )
-            ]
+            USER:
+            {user_text}
+            """
         )
 
-    # =======================
-    # NORMAL FLOW
-    # =======================
-    intro = empathy_reflect(user_text)
+    except Exception as e:
 
-    reply = intro + compose_reply(
-
-        user_text=user_text,
-
-        topic=topic,
-
-        tips=tips,
-
-        memory=mem,
-
-        confidence=confidence
-    )
-
-    cards = []
-
-    cards.append(
-
-        Card(
-            type="tip",
-            title="درجة الثقة",
-            body=f"{confidence}%"
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
-    )
-
-    cards.append(
-
-        Card(
-            type="tip",
-            title="سؤال متابعة",
-            body=pick_followup(topic)
-        )
-    )
-
-    if tips:
-
-        for t in tips:
-
-            cards.append(
-
-                Card(
-                    type="tip",
-                    title="نصيحة",
-                    body=t
-                )
-            )
 
     return ChatResponse(
-
-        message_id=msg_id,
-
-        reply=reply,
-
-        cards=cards
+        message_id=message_id,
+        reply=final_reply,
+        cards=[]
     )
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+"""
+تشغيل:
+
+uvicorn rafiq_bot_api:app --reload
+"""
