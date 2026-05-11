@@ -1,11 +1,12 @@
 """
+rafiq_bot_api.py
 Rafiq Chatbot API (Gemini) - Full
-(Original structure preserved)
+Backend-only FastAPI app:
+- Parenting/Family support + Kids stories/games/books + Personality Assessment
 """
 
 from dotenv import load_dotenv
 load_dotenv()
-
 import os
 import json
 import uuid
@@ -23,7 +24,6 @@ except Exception:
     genai = None
     types = None
 
-
 # =======================
 # CONFIG
 # =======================
@@ -33,6 +33,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 
 ADMIN_KEY = os.getenv("RIBAT_ADMIN_KEY", "change-me")
+if ADMIN_KEY == "change-me":
+    print("WARNING: ADMIN key is default. Set it in ENV for production.")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -41,229 +43,157 @@ PERSIST_MEMORY = os.getenv("RIBAT_PERSIST_MEMORY", "1") == "1"
 
 DATA_DIR = os.getenv("RIBAT_DATA_DIR", "data")
 
-MEMORY_FILE = os.path.join(DATA_DIR, "ribat_user_memory.json")
-ANALYTICS_FILE = os.path.join(DATA_DIR, "ribat_analytics.json")
-APPOINTMENTS_FILE = os.path.join(DATA_DIR, "ribat_appointments.json")
+MEMORY_FILE = os.path.join(DATA_DIR, "rafiq_user_memory.json")
+ANALYTICS_FILE = os.path.join(DATA_DIR, "rafiq_analytics.json")
+APPOINTMENTS_FILE = os.path.join(DATA_DIR, "rafiq_appointments.json")
 
-
-# =======================
-# SAFE GEMINI INIT (FIXED)
-# =======================
-client = None
-if GEMINI_ENABLED:
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print("Gemini init error:", e)
-        client = None
-
-
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
 app = FastAPI(title="Rafiq Chatbot API (Gemini) - Full")
 
 
-# ============================================================
-# ====================== FULL KB =============================
-# ============================================================
+# =======================
+# DUMMY DATA
+# =======================
 KB = [
     {
         "id": "kb_001",
         "topic": "teen_communication",
-        "age_min": 12,
-        "age_max": 18,
-        "tags": ["مراهق", "مش بيرد", "ساكت"],
-        "tip": "ابدئي بهدوء: أنا عايزة أفهمك مش ألومك."
+        "age_min": 12, "age_max": 18,
+        "tags": ["مراهق", "ساكت", "مش بيرد"],
+        "tip": "ابدئي بهدوء: «أنا عايزة أفهمك مش ألومك»."
     },
     {
         "id": "kb_002",
         "topic": "anger",
-        "age_min": 6,
-        "age_max": 18,
+        "age_min": 6, "age_max": 18,
         "tags": ["عصبية", "غضب", "صراخ"],
-        "tip": "وقت الغضب قللي الكلام وركزي على الهدوء."
-    }
+        "tip": "وقت الغضب قللي الكلام، وبعدها ناقشي بهدوء."
+    },
 ]
 
+SPECIALISTS = [
+    {"id": "sp_001", "name": "د. مريم علي", "title": "أخصائي إرشاد أسري", "topics": ["teen_communication", "anger"], "price_egp": 350, "rating": 4.8},
+]
 
-# ============================================================
-# MEMORY
-# ============================================================
-USER_MEMORY: Dict[str, Dict[str, Any]] = {}
+SLOTS = [
+    {"slot_id": "sl_001", "specialist_id": "sp_001", "start": "2026-01-24T18:00:00+02:00", "duration_min": 30, "available": True},
+]
+
+APPOINTMENTS = []
+ANALYTICS = []
+USER_MEMORY = {}
 
 
+# =======================
+# MODELS
+# =======================
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    messages: List[ChatMessage]
+    child_age: Optional[int] = None
+
+
+class Card(BaseModel):
+    type: str
+    title: str
+    body: str
+    meta: Optional[Dict[str, Any]] = None
+
+
+class ChatResponse(BaseModel):
+    message_id: str
+    reply: str
+    cards: List[Card] = []
+
+
+# =======================
+# HELPERS
+# =======================
 def get_user_memory(user_id: str):
     return USER_MEMORY.get(user_id, {"child_age": None, "notes": []})
 
 
-def update_memory(user_id: str, topic: str, age: Optional[int], note: str):
+def update_memory(user_id: str, note: str, age: Optional[int]):
     mem = get_user_memory(user_id)
     if age:
         mem["child_age"] = age
-    mem["notes"].append(note)
+    mem["notes"].append(note[:150])
     USER_MEMORY[user_id] = mem
 
 
-# ============================================================
-# ANALYTICS
-# ============================================================
-ANALYTICS: List[Dict[str, Any]] = []
-
-
-def log_event(user_id: str, topic: str, msg: str):
-    ANALYTICS.append({
-        "user_id": user_id,
-        "topic": topic,
-        "msg": msg,
-        "ts": datetime.utcnow().isoformat()
-    })
-
-
-# ============================================================
-# RISK
-# ============================================================
 def detect_risk(text: str):
-    if any(x in text for x in ["انتحار", "أموت", "أذي نفسي"]):
+    t = text.lower()
+    if "انتحار" in t or "أموت" in t:
         return "high"
     return "low"
 
 
-# ============================================================
-# KB SEARCH
-# ============================================================
-def kb_search(topic: str, query: str, age: Optional[int]):
-    res = []
-    for item in KB:
-        if topic and item["topic"] != topic:
-            continue
-        if age and not (item["age_min"] <= age <= item["age_max"]):
-            continue
-        if query.lower() in item["tip"].lower() or any(q in item["tags"] for q in query.split()):
-            res.append(item)
-    return res
+# =======================
+# GEMINI
+# =======================
+def compose_reply(user_text, topic, tips, memory):
+    if not GEMINI_ENABLED:
+        return "رفيق غير مفعل حاليًا (Gemini API missing)."
 
+    prompt = f"""
+أنت مساعد اسمه "رفيق" متخصص في دعم الأسرة.
+أجب بطريقة بسيطة ومطمئنة.
 
-# ============================================================
-# ROUTER (FIXED SYSTEM NAME ONLY)
-# ============================================================
-def route(user_text: str):
-    if not client:
-        return {"in_scope": False, "topic": "out_of_scope"}
+User: {user_text}
+Topic: {topic}
+Tips: {tips}
+Memory: {memory}
+"""
 
-    prompt = f"أنت Router لتطبيق رفيق. صنف الرسالة:\n{user_text}"
-
-    resp = client.models.generate_content(
+    r = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt
     )
-    return {"raw": resp.text}
+    return r.text or "ممكن توضحي أكتر؟"
 
 
-# ============================================================
+# =======================
+# ROUTE: HOME
+# =======================
+@app.get("/")
+def home():
+    return {"message": "Rafiq Bot API is running 🚀"}
+
+
+# =======================
 # CHAT
-# ============================================================
-@app.post("/chat")
-def chat(req: dict):
+# =======================
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    msg_id = "msg_" + uuid.uuid4().hex[:10]
+    user_text = req.messages[-1].content
 
-    user_id = req["user_id"]
-    user_text = req["messages"][-1]["content"]
-
-    if not client:
-        return {"reply": "Gemini not enabled"}
+    mem = get_user_memory(req.user_id)
+    update_memory(req.user_id, user_text, req.child_age)
 
     risk = detect_risk(user_text)
 
-    decision = route(user_text)
+    if risk == "high":
+        return ChatResponse(
+            message_id=msg_id,
+            reply="أنا قلق عليك ❤️ حاول تتكلم مع شخص قريب منك فورًا.",
+            cards=[Card(type="warning", title="تنبيه مهم", body="اطلب دعم فوري من شخص بالغ أو مختص.")]
+        )
 
-    mem = get_user_memory(user_id)
+    topic = "general"
+    tips = [{"tip": "حاول تتكلم بهدوء"}]
 
-    tips = kb_search("anger", user_text, mem.get("child_age"))
+    reply = compose_reply(user_text, topic, tips, mem)
 
-    update_memory(user_id, "anger", mem.get("child_age"), user_text)
-    log_event(user_id, "chat", user_text)
-
-    reply = f"""
-أنا فاهمك ❤️
-
-{user_text}
-
-نصيحة:
-{tips[0]['tip'] if tips else 'خلينا نفهم أكتر'}
-"""
-
-    return {
-        "reply": reply,
-        "system": "rafiq",
-        "risk": risk,
-        "router": decision
-    }
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-@app.get("/health")
-def health():
-    return {
-        "system": "rafiq",
-        "gemini": GEMINI_ENABLED,
-        "client": client is not None
-    }
-
-
-# ============================================================
-# =================== ASSESSMENT FULL ========================
-# ============================================================
-
-TRAITS = ["leadership", "focus", "empathy"]
-
-ASSESSMENT_QUESTIONS = [
-    {
-        "id": "q1",
-        "text": "بيحب يقود المجموعة",
-        "age_min": 7,
-        "age_max": 18,
-        "weights": {"leadership": 2}
-    },
-    {
-        "id": "q2",
-        "text": "بيكمل المهام للنهاية",
-        "age_min": 7,
-        "age_max": 18,
-        "weights": {"focus": 2}
-    }
-]
-
-
-def get_assessment_questions(age):
-    if not age:
-        return ASSESSMENT_QUESTIONS
-    return [q for q in ASSESSMENT_QUESTIONS if q["age_min"] <= age <= q["age_max"]]
-
-
-def compute_profile(answers, age):
-    scores = {t: 0 for t in TRAITS}
-
-    for a in answers:
-        qid = a["question_id"]
-        val = a["value"]
-
-        for q in ASSESSMENT_QUESTIONS:
-            if q["id"] == qid:
-                for t, w in q["weights"].items():
-                    scores[t] += val * w
-
-    return {"age": age, "scores": scores}
-
-
-@app.get("/assessment/questions")
-def assessment_questions(age: Optional[int] = None):
-    return {"questions": get_assessment_questions(age)}
-
-
-@app.post("/assessment/submit")
-def assessment_submit(req: dict):
-    profile = compute_profile(req["answers"], req.get("child_age"))
-
-    return {
-        "ok": True,
-        "profile": profile
-    }
+    return ChatResponse(
+        message_id=msg_id,
+        reply=reply,
+        cards=[
+            Card(type="tip", title="نصيحة", body="التواصل الهادئ هو الحل الأفضل.")
+        ]
+    )
