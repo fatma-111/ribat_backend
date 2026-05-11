@@ -1,28 +1,25 @@
 """
 rafiq_bot_api.py
-Rafiq Chatbot API (Gemini) - Full
-Backend-only FastAPI app:
-- Parenting/Family support + Kids stories/games/books + Personality Assessment
+Enhanced Rafiq Chatbot API
+FastAPI + Gemini
 """
 
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import json
 import uuid
-import re
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Literal, Tuple
+from typing import List, Optional, Dict, Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 try:
     from google import genai
-    from google.genai import types
 except Exception:
     genai = None
-    types = None
+
 
 # =======================
 # CONFIG
@@ -30,170 +27,600 @@ except Exception:
 DEBUG = os.getenv("RIBAT_DEBUG", "0") == "1"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 
-ADMIN_KEY = os.getenv("RIBAT_ADMIN_KEY", "change-me")
-if ADMIN_KEY == "change-me":
-    print("WARNING: ADMIN key is default. Set it in ENV for production.")
+GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-ENABLE_VERIFY = os.getenv("RIBAT_VERIFY_OUTPUT", "0") == "1"
-PERSIST_MEMORY = os.getenv("RIBAT_PERSIST_MEMORY", "1") == "1"
+DATA_DIR = "data"
 
-DATA_DIR = os.getenv("RIBAT_DATA_DIR", "data")
+MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")
 
-MEMORY_FILE = os.path.join(DATA_DIR, "rafiq_user_memory.json")
-ANALYTICS_FILE = os.path.join(DATA_DIR, "rafiq_analytics.json")
-APPOINTMENTS_FILE = os.path.join(DATA_DIR, "rafiq_appointments.json")
+ANALYTICS_FILE = os.path.join(DATA_DIR, "analytics.json")
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
-app = FastAPI(title="Rafiq Chatbot API (Gemini) - Full")
+
+app = FastAPI(title="Rafiq Chatbot API")
 
 
 # =======================
-# DUMMY DATA
+# STORAGE
+# =======================
+USER_MEMORY = {}
+
+ANALYTICS = []
+
+
+# =======================
+# FILE HELPERS
+# =======================
+def safe_load_json(path):
+
+    try:
+
+        if os.path.exists(path):
+
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+    except:
+        return {}
+
+    return {}
+
+
+def safe_write_json(path, data):
+
+    try:
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as f:
+
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as e:
+
+        if DEBUG:
+            print(e)
+
+
+# =======================
+# MEMORY
+# =======================
+def save_memory():
+
+    safe_write_json(
+        MEMORY_FILE,
+        USER_MEMORY
+    )
+
+
+def load_memory():
+
+    global USER_MEMORY
+
+    USER_MEMORY = safe_load_json(MEMORY_FILE) or {}
+
+
+def get_user_memory(user_id):
+
+    return USER_MEMORY.get(
+        user_id,
+        {
+            "child_age": None,
+            "notes": [],
+            "topics": {}
+        }
+    )
+
+
+def update_memory(
+    user_id,
+    note,
+    age,
+    topic="general"
+):
+
+    mem = get_user_memory(user_id)
+
+    if age:
+        mem["child_age"] = age
+
+    mem["notes"].append(note[:150])
+
+    mem["topics"][topic] = mem["topics"].get(topic, 0) + 1
+
+    USER_MEMORY[user_id] = mem
+
+    save_memory()
+
+
+# =======================
+# ANALYTICS
+# =======================
+def save_analytics():
+
+    safe_write_json(
+        ANALYTICS_FILE,
+        ANALYTICS
+    )
+
+
+def load_analytics():
+
+    global ANALYTICS
+
+    ANALYTICS = safe_load_json(ANALYTICS_FILE) or []
+
+
+# =======================
+# LOAD DATA
+# =======================
+load_memory()
+
+load_analytics()
+
+
+# =======================
+# KB
 # =======================
 KB = [
+
     {
         "id": "kb_001",
         "topic": "teen_communication",
-        "age_min": 12, "age_max": 18,
-        "tags": ["مراهق", "ساكت", "مش بيرد"],
-        "tip": "ابدئي بهدوء: «أنا عايزة أفهمك مش ألومك»."
+        "tags": [
+            "مراهق",
+            "ساكت",
+            "مش بيرد"
+        ],
+        "tip": "ابدئي بهدوء وقولي: أنا عايزة أفهمك مش ألومك."
     },
+
     {
         "id": "kb_002",
         "topic": "anger",
-        "age_min": 6, "age_max": 18,
-        "tags": ["عصبية", "غضب", "صراخ"],
-        "tip": "وقت الغضب قللي الكلام، وبعدها ناقشي بهدوء."
+        "tags": [
+            "غضب",
+            "صراخ",
+            "عصبية"
+        ],
+        "tip": "وقت الغضب قللي الكلام وبعدها اتكلموا بهدوء."
     },
-]
 
-SPECIALISTS = [
-    {"id": "sp_001", "name": "د. مريم علي", "title": "أخصائي إرشاد أسري", "topics": ["teen_communication", "anger"], "price_egp": 350, "rating": 4.8},
+    {
+        "id": "kb_003",
+        "topic": "screen_addiction",
+        "tags": [
+            "موبايل",
+            "شاشات",
+            "تيك توك"
+        ],
+        "tip": "قللي وقت الشاشة تدريجيًا مع نشاط بديل ممتع."
+    }
 ]
-
-SLOTS = [
-    {"slot_id": "sl_001", "specialist_id": "sp_001", "start": "2026-01-24T18:00:00+02:00", "duration_min": 30, "available": True},
-]
-
-APPOINTMENTS = []
-ANALYTICS = []
-USER_MEMORY = {}
 
 
 # =======================
 # MODELS
 # =======================
 class ChatMessage(BaseModel):
+
     role: Literal["user", "assistant"]
+
     content: str
 
 
 class ChatRequest(BaseModel):
+
     user_id: str
+
     messages: List[ChatMessage]
+
     child_age: Optional[int] = None
 
 
 class Card(BaseModel):
+
     type: str
+
     title: str
+
     body: str
+
     meta: Optional[Dict[str, Any]] = None
 
 
 class ChatResponse(BaseModel):
+
     message_id: str
+
     reply: str
+
     cards: List[Card] = []
 
 
 # =======================
-# HELPERS
+# RISK
 # =======================
-def get_user_memory(user_id: str):
-    return USER_MEMORY.get(user_id, {"child_age": None, "notes": []})
+RISK_HIGH = [
+
+    "انتحار",
+    "هنتحر",
+    "أذي نفسي",
+    "أموت"
+]
+
+RISK_MEDIUM = [
+
+    "اكتئاب",
+    "قلق",
+    "خوف شديد",
+    "هلع"
+]
 
 
-def update_memory(user_id: str, note: str, age: Optional[int]):
-    mem = get_user_memory(user_id)
-    if age:
-        mem["child_age"] = age
-    mem["notes"].append(note[:150])
-    USER_MEMORY[user_id] = mem
+def detect_risk(text):
 
-
-def detect_risk(text: str):
     t = text.lower()
-    if "انتحار" in t or "أموت" in t:
+
+    if any(x in t for x in RISK_HIGH):
         return "high"
+
+    if any(x in t for x in RISK_MEDIUM):
+        return "medium"
+
     return "low"
+
+
+# =======================
+# FOLLOW UPS
+# =======================
+FOLLOWUPS = {
+
+    "anger": [
+        "العصبية بتحصل إمتى أكتر؟"
+    ],
+
+    "teen_communication": [
+        "هو ساكت ولا بيرد بعصبية؟"
+    ],
+
+    "general": [
+        "ممكن تفاصيل أكتر؟"
+    ]
+}
+
+
+def pick_followup(topic):
+
+    return FOLLOWUPS.get(
+        topic,
+        FOLLOWUPS["general"]
+    )[0]
+
+
+# =======================
+# CONFIDENCE
+# =======================
+def compute_confidence(
+    user_text,
+    risk
+):
+
+    score = 50
+
+    if len(user_text.split()) > 5:
+        score += 20
+
+    if risk == "low":
+        score += 20
+
+    if risk == "medium":
+        score -= 10
+
+    if risk == "high":
+        score -= 30
+
+    return max(
+        0,
+        min(score, 100)
+    )
+
+
+# =======================
+# EMPATHY
+# =======================
+def empathy_reflect(user_text):
+
+    short = user_text[:80]
+
+    return f"""
+حاسس/ة إن الموقف ده مضايقك فعلًا ❤️
+
+إنت قلت:
+"{short}"
+
+"""
+
+
+# =======================
+# KB SEARCH
+# =======================
+def kb_search(user_text):
+
+    for item in KB:
+
+        for tag in item["tags"]:
+
+            if tag in user_text:
+                return item
+
+    return None
 
 
 # =======================
 # GEMINI
 # =======================
-def compose_reply(user_text, topic, tips, memory):
+def compose_reply(
+    user_text,
+    topic,
+    tips,
+    memory,
+    confidence
+):
+
     if not GEMINI_ENABLED:
-        return "رفيق غير مفعل حاليًا (Gemini API missing)."
 
-    prompt = f"""
-أنت مساعد اسمه "رفيق" متخصص في دعم الأسرة.
-أجب بطريقة بسيطة ومطمئنة.
-
-User: {user_text}
-Topic: {topic}
-Tips: {tips}
-Memory: {memory}
+        return """
+رفيق غير مفعل حاليًا.
+ضيف GEMINI_API_KEY.
 """
 
-    r = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt
-    )
-    return r.text or "ممكن توضحي أكتر؟"
+    prompt = f"""
+أنت مساعد ذكي اسمه رفيق.
+
+مهمتك:
+- دعم الأسرة
+- الرد بالمصري
+- تقديم نصائح تربوية
+- كن هادئ ومطمئن
+- لا تعطي تشخيص طبي
+
+Confidence:
+{confidence}
+
+User:
+{user_text}
+
+Tips:
+{tips}
+
+Memory:
+{memory}
+"""
+
+    try:
+
+        r = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
+
+        return r.text or "ممكن توضحي أكتر؟"
+
+    except Exception:
+
+        return """
+حصلت مشكلة مؤقتة.
+حاولي مرة تانية بعد شوية.
+"""
 
 
 # =======================
-# ROUTE: HOME
+# HEALTH
+# =======================
+@app.get("/health")
+def health():
+
+    return {
+
+        "ok": True,
+
+        "gemini_enabled": GEMINI_ENABLED,
+
+        "memory_users": len(USER_MEMORY),
+
+        "analytics_events": len(ANALYTICS)
+    }
+
+
+# =======================
+# HOME
 # =======================
 @app.get("/")
 def home():
-    return {"message": "Rafiq Bot API is running 🚀"}
+
+    return {
+        "message": "Rafiq API Running 🚀"
+    }
 
 
 # =======================
 # CHAT
 # =======================
-@app.post("/chat", response_model=ChatResponse)
+@app.post(
+    "/chat",
+    response_model=ChatResponse
+)
 def chat(req: ChatRequest):
-    msg_id = "msg_" + uuid.uuid4().hex[:10]
-    user_text = req.messages[-1].content
 
-    mem = get_user_memory(req.user_id)
-    update_memory(req.user_id, user_text, req.child_age)
+    if not req.messages:
+
+        raise HTTPException(
+            status_code=400,
+            detail="messages required"
+        )
+
+    msg_id = "msg_" + uuid.uuid4().hex[:10]
+
+    user_text = req.messages[-1].content
 
     risk = detect_risk(user_text)
 
-    if risk == "high":
-        return ChatResponse(
-            message_id=msg_id,
-            reply="أنا قلق عليك ❤️ حاول تتكلم مع شخص قريب منك فورًا.",
-            cards=[Card(type="warning", title="تنبيه مهم", body="اطلب دعم فوري من شخص بالغ أو مختص.")]
-        )
+    confidence = compute_confidence(
+        user_text,
+        risk
+    )
 
     topic = "general"
-    tips = [{"tip": "حاول تتكلم بهدوء"}]
 
-    reply = compose_reply(user_text, topic, tips, mem)
+    kb_result = kb_search(user_text)
+
+    tips = []
+
+    if kb_result:
+
+        topic = kb_result["topic"]
+
+        tips.append(kb_result["tip"])
+
+    update_memory(
+        req.user_id,
+        user_text,
+        req.child_age,
+        topic
+    )
+
+    mem = get_user_memory(req.user_id)
+
+    ANALYTICS.append({
+
+        "message_id": msg_id,
+
+        "user_id": req.user_id,
+
+        "message": user_text,
+
+        "topic": topic,
+
+        "risk": risk
+    })
+
+    save_analytics()
+
+    # =======================
+    # HIGH RISK
+    # =======================
+    if risk == "high":
+
+        return ChatResponse(
+
+            message_id=msg_id,
+
+            reply="""
+أنا قلقان عليك ❤️
+
+حاول تتكلم فورًا مع شخص قريب منك أو مختص.
+""",
+
+            cards=[
+
+                Card(
+                    type="warning",
+                    title="تنبيه مهم",
+                    body="لو في خطر فوري اطلب مساعدة من شخص بالغ أو مختص."
+                )
+            ]
+        )
+
+    # =======================
+    # MEDIUM RISK
+    # =======================
+    if risk == "medium":
+
+        return ChatResponse(
+
+            message_id=msg_id,
+
+            reply="""
+واضح إن الموضوع تقيل عليك شوية ❤️
+
+ممكن تحكيلي أكتر عن اللي حاصل؟
+""",
+
+            cards=[
+
+                Card(
+                    type="warning",
+                    title="دعم نفسي",
+                    body="لو الإحساس مستمر حاول تتكلم مع مختص."
+                )
+            ]
+        )
+
+    # =======================
+    # NORMAL FLOW
+    # =======================
+    intro = empathy_reflect(user_text)
+
+    reply = intro + compose_reply(
+
+        user_text=user_text,
+
+        topic=topic,
+
+        tips=tips,
+
+        memory=mem,
+
+        confidence=confidence
+    )
+
+    cards = []
+
+    cards.append(
+
+        Card(
+            type="tip",
+            title="درجة الثقة",
+            body=f"{confidence}%"
+        )
+    )
+
+    cards.append(
+
+        Card(
+            type="tip",
+            title="سؤال متابعة",
+            body=pick_followup(topic)
+        )
+    )
+
+    if tips:
+
+        for t in tips:
+
+            cards.append(
+
+                Card(
+                    type="tip",
+                    title="نصيحة",
+                    body=t
+                )
+            )
 
     return ChatResponse(
+
         message_id=msg_id,
+
         reply=reply,
-        cards=[
-            Card(type="tip", title="نصيحة", body="التواصل الهادئ هو الحل الأفضل.")
-        ]
+
+        cards=cards
     )
