@@ -51,8 +51,6 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
 app = FastAPI(title="Rafiq Chatbot API (Gemini) - Full")
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Rafiq Bot API")
-
 
 # =======================
 # CORS
