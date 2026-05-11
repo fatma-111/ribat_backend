@@ -31,7 +31,7 @@ Includes:
 
 from dotenv import load_dotenv
 load_dotenv()
-
+import google.generativeai as genai
 import os
 import json
 import uuid
@@ -49,13 +49,13 @@ except Exception:
     genai = None
     types = None
 
-
 # =======================
 # CONFIG
 # =======================
 DEBUG = os.getenv("RIBAT_DEBUG", "0") == "1"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 
 ADMIN_KEY = os.getenv("RIBAT_ADMIN_KEY", "change-me")
