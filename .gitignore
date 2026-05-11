@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Local persisted data
+ribat_user_memory.json
+ribat_analytics.json
+ribat_appointments.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env/
