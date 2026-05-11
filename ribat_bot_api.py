@@ -197,3 +197,17 @@ def chat(req: ChatRequest):
             Card(type="tip", title="نصيحة", body="التواصل الهادئ هو الحل الأفضل.")
         ]
     )
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*"  # للتجربة فقط
+        # أو حطي الدومين بتاع الفrontend
+        # "https://your-frontend.com"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
