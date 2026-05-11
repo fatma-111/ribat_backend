@@ -48,7 +48,7 @@ ANALYTICS_FILE = os.path.join(DATA_DIR, "rafiq_analytics.json")
 APPOINTMENTS_FILE = os.path.join(DATA_DIR, "rafiq_appointments.json")
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
-app = FastAPI(title="Rafiq Chatbot API (Gemini) - Full")
+app = FastAPI(title="Rafiq Bot API")
 from fastapi.middleware.cors import CORSMiddleware
 
 
