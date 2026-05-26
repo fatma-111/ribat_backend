@@ -1,54 +1,38 @@
 """
 rafiq_bot_api.py
 Rafiq Chatbot API (Gemini) - Full
-Backend-only FastAPI app:
-- Parenting/Family support + Kids stories/games/books + Personality Assessment
 """
 
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
-import json
 import uuid
 import re
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Literal, Tuple
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Literal
+
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 try:
     from google import genai
-    from google.genai import types
 except Exception:
     genai = None
-    types = None
+
 
 # =======================
 # CONFIG
 # =======================
-DEBUG = os.getenv("RIBAT_DEBUG", "0") == "1"
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 
-ADMIN_KEY = os.getenv("RIBAT_ADMIN_KEY", "change-me")
-if ADMIN_KEY == "change-me":
-    print("WARNING: ADMIN key is default. Set it in ENV for production.")
-
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-ENABLE_VERIFY = os.getenv("RIBAT_VERIFY_OUTPUT", "0") == "1"
-PERSIST_MEMORY = os.getenv("RIBAT_PERSIST_MEMORY", "1") == "1"
-
-DATA_DIR = os.getenv("RIBAT_DATA_DIR", "data")
-
-MEMORY_FILE = os.path.join(DATA_DIR, "rafiq_user_memory.json")
-ANALYTICS_FILE = os.path.join(DATA_DIR, "rafiq_analytics.json")
-APPOINTMENTS_FILE = os.path.join(DATA_DIR, "rafiq_appointments.json")
-
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
+
 app = FastAPI(title="Rafiq Bot API")
+
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -57,10 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =======================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*"  # للتجربة فقط
-        # بعدين حطي رابط الفرونت الحقيقي
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,35 +49,8 @@ app.add_middleware(
 
 
 # =======================
-# DUMMY DATA
+# MEMORY
 # =======================
-KB = [
-    {
-        "id": "kb_001",
-        "topic": "teen_communication",
-        "age_min": 12, "age_max": 18,
-        "tags": ["مراهق", "ساكت", "مش بيرد"],
-        "tip": "ابدئي بهدوء: «أنا عايزة أفهمك مش ألومك»."
-    },
-    {
-        "id": "kb_002",
-        "topic": "anger",
-        "age_min": 6, "age_max": 18,
-        "tags": ["عصبية", "غضب", "صراخ"],
-        "tip": "وقت الغضب قللي الكلام، وبعدها ناقشي بهدوء."
-    },
-]
-
-SPECIALISTS = [
-    {"id": "sp_001", "name": "د. مريم علي", "title": "أخصائي إرشاد أسري", "topics": ["teen_communication", "anger"], "price_egp": 350, "rating": 4.8},
-]
-
-SLOTS = [
-    {"slot_id": "sl_001", "specialist_id": "sp_001", "start": "2026-01-24T18:00:00+02:00", "duration_min": 30, "available": True},
-]
-
-APPOINTMENTS = []
-ANALYTICS = []
 USER_MEMORY = {}
 
 
@@ -131,46 +85,177 @@ class ChatResponse(BaseModel):
 # HELPERS
 # =======================
 def get_user_memory(user_id: str):
-    return USER_MEMORY.get(user_id, {"child_age": None, "notes": []})
+    return USER_MEMORY.get(
+        user_id,
+        {
+            "child_age": None,
+            "notes": [],
+            "preferred_language": None
+        }
+    )
 
 
 def update_memory(user_id: str, note: str, age: Optional[int]):
     mem = get_user_memory(user_id)
+
     if age:
         mem["child_age"] = age
+
     mem["notes"].append(note[:150])
+
     USER_MEMORY[user_id] = mem
+
+
+def set_user_language(user_id: str, lang: str):
+    mem = get_user_memory(user_id)
+    mem["preferred_language"] = lang
+    USER_MEMORY[user_id] = mem
+
+
+def get_user_language(user_id: str):
+    mem = get_user_memory(user_id)
+    return mem.get("preferred_language")
+
+
+def detect_language(text: str) -> str:
+    arabic_chars = re.findall(r'[\u0600-\u06FF]', text)
+
+    if len(arabic_chars) > 0:
+        return "ar"
+
+    return "en"
+
+
+def detect_language_command(text: str):
+    t = text.lower()
+
+    english_commands = [
+        "speak english",
+        "english please",
+        "talk in english",
+        "reply in english",
+        "اتكلم انجليزي",
+        "اتكلم بالانجليزي",
+        "خليك انجليزي",
+    ]
+
+    arabic_commands = [
+        "اتكلم عربي",
+        "رد بالعربي",
+        "arabic please",
+        "speak arabic",
+        "reply in arabic",
+    ]
+
+    for cmd in english_commands:
+        if cmd in t:
+            return "en"
+
+    for cmd in arabic_commands:
+        if cmd in t:
+            return "ar"
+
+    return None
+
+
+def clean_response(text: str) -> str:
+    if not text:
+        return ""
+
+    # remove markdown stars
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+
+    # remove markdown symbols
+    text = re.sub(r"`", "", text)
+    text = re.sub(r"#", "", text)
+
+    return text.strip()
 
 
 def detect_risk(text: str):
     t = text.lower()
+
     if "انتحار" in t or "أموت" in t:
         return "high"
+
     return "low"
 
 
 # =======================
 # GEMINI
 # =======================
-def compose_reply(user_text, topic, tips, memory):
+def compose_reply(user_text, topic, tips, memory, lang):
+
     if not GEMINI_ENABLED:
-        return "رفيق غير مفعل حاليًا (Gemini API missing)."
 
-    prompt = f"""
-أنت مساعد اسمه "رفيق" متخصص في دعم الأسرة.
-أجب بطريقة بسيطة ومطمئنة.
+        if lang == "en":
+            return "Rafiq is currently unavailable."
 
-User: {user_text}
-Topic: {topic}
-Tips: {tips}
-Memory: {memory}
+        return "رفيق غير مفعل حاليًا."
+
+    if lang == "ar":
+
+        prompt = f"""
+أنت مساعد ذكي اسمه "رفيق" متخصص في دعم الأسرة والأطفال.
+
+قواعد مهمة:
+- رد بالعربية العامية المصرية البسيطة.
+- كن داعم وهادئ ومطمئن.
+- لا تستخدم أي markdown.
+- لا تستخدم نجوم *.
+- اجعل الرد طبيعي وبشري.
+
+رسالة المستخدم:
+{user_text}
+
+الموضوع:
+{topic}
+
+النصائح:
+{tips}
+
+الذاكرة:
+{memory}
+"""
+
+    else:
+
+        prompt = f"""
+You are an AI assistant called "Rafiq" specialized in parenting and family support.
+
+Rules:
+- Reply in natural simple English.
+- Be warm and supportive.
+- Do NOT use markdown.
+- Do NOT use stars (*).
+- Make the reply conversational.
+
+User Message:
+{user_text}
+
+Topic:
+{topic}
+
+Tips:
+{tips}
+
+Memory:
+{memory}
 """
 
     r = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt
     )
-    return r.text or "ممكن توضحي أكتر؟"
+
+    raw_text = r.text or (
+        "Can you explain more?"
+        if lang == "en"
+        else "ممكن توضحي أكتر؟"
+    )
+
+    return clean_response(raw_text)
 
 
 # =======================
@@ -186,30 +271,118 @@ def home():
 # =======================
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+
     msg_id = "msg_" + uuid.uuid4().hex[:10]
+
     user_text = req.messages[-1].content
 
     mem = get_user_memory(req.user_id)
+
     update_memory(req.user_id, user_text, req.child_age)
 
+    # =======================
+    # CHANGE LANGUAGE
+    # =======================
+    lang_command = detect_language_command(user_text)
+
+    if lang_command:
+
+        set_user_language(req.user_id, lang_command)
+
+        if lang_command == "en":
+
+            return ChatResponse(
+                message_id=msg_id,
+                reply="Done! I will speak English with you from now on.",
+                cards=[]
+            )
+
+        return ChatResponse(
+            message_id=msg_id,
+            reply="تمام، هتكلم معاك بالعربي من دلوقتي.",
+            cards=[]
+        )
+
+    # =======================
+    # LANGUAGE
+    # =======================
+    saved_lang = get_user_language(req.user_id)
+
+    lang = saved_lang if saved_lang else detect_language(user_text)
+
+    # =======================
+    # RISK CHECK
+    # =======================
     risk = detect_risk(user_text)
 
     if risk == "high":
+
+        if lang == "en":
+
+            return ChatResponse(
+                message_id=msg_id,
+                reply="I'm worried about you ❤️ Please talk to someone you trust.",
+                cards=[
+                    Card(
+                        type="warning",
+                        title="Important",
+                        body="Please seek support from a trusted adult or specialist."
+                    )
+                ]
+            )
+
         return ChatResponse(
             message_id=msg_id,
             reply="أنا قلق عليك ❤️ حاول تتكلم مع شخص قريب منك فورًا.",
-            cards=[Card(type="warning", title="تنبيه مهم", body="اطلب دعم فوري من شخص بالغ أو مختص.")]
+            cards=[
+                Card(
+                    type="warning",
+                    title="تنبيه مهم",
+                    body="اطلب دعم فوري من شخص بالغ أو مختص."
+                )
+            ]
         )
 
+    # =======================
+    # TOPIC + TIPS
+    # =======================
     topic = "general"
-    tips = [{"tip": "حاول تتكلم بهدوء"}]
 
-    reply = compose_reply(user_text, topic, tips, mem)
+    tips = [
+        {
+            "tip":
+            "حاول تتكلم بهدوء"
+            if lang == "ar"
+            else "Try to communicate calmly"
+        }
+    ]
 
+    # =======================
+    # AI RESPONSE
+    # =======================
+    reply = compose_reply(
+        user_text=user_text,
+        topic=topic,
+        tips=tips,
+        memory=mem,
+        lang=lang
+    )
+
+    # =======================
+    # FINAL RESPONSE
+    # =======================
     return ChatResponse(
         message_id=msg_id,
         reply=reply,
         cards=[
-            Card(type="tip", title="نصيحة", body="التواصل الهادئ هو الحل الأفضل.")
+            Card(
+                type="tip",
+                title="نصيحة" if lang == "ar" else "Tip",
+                body=(
+                    "التواصل الهادئ هو الحل الأفضل."
+                    if lang == "ar"
+                    else "Calm communication is usually the best approach."
+                )
+            )
         ]
     )
