@@ -1,6 +1,6 @@
 """
-rafiq_bot_api.py
-Rafiq Chatbot API (Production Fixed + PostgreSQL Memory)
+Rafiq Bot API - FINAL FULL SYSTEM
+FastAPI + PostgreSQL + Gemini AI + Chat + Memory + Assessment + Appointments + Analytics
 """
 
 from dotenv import load_dotenv
@@ -10,38 +10,31 @@ import os
 import uuid
 import re
 import json
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Literal, Dict, Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-
-try:
-    from google import genai
-except Exception:
-    genai = None
+from google import genai
 
 
-# =======================
+# ======================
 # CONFIG
-# =======================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_ENABLED = bool(GEMINI_API_KEY) and genai is not None
-
+# ======================
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-app = FastAPI(title="Rafiq Bot API")
+app = FastAPI(title="Rafiq AI System 🚀")
 
 
-# =======================
+# ======================
 # CORS
-# =======================
+# ======================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,226 +44,357 @@ app.add_middleware(
 )
 
 
-# =======================
+# ======================
 # DB
-# =======================
+# ======================
 def get_conn():
-    if not DATABASE_URL:
-        raise Exception("DATABASE_URL is missing")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
-# =======================
+# ======================
 # MODELS
-# =======================
-class ChatMessage(BaseModel):
+# ======================
+class Msg(BaseModel):
     role: Literal["user", "assistant"]
     content: str
 
 
-class ChatRequest(BaseModel):
+class ChatReq(BaseModel):
     user_id: str
-    messages: List[ChatMessage]
+    messages: List[Msg]
     child_age: Optional[int] = None
 
 
-class Card(BaseModel):
-    type: str
-    title: str
-    body: str
-    meta: Optional[Dict[str, Any]] = None
-
-
-class ChatResponse(BaseModel):
-    message_id: str
-    reply: str
-    cards: List[Card] = []
-
-
-# =======================
-# MEMORY (POSTGRESQL)
-# =======================
-def get_user_profile(conn, user_id: str):
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT user_id, child_age, notes, topics, preferred_language
-            FROM users
-            WHERE user_id = %s
-        """, (user_id,))
-        return cur.fetchone()
-
-
-def update_user_memory(conn, user_id: str, text: str, child_age: Optional[int]):
-    with conn.cursor() as cur:
-
-        cur.execute("""
-            SELECT notes FROM users WHERE user_id = %s
-        """, (user_id,))
-        row = cur.fetchone()
-
-        if row:
-            notes = row[0] or []
-            notes.append(text[:150])
-
-            cur.execute("""
-                UPDATE users
-                SET notes = %s,
-                    child_age = COALESCE(%s, child_age),
-                    updated_at = NOW()
-                WHERE user_id = %s
-            """, (json.dumps(notes), child_age, user_id))
-        else:
-            cur.execute("""
-                INSERT INTO users (user_id, child_age, notes)
-                VALUES (%s, %s, %s)
-            """, (user_id, child_age, json.dumps([text[:150]])))
-
-
-# =======================
-# HELPERS
-# =======================
-def detect_language(text: str) -> str:
+# ======================
+# UTIL
+# ======================
+def detect_lang(text):
     return "ar" if re.findall(r'[\u0600-\u06FF]', text) else "en"
 
 
-def clean_response(text: str) -> str:
+def clean(text):
     return re.sub(r"[\*`#]", "", text or "").strip()
 
 
-def detect_risk(text: str):
+def detect_risk(text):
     t = text.lower()
-    return "high" if ("انتحار" in t or "أموت" in t or "kill myself" in t) else "low"
+    return "high" if ("انتحار" in t or "kill" in t or "أموت" in t) else "low"
 
 
-def build_memory_text(profile):
-    if not profile:
-        return "No memory"
+# ======================
+# MEMORY
+# ======================
+def get_memory(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT notes, topics, child_age, preferred_language
+        FROM users
+        WHERE user_id=%s
+    """, (user_id,))
+    row = cur.fetchone()
+
+    if not row:
+        return {}
 
     return {
-        "child_age": profile["child_age"],
-        "notes": profile["notes"],
-        "topics": profile["topics"],
-        "preferred_language": profile["preferred_language"]
+        "notes": row[0],
+        "topics": row[1],
+        "child_age": row[2],
+        "lang": row[3]
     }
 
 
-# =======================
-# GEMINI
-# =======================
-def compose_reply(user_text, memory, lang):
+def update_memory(conn, user_id, text, child_age):
+    cur = conn.cursor()
 
-    if not GEMINI_ENABLED:
-        return "Rafiq is unavailable." if lang == "en" else "رفيق غير متاح"
+    cur.execute("SELECT notes FROM users WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
 
+    if row:
+        notes = row[0] or []
+        notes.append(text[:150])
+
+        cur.execute("""
+            UPDATE users
+            SET notes=%s,
+                child_age=COALESCE(%s, child_age),
+                updated_at=NOW()
+            WHERE user_id=%s
+        """, (json.dumps(notes), child_age, user_id))
+
+    else:
+        cur.execute("""
+            INSERT INTO users (user_id, child_age, notes)
+            VALUES (%s, %s, %s)
+        """, (user_id, child_age, json.dumps([text[:150]])))
+
+
+# ======================
+# AI
+# ======================
+def ai_reply(text, memory, lang):
     prompt = f"""
-You are Rafiq, a helpful parenting assistant.
+You are Rafiq AI assistant.
 
 Rules:
-- Simple & friendly
-- No markdown
-- No symbols
-- Short responses
+- simple
+- friendly
+- no markdown
 
-User message:
-{user_text}
+User:
+{text}
 
 Language:
 {lang}
 
-User memory:
+Memory:
 {memory}
 """
 
-    response = client.models.generate_content(
+    res = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt
     )
 
-    return clean_response(response.text)
+    return clean(res.text)
 
 
-# =======================
-# CHAT ENDPOINT
-# =======================
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+# ======================
+# ROUTES
+# ======================
 
-    msg_id = "msg_" + uuid.uuid4().hex[:10]
-    user_text = req.messages[-1].content
-
-    risk = detect_risk(user_text)
-    lang = detect_language(user_text)
-
-    try:
-        conn = get_conn()
-
-        # =======================
-        # LOAD MEMORY
-        # =======================
-        profile = get_user_profile(conn, req.user_id)
-        memory = build_memory_text(profile)
-
-        # =======================
-        # RISK HANDLING
-        # =======================
-        if risk == "high":
-            reply = "Please talk to someone you trust ❤️" if lang == "en" else "أنا قلق عليك ❤️ كلم حد قريب منك"
-
-            return ChatResponse(
-                message_id=msg_id,
-                reply=reply,
-                cards=[]
-            )
-
-        # =======================
-        # AI RESPONSE
-        # =======================
-        reply = compose_reply(user_text, memory, lang)
-
-        # =======================
-        # UPDATE MEMORY
-        # =======================
-        update_user_memory(conn, req.user_id, user_text, req.child_age)
-
-        # =======================
-        # SAVE CHAT
-        # =======================
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO chat_messages (message_id, user_id, message, response)
-                VALUES (%s, %s, %s, %s)
-            """, (msg_id, req.user_id, user_text, reply))
-
-            cur.execute("""
-                INSERT INTO analytics (user_id, event_type, value)
-                VALUES (%s, %s, %s)
-            """, (req.user_id, "chat", user_text[:100]))
-
-        conn.commit()
-        conn.close()
-
-        return ChatResponse(
-            message_id=msg_id,
-            reply=reply,
-            cards=[]
-        )
-
-    except Exception as e:
-        print("ERROR:", str(e))
-
-        return ChatResponse(
-            message_id=msg_id,
-            reply="System error occurred",
-            cards=[]
-        )
-
-
-# =======================
-# HEALTH CHECK
-# =======================
 @app.get("/")
 def home():
+    return {"status": "Rafiq running 🚀"}
+
+
+# ======================
+# 💬 CHAT
+# ======================
+@app.post("/chat")
+def chat(req: ChatReq):
+
+    user_text = req.messages[-1].content
+    lang = detect_lang(user_text)
+    risk = detect_risk(user_text)
+    msg_id = "msg_" + uuid.uuid4().hex[:10]
+
+    conn = get_conn()
+
+    try:
+        memory = get_memory(conn, req.user_id)
+
+        if risk == "high":
+            return {
+                "message_id": msg_id,
+                "reply": "Please talk to someone you trust ❤️" if lang == "en"
+                else "أنا قلق عليك ❤️ كلم حد قريب منك"
+            }
+
+        reply = ai_reply(user_text, memory, lang)
+
+        update_memory(conn, req.user_id, user_text, req.child_age)
+
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO chat_messages (message_id, user_id, message, response)
+            VALUES (%s, %s, %s, %s)
+        """, (msg_id, req.user_id, user_text, reply))
+
+        cur.execute("""
+            INSERT INTO analytics (user_id, event_type, value)
+            VALUES (%s, %s, %s)
+        """, (req.user_id, "chat", user_text[:100]))
+
+        conn.commit()
+
+        return {
+            "message_id": msg_id,
+            "reply": reply
+        }
+
+    finally:
+        conn.close()
+
+
+# ======================
+# 📜 GET CHAT HISTORY
+# ======================
+@app.get("/chat/{user_id}")
+def get_chat(user_id: str, limit: int = 50):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT message_id, message, response, created_at
+        FROM chat_messages
+        WHERE user_id=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (user_id, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+
     return {
-        "status": "running",
-        "gemini": GEMINI_ENABLED
+        "user_id": user_id,
+        "messages": [
+            {
+                "message_id": r[0],
+                "user_message": r[1],
+                "bot_reply": r[2],
+                "created_at": r[3].isoformat() if r[3] else None
+            }
+            for r in rows
+        ]
+    }
+
+
+# ======================
+# 🧠 GET MEMORY
+# ======================
+@app.get("/memory/{user_id}")
+def memory(user_id: str):
+
+    conn = get_conn()
+    data = get_memory(conn, user_id)
+    conn.close()
+
+    return data
+
+
+# ======================
+# 📅 APPOINTMENTS
+# ======================
+@app.post("/appointments")
+def book(user_id: str, specialist_id: str, slot_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO appointments (appointment_id, user_id, specialist_id, slot_id)
+        VALUES (%s, %s, %s, %s)
+    """, (str(uuid.uuid4()), user_id, specialist_id, slot_id))
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "booked"}
+
+
+@app.get("/appointments/{user_id}")
+def get_appointments(user_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM appointments WHERE user_id=%s
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {"appointments": rows}
+
+
+# ======================
+# 📊 ANALYTICS
+# ======================
+@app.post("/analytics")
+def analytics(user_id: str, event_type: str, value: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO analytics (user_id, event_type, value)
+        VALUES (%s, %s, %s)
+    """, (user_id, event_type, value))
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok"}
+
+
+# ======================
+# 🧪 ASSESSMENT QUESTIONS
+# ======================
+@app.get("/assessment/questions")
+def get_questions(child_age: int | None = None):
+
+    if child_age is None:
+        return {"questions": ASSESSMENT_QUESTIONS}
+
+    return {
+        "questions": [
+            q for q in ASSESSMENT_QUESTIONS
+            if q["age_min"] <= child_age <= q["age_max"]
+        ]
+    }
+
+
+# ======================
+# 🧪 ASSESSMENT SUBMIT
+# ======================
+@app.post("/assessment/submit")
+def submit_assessment(user_id: str, child_age: int, answers: list[dict]):
+
+    profile = compute_personality_profile(
+        answers=answers,
+        child_age=child_age
+    )
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO assessments (user_id, child_age, assessment_confidence, result)
+        VALUES (%s, %s, %s, %s)
+    """, (
+        user_id,
+        child_age,
+        80,
+        json.dumps(profile)
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return profile
+
+
+# ======================
+# 🧪 GET ASSESSMENTS
+# ======================
+@app.get("/assessment/{user_id}")
+def get_assessments(user_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT child_age, assessment_confidence, result, created_at
+        FROM assessments
+        WHERE user_id=%s
+        ORDER BY created_at DESC
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "assessments": [
+            {
+                "child_age": r[0],
+                "confidence": r[1],
+                "result": r[2],
+                "created_at": r[3].isoformat() if r[3] else None
+            }
+            for r in rows
+        ]
     }
