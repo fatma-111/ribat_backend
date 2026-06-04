@@ -175,62 +175,25 @@ def home():
 def chat(req: ChatReq):
 
     try:
+        print("CHAT STARTED")
+
         user_text = req.messages[-1].content
-        lang = detect_lang(user_text)
-        risk = detect_risk(user_text)
-        msg_id = "msg_" + uuid.uuid4().hex[:10]
+        print("USER TEXT:", user_text)
 
         conn = get_conn()
-        cur = conn.cursor()
+        print("DB CONNECTED")
 
         memory = get_memory(conn, req.user_id)
+        print("MEMORY LOADED:", memory)
 
-        # safety
-        if risk == "high":
-            return {
-                "message_id": msg_id,
-                "reply": "Please talk to someone you trust ❤️" if lang == "en"
-                else "أنا قلق عليك ❤️ كلم حد قريب منك"
-            }
+        reply = "TEST OK"
+        print("REPLY READY")
 
-        # AI CALL (IMPORTANT FIX AREA)
-        try:
-            reply = ai_reply(user_text, memory, lang)
-        except Exception as ai_error:
-            print("GEMINI ERROR:", ai_error)
-            reply = "Sorry, AI is currently unavailable."
-
-        update_memory(conn, req.user_id, user_text, req.child_age)
-
-        cur.execute("""
-            INSERT INTO chat_messages (message_id, user_id, message, response)
-            VALUES (%s, %s, %s, %s)
-        """, (msg_id, req.user_id, user_text, reply))
-
-        cur.execute("""
-            INSERT INTO analytics (user_id, event_type, value)
-            VALUES (%s, %s, %s)
-        """, (req.user_id, "chat", user_text[:100]))
-
-        conn.commit()
-
-        return {
-            "message_id": msg_id,
-            "reply": reply
-        }
+        return {"reply": reply}
 
     except Exception as e:
-        print("CHAT ERROR:", str(e))
-        return {
-            "error": "internal_error",
-            "details": str(e)
-        }
-
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
+        print("CHAT CRASH:", str(e))
+        return {"error": str(e)}
 
 # ======================
 # 📜 GET CHAT HISTORY
