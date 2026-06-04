@@ -174,16 +174,18 @@ def home():
 @app.post("/chat")
 def chat(req: ChatReq):
 
-    user_text = req.messages[-1].content
-    lang = detect_lang(user_text)
-    risk = detect_risk(user_text)
-    msg_id = "msg_" + uuid.uuid4().hex[:10]
-
-    conn = get_conn()
-
     try:
+        user_text = req.messages[-1].content
+        lang = detect_lang(user_text)
+        risk = detect_risk(user_text)
+        msg_id = "msg_" + uuid.uuid4().hex[:10]
+
+        conn = get_conn()
+        cur = conn.cursor()
+
         memory = get_memory(conn, req.user_id)
 
+        # safety
         if risk == "high":
             return {
                 "message_id": msg_id,
@@ -191,11 +193,14 @@ def chat(req: ChatReq):
                 else "أنا قلق عليك ❤️ كلم حد قريب منك"
             }
 
-        reply = ai_reply(user_text, memory, lang)
+        # AI CALL (IMPORTANT FIX AREA)
+        try:
+            reply = ai_reply(user_text, memory, lang)
+        except Exception as ai_error:
+            print("GEMINI ERROR:", ai_error)
+            reply = "Sorry, AI is currently unavailable."
 
         update_memory(conn, req.user_id, user_text, req.child_age)
-
-        cur = conn.cursor()
 
         cur.execute("""
             INSERT INTO chat_messages (message_id, user_id, message, response)
@@ -214,9 +219,18 @@ def chat(req: ChatReq):
             "reply": reply
         }
 
-    finally:
-        conn.close()
+    except Exception as e:
+        print("CHAT ERROR:", str(e))
+        return {
+            "error": "internal_error",
+            "details": str(e)
+        }
 
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 # ======================
 # 📜 GET CHAT HISTORY
