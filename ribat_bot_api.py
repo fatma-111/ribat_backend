@@ -151,34 +151,24 @@ def update_memory(conn, user_id, text, child_age):
 # ======================
 def ai_reply(text, memory, lang):
 
-    # ❌ fallback if AI not available
+    print("AI START")
+
     if client is None:
-        return "AI is temporarily unavailable. Please try again later."
+        print("NO CLIENT")
+        return "AI is not enabled"
 
     try:
-        prompt = f"""
-You are Rafiq assistant.
-
-User:
-{text}
-
-Language:
-{lang}
-
-Memory:
-{memory}
-"""
-
         res = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt
+            contents=text
         )
 
-        return clean(res.text)
+        print("AI SUCCESS")
+        return res.text
 
     except Exception as e:
         print("AI ERROR:", e)
-        return "AI error occurred, please try again."
+        return "AI failed"
 
 
 # ======================
