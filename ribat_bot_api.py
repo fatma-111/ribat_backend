@@ -274,32 +274,35 @@ def book(user_id: str, specialist_id: str, slot_id: str):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO appointments (appointment_id, user_id, specialist_id, slot_id)
-        VALUES (%s, %s, %s, %s)
-    """, (str(uuid.uuid4()), user_id, specialist_id, slot_id))
+    try:
+        cur.execute("""
+            INSERT INTO appointments 
+            (appointment_id, user_id, specialist_id, slot_id, status)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            str(uuid.uuid4()),
+            user_id,
+            specialist_id,
+            slot_id,
+            "pending"
+        ))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    return {"status": "booked"}
+        return {
+            "status": "success",
+            "message": "Appointment booked successfully"
+        }
 
+    except Exception as e:
+        conn.rollback()
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
-@app.get("/appointments/{user_id}")
-def get_appointments(user_id: str):
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT * FROM appointments WHERE user_id=%s
-    """, (user_id,))
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return {"appointments": rows}
-
+    finally:
+        conn.close()
 
 # ======================
 # 📊 ANALYTICS
