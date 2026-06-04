@@ -1,6 +1,6 @@
 """
 rafiq_bot_api.py
-Rafiq Chatbot API (Gemini + PostgreSQL FIXED)
+Rafiq Chatbot API (Production Fixed + PostgreSQL Memory)
 """
 
 from dotenv import load_dotenv
@@ -9,6 +9,7 @@ load_dotenv()
 import os
 import uuid
 import re
+import json
 from typing import List, Optional, Dict, Any, Literal
 
 from fastapi import FastAPI
@@ -28,10 +29,9 @@ except Exception:
 # CONFIG
 # =======================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
+GEMINI_ENABLED = bool(GEMINI_API_KEY) and genai is not None
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
@@ -52,13 +52,7 @@ app.add_middleware(
 
 
 # =======================
-# MEMORY (TEMP)
-# =======================
-USER_MEMORY = {}
-
-
-# =======================
-# DB CONNECTION (FIXED)
+# DB
 # =======================
 def get_conn():
     if not DATABASE_URL:
@@ -94,37 +88,70 @@ class ChatResponse(BaseModel):
 
 
 # =======================
+# MEMORY (POSTGRESQL)
+# =======================
+def get_user_profile(conn, user_id: str):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT user_id, child_age, notes, topics, preferred_language
+            FROM users
+            WHERE user_id = %s
+        """, (user_id,))
+        return cur.fetchone()
+
+
+def update_user_memory(conn, user_id: str, text: str, child_age: Optional[int]):
+    with conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT notes FROM users WHERE user_id = %s
+        """, (user_id,))
+        row = cur.fetchone()
+
+        if row:
+            notes = row[0] or []
+            notes.append(text[:150])
+
+            cur.execute("""
+                UPDATE users
+                SET notes = %s,
+                    child_age = COALESCE(%s, child_age),
+                    updated_at = NOW()
+                WHERE user_id = %s
+            """, (json.dumps(notes), child_age, user_id))
+        else:
+            cur.execute("""
+                INSERT INTO users (user_id, child_age, notes)
+                VALUES (%s, %s, %s)
+            """, (user_id, child_age, json.dumps([text[:150]])))
+
+
+# =======================
 # HELPERS
 # =======================
-def get_user_memory(user_id: str):
-    return USER_MEMORY.get(user_id, {
-        "child_age": None,
-        "notes": [],
-        "preferred_language": None
-    })
-
-
-def update_memory(user_id: str, note: str, age: Optional[int]):
-    mem = get_user_memory(user_id)
-
-    if age is not None:
-        mem["child_age"] = age
-
-    mem["notes"].append(note[:150])
-    USER_MEMORY[user_id] = mem
-
-
 def detect_language(text: str) -> str:
     return "ar" if re.findall(r'[\u0600-\u06FF]', text) else "en"
 
 
 def clean_response(text: str) -> str:
-    return re.sub(r"[\*`#]", "", text).strip()
+    return re.sub(r"[\*`#]", "", text or "").strip()
 
 
 def detect_risk(text: str):
     t = text.lower()
-    return "high" if ("انتحار" in t or "أموت" in t) else "low"
+    return "high" if ("انتحار" in t or "أموت" in t or "kill myself" in t) else "low"
+
+
+def build_memory_text(profile):
+    if not profile:
+        return "No memory"
+
+    return {
+        "child_age": profile["child_age"],
+        "notes": profile["notes"],
+        "topics": profile["topics"],
+        "preferred_language": profile["preferred_language"]
+    }
 
 
 # =======================
@@ -139,34 +166,27 @@ def compose_reply(user_text, memory, lang):
 You are Rafiq, a helpful parenting assistant.
 
 Rules:
-- Be simple and friendly
+- Simple & friendly
 - No markdown
-- No stars
+- No symbols
+- Short responses
 
-User:
+User message:
 {user_text}
 
 Language:
 {lang}
 
-Memory:
+User memory:
 {memory}
 """
 
-    r = client.models.generate_content(
+    response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt
     )
 
-    return clean_response(r.text or "...")
-
-
-# =======================
-# HOME
-# =======================
-@app.get("/")
-def home():
-    return {"message": "Rafiq Bot API is running 🚀"}
+    return clean_response(response.text)
 
 
 # =======================
@@ -176,17 +196,58 @@ def home():
 def chat(req: ChatRequest):
 
     msg_id = "msg_" + uuid.uuid4().hex[:10]
-
     user_text = req.messages[-1].content
 
-    mem = get_user_memory(req.user_id)
-    update_memory(req.user_id, user_text, req.child_age)
-
-    lang = detect_language(user_text)
     risk = detect_risk(user_text)
+    lang = detect_language(user_text)
 
-    if risk == "high":
-        reply = "Please talk to someone you trust ❤️" if lang == "en" else "أنا قلق عليك ❤️ كلم حد قريب منك"
+    try:
+        conn = get_conn()
+
+        # =======================
+        # LOAD MEMORY
+        # =======================
+        profile = get_user_profile(conn, req.user_id)
+        memory = build_memory_text(profile)
+
+        # =======================
+        # RISK HANDLING
+        # =======================
+        if risk == "high":
+            reply = "Please talk to someone you trust ❤️" if lang == "en" else "أنا قلق عليك ❤️ كلم حد قريب منك"
+
+            return ChatResponse(
+                message_id=msg_id,
+                reply=reply,
+                cards=[]
+            )
+
+        # =======================
+        # AI RESPONSE
+        # =======================
+        reply = compose_reply(user_text, memory, lang)
+
+        # =======================
+        # UPDATE MEMORY
+        # =======================
+        update_user_memory(conn, req.user_id, user_text, req.child_age)
+
+        # =======================
+        # SAVE CHAT
+        # =======================
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO chat_messages (message_id, user_id, message, response)
+                VALUES (%s, %s, %s, %s)
+            """, (msg_id, req.user_id, user_text, reply))
+
+            cur.execute("""
+                INSERT INTO analytics (user_id, event_type, value)
+                VALUES (%s, %s, %s)
+            """, (req.user_id, "chat", user_text[:100]))
+
+        conn.commit()
+        conn.close()
 
         return ChatResponse(
             message_id=msg_id,
@@ -194,38 +255,22 @@ def chat(req: ChatRequest):
             cards=[]
         )
 
-    reply = compose_reply(
-        user_text=user_text,
-        memory=mem,
-        lang=lang
-    )
-
-    # =======================
-    # DB SAVE (SAFE FIXED)
-    # =======================
-    try:
-        conn = get_conn()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO chat_messages (user_id, message, response)
-            VALUES (%s, %s, %s)
-        """, (req.user_id, user_text, reply))
-
-        cursor.execute("""
-            INSERT INTO analytics (user_id, event_type, value)
-            VALUES (%s, %s, %s)
-        """, (req.user_id, "chat", user_text[:100]))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-
     except Exception as e:
-        print("DB ERROR:", str(e))
+        print("ERROR:", str(e))
 
-    return ChatResponse(
-        message_id=msg_id,
-        reply=reply,
-        cards=[]
-    )
+        return ChatResponse(
+            message_id=msg_id,
+            reply="System error occurred",
+            cards=[]
+        )
+
+
+# =======================
+# HEALTH CHECK
+# =======================
+@app.get("/")
+def home():
+    return {
+        "status": "running",
+        "gemini": GEMINI_ENABLED
+    }
