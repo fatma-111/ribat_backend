@@ -277,7 +277,14 @@ def memory(user_id: str):
     conn.close()
 
     return data
-
+@app.middleware("http")
+async def log_requests(request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        print("GLOBAL ERROR:", e)
+        raise e
 
 # ======================
 # 📅 APPOINTMENTS
