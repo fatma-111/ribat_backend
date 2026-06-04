@@ -4,3 +4,4 @@ google-genai
 pydantic
 python-dotenv
 requests
+psycopg2-binary
