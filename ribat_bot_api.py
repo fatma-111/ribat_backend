@@ -1,6 +1,6 @@
 """
 rafiq_bot_api.py
-Rafiq Chatbot API (Gemini + PostgreSQL)
+Rafiq Chatbot API (Gemini + PostgreSQL FIXED)
 """
 
 from dotenv import load_dotenv
@@ -9,13 +9,14 @@ load_dotenv()
 import os
 import uuid
 import re
-
 from typing import List, Optional, Dict, Any, Literal
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import psycopg2
+from psycopg2.extras import RealDictCursor
 
 try:
     from google import genai
@@ -41,8 +42,6 @@ app = FastAPI(title="Rafiq Bot API")
 # =======================
 # CORS
 # =======================
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,10 +58,12 @@ USER_MEMORY = {}
 
 
 # =======================
-# DB CONNECTION
+# DB CONNECTION (FIXED)
 # =======================
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL is missing")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 # =======================
@@ -106,11 +107,10 @@ def get_user_memory(user_id: str):
 def update_memory(user_id: str, note: str, age: Optional[int]):
     mem = get_user_memory(user_id)
 
-    if age:
+    if age is not None:
         mem["child_age"] = age
 
     mem["notes"].append(note[:150])
-
     USER_MEMORY[user_id] = mem
 
 
@@ -130,7 +130,7 @@ def detect_risk(text: str):
 # =======================
 # GEMINI
 # =======================
-def compose_reply(user_text, topic, memory, lang):
+def compose_reply(user_text, memory, lang):
 
     if not GEMINI_ENABLED:
         return "Rafiq is unavailable." if lang == "en" else "رفيق غير متاح"
@@ -180,11 +180,9 @@ def chat(req: ChatRequest):
     user_text = req.messages[-1].content
 
     mem = get_user_memory(req.user_id)
-
     update_memory(req.user_id, user_text, req.child_age)
 
     lang = detect_language(user_text)
-
     risk = detect_risk(user_text)
 
     if risk == "high":
@@ -198,25 +196,22 @@ def chat(req: ChatRequest):
 
     reply = compose_reply(
         user_text=user_text,
-        topic="general",
         memory=mem,
         lang=lang
     )
 
     # =======================
-    # DB SAVE
+    # DB SAVE (SAFE FIXED)
     # =======================
     try:
         conn = get_conn()
         cursor = conn.cursor()
 
-        # chat messages
         cursor.execute("""
             INSERT INTO chat_messages (user_id, message, response)
             VALUES (%s, %s, %s)
         """, (req.user_id, user_text, reply))
 
-        # analytics
         cursor.execute("""
             INSERT INTO analytics (user_id, event_type, value)
             VALUES (%s, %s, %s)
@@ -227,7 +222,7 @@ def chat(req: ChatRequest):
         conn.close()
 
     except Exception as e:
-        print("DB ERROR:", e)
+        print("DB ERROR:", str(e))
 
     return ChatResponse(
         message_id=msg_id,
