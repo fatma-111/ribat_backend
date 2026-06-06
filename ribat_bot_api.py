@@ -1,5 +1,5 @@
 """
-Rafiq Bot API - SAFE FINAL VERSION
+Rafiq Bot API - FIXED FINAL VERSION
 FastAPI + PostgreSQL + Safe Gemini + Memory + Chat + Assessment
 """
 
@@ -18,7 +18,6 @@ from pydantic import BaseModel
 
 import psycopg2
 
-# Gemini (safe import)
 try:
     from google import genai
 except:
@@ -34,7 +33,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 client = None
 
-# SAFE INIT GEMINI
 if genai and GEMINI_API_KEY:
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
@@ -84,6 +82,13 @@ class ChatReq(BaseModel):
     child_age: Optional[int] = None
 
 
+# FIX 3: Pydantic model for booking instead of query params
+class BookingReq(BaseModel):
+    user_id: str
+    specialist_id: str
+    slot_id: str
+
+
 # ======================
 # UTIL
 # ======================
@@ -128,7 +133,16 @@ def update_memory(conn, user_id, text, child_age):
     row = cur.fetchone()
 
     if row:
-        notes = row[0] or []
+        # FIX 2: parse JSON string from DB before appending
+        raw = row[0]
+        if isinstance(raw, str):
+            try:
+                notes = json.loads(raw)
+            except Exception:
+                notes = []
+        else:
+            notes = raw or []
+
         notes.append(text[:150])
 
         cur.execute("""
@@ -214,21 +228,23 @@ def chat(req: ChatReq):
             VALUES (%s, %s, %s, %s)
         """, (msg_id, req.user_id, user_text, reply))
 
-      cur.execute("""
-    INSERT INTO analytics
-    (
-        event_id,
-        user_id,
-        event_type,
-        value
-    )
-    VALUES (%s,%s,%s,%s)
-""", (
-    "evt_" + uuid.uuid4().hex[:10],
-    req.user_id,
-    "chat",
-    user_text[:100]
-))
+        # FIX 1: fixed indentation for analytics insert
+        cur.execute("""
+            INSERT INTO analytics
+            (
+                event_id,
+                user_id,
+                event_type,
+                value
+            )
+            VALUES (%s,%s,%s,%s)
+        """, (
+            "evt_" + uuid.uuid4().hex[:10],
+            req.user_id,
+            "chat",
+            user_text[:100]
+        ))
+
         conn.commit()
         conn.close()
 
@@ -292,10 +308,10 @@ def memory(user_id: str):
 
 
 # ======================
-# APPOINTMENTS (SAFE)
+# APPOINTMENTS
 # ======================
 @app.post("/appointments")
-def book(user_id: str, specialist_id: str, slot_id: str):
+def book(req: BookingReq):  # FIX 3: use Pydantic model
 
     conn = get_conn()
     cur = conn.cursor()
@@ -306,9 +322,9 @@ def book(user_id: str, specialist_id: str, slot_id: str):
         VALUES (%s, %s, %s, %s, %s)
     """, (
         str(uuid.uuid4()),
-        user_id,
-        specialist_id,
-        slot_id,
+        req.user_id,
+        req.specialist_id,
+        req.slot_id,
         "pending"
     ))
 
@@ -316,7 +332,9 @@ def book(user_id: str, specialist_id: str, slot_id: str):
     conn.close()
 
     return {"status": "booked"}
-    # ======================
+
+
+# ======================
 # ASSESSMENT
 # ======================
 
@@ -384,7 +402,8 @@ def get_assessments(user_id: str):
                 "child_age": r[1],
                 "confidence": float(r[2]),
                 "result": r[3],
-                "created_at": r[4]
+                # FIX 4: added .isoformat() to avoid JSON serialization error
+                "created_at": r[4].isoformat() if r[4] else None
             }
             for r in rows
         ]
@@ -500,7 +519,7 @@ def get_user_appointments(user_id: str):
                 "specialist_id": r[1],
                 "slot_id": r[2],
                 "status": r[3],
-                "created_at": r[4]
+                "created_at": r[4].isoformat() if r[4] else None
             }
             for r in rows
         ]
