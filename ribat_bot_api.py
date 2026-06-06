@@ -214,11 +214,21 @@ def chat(req: ChatReq):
             VALUES (%s, %s, %s, %s)
         """, (msg_id, req.user_id, user_text, reply))
 
-        cur.execute("""
-            INSERT INTO analytics (user_id, event_type, value)
-            VALUES (%s, %s, %s)
-        """, (req.user_id, "chat", user_text[:100]))
-
+      cur.execute("""
+    INSERT INTO analytics
+    (
+        event_id,
+        user_id,
+        event_type,
+        value
+    )
+    VALUES (%s,%s,%s,%s)
+""", (
+    "evt_" + uuid.uuid4().hex[:10],
+    req.user_id,
+    "chat",
+    user_text[:100]
+))
         conn.commit()
         conn.close()
 
@@ -306,3 +316,235 @@ def book(user_id: str, specialist_id: str, slot_id: str):
     conn.close()
 
     return {"status": "booked"}
+    # ======================
+# ASSESSMENT
+# ======================
+
+class AssessmentReq(BaseModel):
+    user_id: str
+    child_age: int
+    result: Dict[str, Any]
+    confidence: float = 1.0
+
+
+@app.post("/assessment")
+def save_assessment(req: AssessmentReq):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO assessments
+        (
+            user_id,
+            child_age,
+            assessment_confidence,
+            result,
+            created_at
+        )
+        VALUES (%s,%s,%s,%s,NOW())
+    """, (
+        req.user_id,
+        req.child_age,
+        req.confidence,
+        json.dumps(req.result)
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "saved"}
+
+
+@app.get("/assessment/{user_id}")
+def get_assessments(user_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            child_age,
+            assessment_confidence,
+            result,
+            created_at
+        FROM assessments
+        WHERE user_id=%s
+        ORDER BY created_at DESC
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "assessments": [
+            {
+                "id": r[0],
+                "child_age": r[1],
+                "confidence": float(r[2]),
+                "result": r[3],
+                "created_at": r[4]
+            }
+            for r in rows
+        ]
+    }
+
+
+# ======================
+# SPECIALISTS
+# ======================
+
+@app.get("/specialists")
+def specialists():
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            name,
+            title,
+            topics,
+            price_egp,
+            rating
+        FROM specialists
+        ORDER BY rating DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "specialists": [
+            {
+                "id": r[0],
+                "name": r[1],
+                "title": r[2],
+                "topics": r[3],
+                "price_egp": float(r[4]),
+                "rating": float(r[5])
+            }
+            for r in rows
+        ]
+    }
+
+
+# ======================
+# SLOTS
+# ======================
+
+@app.get("/slots/{specialist_id}")
+def get_slots(specialist_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            slot_id,
+            start_time,
+            duration_min,
+            available
+        FROM slots
+        WHERE specialist_id=%s
+        ORDER BY start_time
+    """, (specialist_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "slots": [
+            {
+                "slot_id": r[0],
+                "start_time": r[1],
+                "duration_min": r[2],
+                "available": r[3]
+            }
+            for r in rows
+        ]
+    }
+
+
+# ======================
+# GET APPOINTMENTS
+# ======================
+
+@app.get("/appointments/{user_id}")
+def get_user_appointments(user_id: str):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            appointment_id,
+            specialist_id,
+            slot_id,
+            status,
+            created_at
+        FROM appointments
+        WHERE user_id=%s
+        ORDER BY created_at DESC
+    """, (user_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "appointments": [
+            {
+                "appointment_id": r[0],
+                "specialist_id": r[1],
+                "slot_id": r[2],
+                "status": r[3],
+                "created_at": r[4]
+            }
+            for r in rows
+        ]
+    }
+
+
+# ======================
+# FEEDBACK
+# ======================
+
+class FeedbackReq(BaseModel):
+    user_id: str
+    message_id: str
+    rating: int
+    comment: Optional[str] = ""
+    topic: Optional[str] = "general"
+
+
+@app.post("/feedback")
+def feedback(req: FeedbackReq):
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO feedback
+        (
+            user_id,
+            message_id,
+            rating,
+            comment,
+            topic,
+            created_at
+        )
+        VALUES (%s,%s,%s,%s,%s,NOW())
+    """, (
+        req.user_id,
+        req.message_id,
+        req.rating,
+        req.comment,
+        req.topic
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "saved"}
