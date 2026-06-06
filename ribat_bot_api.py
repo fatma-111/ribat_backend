@@ -214,21 +214,21 @@ def chat(req: ChatReq):
             VALUES (%s, %s, %s, %s)
         """, (msg_id, req.user_id, user_text, reply))
 
-      cur.execute("""
-    INSERT INTO analytics
-    (
-        event_id,
-        user_id,
-        event_type,
-        value
-    )
-    VALUES (%s,%s,%s,%s)
-""", (
-    "evt_" + uuid.uuid4().hex[:10],
-    req.user_id,
-    "chat",
-    user_text[:100]
-))
+        cur.execute("""
+            INSERT INTO analytics
+            (
+                event_id,
+                user_id,
+                event_type,
+                value
+            )
+            VALUES (%s,%s,%s,%s)
+        """, (
+            "evt_" + uuid.uuid4().hex[:10],
+            req.user_id,
+            "chat",
+            user_text[:100]
+        ))
         conn.commit()
         conn.close()
 
@@ -316,7 +316,9 @@ def book(user_id: str, specialist_id: str, slot_id: str):
     conn.close()
 
     return {"status": "booked"}
-    # ======================
+
+
+# ======================
 # ASSESSMENT
 # ======================
 
@@ -506,45 +508,3 @@ def get_user_appointments(user_id: str):
         ]
     }
 
-
-# ======================
-# FEEDBACK
-# ======================
-
-class FeedbackReq(BaseModel):
-    user_id: str
-    message_id: str
-    rating: int
-    comment: Optional[str] = ""
-    topic: Optional[str] = "general"
-
-
-@app.post("/feedback")
-def feedback(req: FeedbackReq):
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO feedback
-        (
-            user_id,
-            message_id,
-            rating,
-            comment,
-            topic,
-            created_at
-        )
-        VALUES (%s,%s,%s,%s,%s,NOW())
-    """, (
-        req.user_id,
-        req.message_id,
-        req.rating,
-        req.comment,
-        req.topic
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return {"status": "saved"}
