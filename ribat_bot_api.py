@@ -496,8 +496,102 @@ def book_slot(conn, user_id: str, specialist_id: str, slot_id: str) -> Dict[str,
 
 
 # ======================
+# LANGUAGE DETECTION
+# ======================
+def detect_lang(text: str) -> Literal["ar", "en"]:
+    """Detect if text is Arabic or English."""
+    ar_chars = len(re.findall(r'[\u0600-\u06FF]', text))
+    en_chars = len(re.findall(r'[a-zA-Z]', text))
+    return "ar" if ar_chars >= en_chars else "en"
+
+
+# Bilingual static strings
+_STRINGS: Dict[str, Dict[str, str]] = {
+    "out_of_scope_reply": {
+        "ar": "أنا بوت (رفيق) متخصص في دعم الأسرة والتواصل بين الأهل والأبناء، ومش بقدر أساعد في طلبات البرمجة/الأدوية/التشخيص.",
+        "en": "I'm Rafiq, a family support assistant. I can't help with programming, medication, or medical diagnosis requests.",
+    },
+    "out_of_scope_card": {
+        "ar": "اسألي عن: مراهقة، عصبية، موبايل، تنمر، مذاكرة، قصص للأطفال، ألعاب تربوية، تقييم شخصية الطفل…",
+        "en": "Ask about: teen communication, anger, screen time, bullying, studying, kids stories, educational games, or personality assessment.",
+    },
+    "gemini_disabled": {
+        "ar": "ميزة الشات غير مفعّلة حاليًا. التقييم (Assessment) والـ KB والـ Memory شغالين ✅",
+        "en": "Chat feature is currently disabled. Assessment, KB, and Memory are still working ✅",
+    },
+    "risk_high": {
+        "ar": "أنا قلقان/ة عليك جدًا. لو في خطر فوري، اتواصلي فورًا مع شخص كبير موثوق قريب منك، ولو الموضوع عاجل اتصلي بخدمات الطوارئ في بلدك.",
+        "en": "I'm very concerned about you. If there's immediate danger, please reach out to a trusted adult near you, or call emergency services in your country.",
+    },
+    "risk_high_card": {
+        "ar": "في الحالات العاجلة لازم تدخل إنسان/مختص فورًا. رفيق هنا للدعم العام فقط.",
+        "en": "In urgent cases, a human specialist must intervene immediately. Rafiq is here for general support only.",
+    },
+    "scope_refusal": {
+        "ar": "أنا بوت (رفيق) متخصص في دعم الأسرة. سؤالك ده خارج نطاق رفيق. اسألي عن مشكلة أسرية/تربوية وأنا أساعدك فورًا ✅",
+        "en": "I'm Rafiq, a family support assistant. Your question is outside my scope. Ask me about a parenting or family issue and I'll help right away ✅",
+    },
+    "kids_safety": {
+        "ar": "خلّينا نخلي المحتوى مناسب للأطفال 🙏 قوليلي سن الطفل وعايزين قصة/لعبة عن (الصدق/المشاركة/الشجاعة/الاحترام)؟",
+        "en": "Let's keep the content child-appropriate 🙏 Tell me the child's age and what theme you'd like (honesty/sharing/courage/respect)?",
+    },
+    "missing_slot": {
+        "ar": "تمام، ابعتي رقم الموعد بالشكل ده: (احجز sl_001).",
+        "en": "Please send the slot number like this: (book sl_001).",
+    },
+    "slot_unavailable": {
+        "ar": "الموعد ده مش متاح دلوقتي. اختاري ميعاد تاني من اللي ظاهر.",
+        "en": "This slot is no longer available. Please choose another slot from the list.",
+    },
+    "low_conf_followup": {
+        "ar": "حاسّة إن الموضوع مُتعب ومحتاج نفهمه صح قبل ما أدي خطوات محددة. ",
+        "en": "I sense this topic needs more context before I give specific advice. ",
+    },
+    "low_conf_suffix": {
+        "ar": " ولو تقدري احكيلي موقف واحد حصل قريب.",
+        "en": " And if you can, tell me about one recent situation that happened.",
+    },
+    "verify_fallback": {
+        "ar": "أنا معاكِ ✅ بس خلّيني أسألك سؤال صغير: ",
+        "en": "I'm here for you ✅ Let me ask one small question: ",
+    },
+    "assessment_result_title": {
+        "ar": "نتيجة تقييم شخصية الطفل (إرشادي)",
+        "en": "Child Personality Assessment Result (Indicative)",
+    },
+    "assessment_note": {
+        "ar": "النتيجة إرشادية وليست تشخيصًا. الشخصية بتتغير حسب العمر والبيئة.",
+        "en": "This result is indicative, not a diagnosis. Personality changes with age and environment.",
+    },
+    "booking_success": {
+        "ar": "تم الحجز ✅ رقم الحجز: ",
+        "en": "Booking confirmed ✅ Booking ID: ",
+    },
+}
+
+
+def t(key: str, lang: str) -> str:
+    """Get bilingual string."""
+    return _STRINGS.get(key, {}).get(lang, _STRINGS.get(key, {}).get("ar", ""))
+
+
+# ======================
 # MEMORY (PostgreSQL)
 # ======================
+def ensure_user_exists(conn, user_id: str):
+    """Upsert user row so FK constraints never fail."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO users (user_id, child_age, notes)
+        VALUES (%s, NULL, %s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id, json.dumps([]))
+    )
+    conn.commit()
+
+
 def get_memory(conn, user_id: str) -> Dict[str, Any]:
     cur = conn.cursor()
     cur.execute("SELECT notes, child_age FROM users WHERE user_id=%s", (user_id,))
@@ -516,6 +610,7 @@ def get_memory(conn, user_id: str) -> Dict[str, Any]:
 
 
 def update_memory(conn, user_id: str, topic: str, child_age: Optional[int], note: str = ""):
+    ensure_user_exists(conn, user_id)
     cur = conn.cursor()
     cur.execute("SELECT notes FROM users WHERE user_id=%s", (user_id,))
     row = cur.fetchone()
@@ -920,10 +1015,20 @@ def assessment_questions(age: Optional[int] = None):
 
 @app.post("/assessment/submit")
 def assessment_submit(req: AssessmentSubmitReq):
+    # Detect language from first answer text or default to Arabic
+    lang = detect_lang(req.user_id) if req.user_id else "ar"
+    # Better: detect from any string field available
+    sample = " ".join([str(a.get("value", "")) for a in (req.answers or [])])
+    lang = detect_lang(sample) if sample.strip() else "ar"
+
     profile = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
     assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
 
     conn = get_conn()
+
+    # FIX: ensure user exists before any FK-constrained insert
+    ensure_user_exists(conn, req.user_id)
+
     cur = conn.cursor()
     cur.execute(
         """
@@ -934,27 +1039,45 @@ def assessment_submit(req: AssessmentSubmitReq):
     )
     conn.commit()
 
-    update_memory(conn, req.user_id, "assessment_personality", req.child_age, note="Assessment submitted")
-    log_event(conn, req.user_id, "assessment_submit", meta={"confidence": assess_conf["confidence"]})
+    note = "Assessment submitted" if lang == "en" else "تم إرسال التقييم"
+    update_memory(conn, req.user_id, "assessment_personality", req.child_age, note=note)
+    log_event(conn, req.user_id, "assessment_submit", value=f"confidence={assess_conf['confidence']}")
     conn.close()
+
+    # Bilingual result body
+    if lang == "en":
+        personalities_str = "\n".join([f"- {p['name']} (match {p['match']}%) — needs: {p['need']}" for p in profile["possible_personalities"]])
+        top_str    = "\n".join([f"- {tr}: {v}%" for tr, v in profile["top_traits"]])
+        low_str    = "\n".join([f"- {tr}: {v}%" for tr, v in profile["low_traits"]])
+        result_body = (
+            f"Closest personality types:\n{personalities_str}\n\n"
+            f"Strongest traits:\n{top_str}\n\n"
+            f"Traits needing support:\n{low_str}\n\n"
+            f"Note: {t('assessment_note', 'en')}"
+        )
+        conf_title = "Assessment Confidence Score"
+    else:
+        personalities_str = "\n".join([f"- {p['name']} (تطابق {p['match']}%) — يحتاج: {p['need']}" for p in profile["possible_personalities"]])
+        top_str    = "\n".join([f"- {tr}: {v}%" for tr, v in profile["top_traits"]])
+        low_str    = "\n".join([f"- {tr}: {v}%" for tr, v in profile["low_traits"]])
+        result_body = (
+            f"أقرب الشخصيات المحتملة:\n{personalities_str}\n\n"
+            f"أقوى السمات:\n{top_str}\n\n"
+            f"سمات تحتاج دعم:\n{low_str}\n\n"
+            f"ملاحظة: {t('assessment_note', 'ar')}"
+        )
+        conf_title = "درجة ثقة التقييم"
 
     cards = [
         Card(
             type="assessment_result",
-            title="نتيجة تقييم شخصية الطفل (إرشادي)",
-            body=(
-                "أقرب الشخصيات المحتملة:\n" +
-                "\n".join([f"- {p['name']} (تطابق {p['match']}%) — يحتاج: {p['need']}" for p in profile["possible_personalities"]]) +
-                "\n\nأقوى السمات:\n" +
-                "\n".join([f"- {t}: {v}%" for t, v in profile["top_traits"]]) +
-                "\n\nسمات تحتاج دعم:\n" +
-                "\n".join([f"- {t}: {v}%" for t, v in profile["low_traits"]]) +
-                f"\n\nملاحظة: {profile['note']}"
-            ),
+            title=t("assessment_result_title", lang),
+            body=result_body,
             meta=profile
         ),
         Card(
-            type="confidence", title="درجة ثقة التقييم",
+            type="confidence",
+            title=conf_title,
             body=f"{assess_conf['confidence']}%",
             meta=assess_conf
         )
@@ -1146,28 +1269,33 @@ def chat(req: ChatRequest):
 
     message_id = "msg_" + uuid.uuid4().hex[:10]
     user_text = req.messages[-1].content.strip()
+    lang = detect_lang(user_text)   # "ar" or "en" — drives ALL reply strings
 
     # Hard guards (no DB needed)
     if hard_out_of_scope(user_text) or hard_medical(user_text):
         return ChatResponse(
             message_id=message_id,
-            reply="أنا بوت (رفيق) متخصص في دعم الأسرة والتواصل بين الأهل والأبناء، ومش بقدر أساعد في طلبات البرمجة/الأدوية/التشخيص.",
-            cards=[Card(type="refusal", title="خارج نطاق رفيق",
-                        body="اسألي عن: مراهقة، عصبية، موبايل، تنمر، مذاكرة، قصص للأطفال، ألعاب تربوية، تقييم شخصية الطفل…")]
+            reply=t("out_of_scope_reply", lang),
+            cards=[Card(type="refusal",
+                        title="Out of Rafiq scope" if lang == "en" else "خارج نطاق رفيق",
+                        body=t("out_of_scope_card", lang))]
         )
 
     # Gemini check
     if not GEMINI_ENABLED or client is None:
         return ChatResponse(
             message_id=message_id,
-            reply="ميزة الشات غير مفعّلة حاليًا. التقييم (Assessment) والـ KB والـ Memory شغالين ✅",
-            cards=[Card(type="warning", title="Gemini غير مفعّل", body="ضيفي GEMINI_API_KEY في Environment Variables.")]
+            reply=t("gemini_disabled", lang),
+            cards=[Card(type="warning",
+                        title="Gemini disabled" if lang == "en" else "Gemini غير مفعّل",
+                        body="Add GEMINI_API_KEY to Environment Variables." if lang == "en"
+                             else "ضيفي GEMINI_API_KEY في Environment Variables.")]
         )
 
     conn = get_conn()
 
     slot_from_text = extract_slot_id(user_text)
-    wants_booking = any(x in user_text for x in ["احجز", "حجز", "استشارة", "مختص", "دكتور"])
+    wants_booking = any(x in user_text for x in ["احجز", "حجز", "استشارة", "مختص", "دكتور", "book", "specialist", "appointment"])
     risk_level = detect_risk_level(user_text)
 
     # High risk → immediate response
@@ -1176,13 +1304,10 @@ def chat(req: ChatRequest):
         conn.close()
         return ChatResponse(
             message_id=message_id,
-            reply=(
-                "أنا قلقان/ة عليك جدًا. لو في خطر فوري، "
-                "اتواصلي فورًا مع شخص كبير موثوق قريب منك، "
-                "ولو الموضوع عاجل اتصلي بخدمات الطوارئ في بلدك."
-            ),
-            cards=[Card(type="warning", title="مهم جدًا",
-                        body="في الحالات العاجلة لازم تدخل إنسان/مختص فورًا. رفيق هنا للدعم العام فقط.",
+            reply=t("risk_high", lang),
+            cards=[Card(type="warning",
+                        title="Important" if lang == "en" else "مهم جدًا",
+                        body=t("risk_high_card", lang),
                         meta={"risk_level": "high"})]
         )
 
@@ -1200,7 +1325,8 @@ def chat(req: ChatRequest):
         decision.action = "book_appointment"
         decision.slot_id = slot_from_text
 
-    # Log analytics
+    # Log analytics (ensure user exists first)
+    ensure_user_exists(conn, req.user_id)
     log_event(conn, req.user_id, "chat_message", value=user_text[:300])
 
     # Out of scope
@@ -1208,8 +1334,10 @@ def chat(req: ChatRequest):
         conn.close()
         return ChatResponse(
             message_id=message_id,
-            reply="أنا بوت (رفيق) متخصص في دعم الأسرة. سؤالك ده خارج نطاق رفيق. اسألي عن مشكلة أسرية/تربوية وأنا أساعدك فورًا ✅",
-            cards=[Card(type="refusal", title="خارج نطاق رفيق", body=f"السبب: {decision.reason}")]
+            reply=t("scope_refusal", lang),
+            cards=[Card(type="refusal",
+                        title="Out of Rafiq scope" if lang == "en" else "خارج نطاق رفيق",
+                        body=f"Reason: {decision.reason}" if lang == "en" else f"السبب: {decision.reason}")]
         )
 
     # Kids safety
@@ -1218,8 +1346,11 @@ def chat(req: ChatRequest):
         conn.close()
         return ChatResponse(
             message_id=message_id,
-            reply="خلّينا نخلي المحتوى مناسب للأطفال 🙏 قوليلي سن الطفل وعايزين قصة/لعبة عن (الصدق/المشاركة/الشجاعة/الاحترام)؟",
-            cards=[Card(type="warning", title="محتوى مناسب للأطفال", body="اختاري موضوع آمن ومناسب للسن.")]
+            reply=t("kids_safety", lang),
+            cards=[Card(type="warning",
+                        title="Child-appropriate content" if lang == "en" else "محتوى مناسب للأطفال",
+                        body="Choose a safe, age-appropriate topic." if lang == "en"
+                             else "اختاري موضوع آمن ومناسب للسن.")]
         )
 
     # Memory
@@ -1240,8 +1371,11 @@ def chat(req: ChatRequest):
             conn.close()
             return ChatResponse(
                 message_id=message_id,
-                reply="تمام، ابعتي رقم الموعد بالشكل ده: (احجز sl_001).",
-                cards=[Card(type="warning", title="ناقص بيانات الحجز", body="محتاجين slot_id زي sl_001.")]
+                reply=t("missing_slot", lang),
+                cards=[Card(type="warning",
+                            title="Missing booking data" if lang == "en" else "ناقص بيانات الحجز",
+                            body="We need a slot_id like sl_001." if lang == "en"
+                                 else "محتاجين slot_id زي sl_001.")]
             )
 
         sync_slots_with_booked(conn)
@@ -1250,19 +1384,24 @@ def chat(req: ChatRequest):
             sp = next((x for x in SPECIALISTS if x["id"] == specialist_id), None)
             log_event(conn, req.user_id, "booking_created", value=slot_id)
             conn.close()
+            sp_name = sp["name"] if sp else specialist_id
             return ChatResponse(
                 message_id=message_id,
-                reply=f"تم الحجز ✅ رقم الحجز: {appt['appointment_id']}.",
-                cards=[Card(type="booking", title="تفاصيل الحجز",
-                            body=f"المختص: {sp['name'] if sp else specialist_id}\nslot_id: {slot_id}",
+                reply=f"{t('booking_success', lang)}{appt['appointment_id']}.",
+                cards=[Card(type="booking",
+                            title="Booking details" if lang == "en" else "تفاصيل الحجز",
+                            body=f"Specialist: {sp_name}\nslot_id: {slot_id}" if lang == "en"
+                                 else f"المختص: {sp_name}\nslot_id: {slot_id}",
                             meta=appt)]
             )
         except ValueError:
             conn.close()
             return ChatResponse(
                 message_id=message_id,
-                reply="الموعد ده مش متاح دلوقتي. اختاري ميعاد تاني من اللي ظاهر.",
-                cards=[Card(type="warning", title="الموعد غير متاح", body="جرّبي slot_id مختلف.")]
+                reply=t("slot_unavailable", lang),
+                cards=[Card(type="warning",
+                            title="Slot unavailable" if lang == "en" else "الموعد غير متاح",
+                            body="Try a different slot_id." if lang == "en" else "جرّبي slot_id مختلف.")]
             )
 
     # Normal answer flow
@@ -1280,30 +1419,30 @@ def chat(req: ChatRequest):
 
     # Low confidence → ask follow-up first
     if topic in PARENTING_TOPICS and not kb_res.matched and conf < 65:
-        q = followups[0] if followups else "سن الطفل قد إيه؟"
+        q = followups[0] if followups else ("How old is the child?" if lang == "en" else "سن الطفل قد إيه؟")
         conn.close()
         return ChatResponse(
             message_id=message_id,
-            reply=(
-                "حاسّة إن الموضوع مُتعب ومحتاج نفهمه صح قبل ما أدي خطوات محددة. "
-                f"{q} "
-                "ولو تقدري احكيلي موقف واحد حصل قريب."
-            ),
+            reply=t("low_conf_followup", lang) + q + t("low_conf_suffix", lang),
             cards=[
-                Card(type="confidence", title="درجة الثقة (إرشادي)", body=f"{conf}%",
-                     meta={"confidence": conf, "matched": kb_res.matched}),
-                Card(type="warning", title="سؤال متابعة سريع", body=q, meta={"followups": followups}),
+                Card(type="confidence",
+                     title="Confidence score" if lang == "en" else "درجة الثقة (إرشادي)",
+                     body=f"{conf}%", meta={"confidence": conf, "matched": kb_res.matched}),
+                Card(type="warning",
+                     title="Quick follow-up" if lang == "en" else "سؤال متابعة سريع",
+                     body=q, meta={"followups": followups}),
             ]
         )
 
-    # Compose with Gemini
-    intro = empathy_reflect(user_text, topic, risk_level)
+    # Compose with Gemini — inject lang in system prompt
+    intro = empathy_reflect(user_text, topic, risk_level) if lang == "ar" else ""
     try:
         final_text = intro + gemini_compose_answer(
             user_text=user_text, topic=topic, tips=tips,
             specialists=specialists, slots=slots_list,
             memory=mem, followups=followups,
-            confidence=conf, risk_level=risk_level
+            confidence=conf, risk_level=risk_level,
+            lang=lang
         )
     except HTTPException:
         conn.close()
@@ -1318,7 +1457,8 @@ def chat(req: ChatRequest):
                            "memory": mem, "followups": followups, "confidence": conf, "risk_level": risk_level}
         verdict = gemini_verify_answer(user_text, final_text, allowed_payload)
         if not verdict.get("ok", True):
-            final_text = "أنا معاكِ ✅ بس خلّيني أسألك سؤال صغير: " + (followups[0] if followups else "سن الطفل قد إيه؟")
+            fallback_q = followups[0] if followups else ("How old is the child?" if lang == "en" else "سن الطفل قد إيه؟")
+            final_text = t("verify_fallback", lang) + fallback_q
 
     # Save to DB
     cur = conn.cursor()
@@ -1329,40 +1469,68 @@ def chat(req: ChatRequest):
     conn.commit()
     conn.close()
 
-    # Build cards
+    # Build cards (bilingual titles)
     cards: List[Card] = []
-    for t in tips:
-        ctype, ctitle = "tip", "نصيحة عملية"
-        if topic == "kids_stories":
-            ctype, ctitle = "story", "قصة للأطفال"
-        elif topic == "activities_games":
-            ctype, ctitle = "game", "لعبة/نشاط"
-        elif topic == "book_recommendations":
-            ctype, ctitle = "books", "اقتراح قراءة"
-        elif topic == "assessment_personality":
-            ctype, ctitle = "assessment_question", "تقييم شخصية الطفل"
-        cards.append(Card(type=ctype, title=ctitle, body=t["tip"],
-                          meta={"kb_id": t["id"], "topic": t["topic"], "age_used": age,
+    card_labels = {
+        "tip":                ("Practical tip",             "نصيحة عملية"),
+        "kids_stories":       ("Kids story",                "قصة للأطفال"),
+        "activities_games":   ("Activity / game",           "لعبة/نشاط"),
+        "book_recommendations":("Reading suggestion",       "اقتراح قراءة"),
+        "assessment_personality":("Personality assessment", "تقييم شخصية الطفل"),
+    }
+
+    for tip_item in tips:
+        if topic in card_labels:
+            ctype = topic if topic != "tip" else "tip"
+            ctitle = card_labels[topic][0 if lang == "en" else 1]
+        else:
+            ctype, ctitle = "tip", card_labels["tip"][0 if lang == "en" else 1]
+        # fix ctype for valid Card types
+        ctype_map = {"kids_stories": "story", "activities_games": "game",
+                     "book_recommendations": "books", "assessment_personality": "assessment_question"}
+        ctype = ctype_map.get(ctype, "tip")
+        cards.append(Card(type=ctype, title=ctitle, body=tip_item["tip"],
+                          meta={"kb_id": tip_item["id"], "topic": tip_item["topic"], "age_used": age,
                                 "matched": kb_res.matched, "used_default": kb_res.used_default}))
 
-    cards.append(Card(type="confidence", title="درجة الثقة (إرشادي)", body=f"{conf}%",
-                      meta={"confidence": conf, "matched": kb_res.matched, "risk_level": risk_level}))
+    cards.append(Card(
+        type="confidence",
+        title="Confidence score" if lang == "en" else "درجة الثقة (إرشادي)",
+        body=f"{conf}%",
+        meta={"confidence": conf, "matched": kb_res.matched, "risk_level": risk_level}
+    ))
 
     if conf < 70 or (topic in PARENTING_TOPICS and not kb_res.matched):
-        cards.append(Card(type="warning", title="سؤال متابعة سريع",
-                          body="- " + "\n- ".join(followups[:1]), meta={"followups": followups}))
+        cards.append(Card(
+            type="warning",
+            title="Quick follow-up" if lang == "en" else "سؤال متابعة سريع",
+            body="- " + "\n- ".join(followups[:1]),
+            meta={"followups": followups}
+        ))
 
     if show_specialists:
-        for s in specialists:
-            cards.append(Card(type="specialist", title=f"{s['name']} — {s['title']}",
-                              body=f"السعر: {s['price_egp']} جنيه | التقييم: {s['rating']}",
-                              meta={"specialist_id": s["id"], "topics": s["topics"]}))
+        for sp in specialists:
+            cards.append(Card(
+                type="specialist",
+                title=f"{sp['name']} — {sp['title']}",
+                body=f"Price: {sp['price_egp']} EGP | Rating: {sp['rating']}" if lang == "en"
+                     else f"السعر: {sp['price_egp']} جنيه | التقييم: {sp['rating']}",
+                meta={"specialist_id": sp["id"], "topics": sp["topics"]}
+            ))
 
     if slots_list and show_specialists:
-        body = "\n".join([f"- {sl['slot_id']}: {sl['start']} ({sl['duration_min']} دقيقة)" for sl in slots_list])
-        cards.append(Card(type="booking", title="مواعيد متاحة",
-                          body=body + "\n\nللحجز ابعتي: احجز sl_001",
-                          meta={"slot_ids": [sl["slot_id"] for sl in slots_list],
-                                "specialist_id": specialists[0]["id"] if specialists else None}))
+        if lang == "en":
+            body = "\n".join([f"- {sl['slot_id']}: {sl['start']} ({sl['duration_min']} min)" for sl in slots_list])
+            body += "\n\nTo book, send: book sl_001"
+        else:
+            body = "\n".join([f"- {sl['slot_id']}: {sl['start']} ({sl['duration_min']} دقيقة)" for sl in slots_list])
+            body += "\n\nللحجز ابعتي: احجز sl_001"
+        cards.append(Card(
+            type="booking",
+            title="Available slots" if lang == "en" else "مواعيد متاحة",
+            body=body,
+            meta={"slot_ids": [sl["slot_id"] for sl in slots_list],
+                  "specialist_id": specialists[0]["id"] if specialists else None}
+        ))
 
     return ChatResponse(message_id=message_id, reply=final_text, cards=cards)
