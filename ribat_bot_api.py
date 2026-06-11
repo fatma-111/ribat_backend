@@ -30,6 +30,16 @@ except Exception:
     genai = None          # type: ignore
     genai_types = None    # type: ignore
 
+try:
+    import firebase_admin
+    from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
+    _FIREBASE_AVAILABLE = True
+except ImportError:
+    firebase_admin = None  # type: ignore
+    fb_credentials = None  # type: ignore
+    fb_messaging   = None  # type: ignore
+    _FIREBASE_AVAILABLE = False
+
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
@@ -54,6 +64,24 @@ if GEMINI_ENABLED:
 else:
     print("Gemini disabled")
 
+# ── Firebase Admin SDK init ────────────────────
+FIREBASE_ENABLED = False
+_FIREBASE_CREDS_JSON = os.getenv("FIREBASE_CREDENTIALS", "").strip()
+if _FIREBASE_AVAILABLE and _FIREBASE_CREDS_JSON:
+    try:
+        _fb_cred_dict = json.loads(_FIREBASE_CREDS_JSON)
+        _fb_cred      = fb_credentials.Certificate(_fb_cred_dict)
+        firebase_admin.initialize_app(_fb_cred)
+        FIREBASE_ENABLED = True
+        print("Firebase initialized ✔")
+    except Exception as _fb_exc:
+        print(f"Firebase init failed: {_fb_exc}")
+else:
+    if not _FIREBASE_AVAILABLE:
+        print("firebase-admin not installed — FCM disabled")
+    else:
+        print("FIREBASE_CREDENTIALS not set — FCM disabled")
+
 app = FastAPI(
     title="Rafiq Bot API",
     version="3.0.0",
@@ -65,6 +93,10 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def on_startup():
+    _run_schema_migrations()
+
 # ──────────────────────────────────────────────
 # DATABASE
 # ──────────────────────────────────────────────
@@ -72,6 +104,31 @@ def get_conn():
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def _run_schema_migrations() -> None:
+    """Apply schema additions that may not exist yet (idempotent)."""
+    if not DATABASE_URL:
+        print("Skipping DB migrations — DATABASE_URL not set")
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        cur  = conn.cursor()
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_tips (
+                id         SERIAL PRIMARY KEY,
+                user_id    VARCHAR(100),
+                tip        TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+        print("DB migrations applied ✔")
+    except Exception as exc:
+        print(f"DB migration warning: {exc}")
 
 # ──────────────────────────────────────────────
 # KNOWLEDGE BASE
@@ -252,6 +309,14 @@ class AssessmentSubmitReq(BaseModel):
     child_age: Optional[int] = None
     answers: List[Dict[str, Any]] = []
     behavior_signals: Optional[Dict[str, Any]] = None
+
+class RegisterTokenReq(BaseModel):
+    user_id: str
+    fcm_token: str
+
+class SendDailyTipReq(BaseModel):
+    user_id: str
+    tip: str
 
 # Router model for Gemini structured output
 AllowedTopic = Literal[
@@ -1084,6 +1149,147 @@ def memory_get(user_id: str):
     data = get_memory(conn, user_id)
     conn.close()
     return {"user_id": user_id, "memory": data}
+
+# ──────────────────────────────────────────────
+# ROUTES — FCM / PUSH NOTIFICATIONS
+# ──────────────────────────────────────────────
+
+@app.post("/register-token", tags=["Notifications"])
+def register_token(req: RegisterTokenReq):
+    """Save or update a user's FCM device token."""
+    conn = get_conn()
+    try:
+        ensure_user_exists(conn, req.user_id)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET fcm_token = %s, updated_at = NOW() WHERE user_id = %s",
+            (req.fcm_token, req.user_id)
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"User '{req.user_id}' not found")
+        conn.commit()
+        log_event(conn, req.user_id, "fcm_token_registered", value=req.fcm_token[:20])
+        return {"ok": True, "user_id": req.user_id, "message": "FCM token saved successfully"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
+
+
+@app.post("/send-daily-tip", tags=["Notifications"])
+def send_daily_tip(req: SendDailyTipReq):
+    """
+    Save a parenting tip for the user, then push a Firebase notification to their device.
+    """
+    conn = get_conn()
+    try:
+        # 1 — Fetch the user's FCM token
+        cur = conn.cursor()
+        cur.execute("SELECT fcm_token FROM users WHERE user_id = %s", (req.user_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"User '{req.user_id}' not found")
+        fcm_token: Optional[str] = row[0]
+        if not fcm_token:
+            raise HTTPException(
+                status_code=422,
+                detail="User has no registered FCM token. Call POST /register-token first."
+            )
+
+        # 2 — Persist the tip
+        ensure_user_exists(conn, req.user_id)
+        cur.execute(
+            "INSERT INTO daily_tips (user_id, tip) VALUES (%s, %s)",
+            (req.user_id, req.tip)
+        )
+        conn.commit()
+
+        # 3 — Send Firebase push notification
+        if not FIREBASE_ENABLED:
+            return {
+                "ok": True,
+                "user_id": req.user_id,
+                "tip_saved": True,
+                "notification_sent": False,
+                "warning": "Firebase not configured — tip saved but no push notification sent."
+            }
+
+        try:
+            message = fb_messaging.Message(
+                notification=fb_messaging.Notification(
+                    title="💡 نصيحة اليوم من رفيق",
+                    body=req.tip[:200],
+                ),
+                token=fcm_token,
+                data={"user_id": req.user_id, "type": "daily_tip"},
+            )
+            fb_messaging.send(message)
+        except fb_messaging.UnregisteredError:
+            # Token expired — clear it so we don't retry
+            cur.execute(
+                "UPDATE users SET fcm_token = NULL WHERE user_id = %s", (req.user_id,)
+            )
+            conn.commit()
+            raise HTTPException(
+                status_code=410,
+                detail="FCM token is no longer valid (device unregistered). Token cleared — please re-register."
+            )
+        except Exception as fb_exc:
+            raise HTTPException(status_code=502, detail=f"Firebase error: {fb_exc}")
+
+        log_event(conn, req.user_id, "daily_tip_sent", value=req.tip[:100])
+        return {
+            "ok": True,
+            "user_id": req.user_id,
+            "tip_saved": True,
+            "notification_sent": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/daily-tip/{user_id}", tags=["Notifications"])
+def get_daily_tips(user_id: str, limit: int = 50):
+    """Return all saved tips for a user, newest first."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        # Verify user exists
+        cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+        cur.execute(
+            "SELECT id, tip, created_at FROM daily_tips WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+            (user_id, max(1, min(200, limit)))
+        )
+        rows = cur.fetchall()
+        return {
+            "user_id": user_id,
+            "total": len(rows),
+            "tips": [
+                {
+                    "id": r[0],
+                    "tip": r[1],
+                    "created_at": r[2].isoformat() if r[2] else None,
+                }
+                for r in rows
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
 
 # ──────────────────────────────────────────────
 # ROUTES — KNOWLEDGE BASE
