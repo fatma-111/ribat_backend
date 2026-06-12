@@ -1,12 +1,17 @@
+# ════════════════════════════════════════════════════════════════════════════
+# HOW TO ADD THIS TO main.py (ribat_bot_api.py)
+# ────────────────────────────────────────────────────────────────────────────
+# Find this existing line near the BOTTOM of your file:
+#
+#     # ROUTES — CHAT (Main)
+#
+# Paste EVERYTHING below this comment block DIRECTLY ABOVE that line.
+# Do NOT paste it at the top of the file — app must already be defined.
+# ════════════════════════════════════════════════════════════════════════════
+
+
 # ──────────────────────────────────────────────
 # ROUTES — PARENTING PLAN
-# ──────────────────────────────────────────────
-# Paste this block into main.py, just before the final chat endpoint
-# (or anywhere after the helpers section).
-# It reuses: client, GEMINI_MODEL, GEMINI_ENABLED, FIREBASE_ENABLED,
-#             get_conn, ensure_user_exists, log_event,
-#             fb_messaging (already imported at the top of main.py).
-# No existing endpoints are modified.
 # ──────────────────────────────────────────────
 
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
@@ -45,8 +50,10 @@ def generate_parenting_plan(user_id: str):
         if not row:
             raise HTTPException(
                 status_code=404,
-                detail=f"No assessment found for user '{user_id}'. "
-                       "Please complete an assessment first via POST /assessment/submit."
+                detail=(
+                    f"No assessment found for user '{user_id}'. "
+                    "Please complete an assessment first via POST /assessment/submit."
+                )
             )
 
         assessment_id, child_age, assessment_confidence, result_raw, assessed_at = row
@@ -62,16 +69,16 @@ def generate_parenting_plan(user_id: str):
                 detail=f"Failed to parse assessment result JSON: {exc}"
             )
 
-        top_traits            = result.get("top_traits", [])
+        top_traits             = result.get("top_traits", [])
         possible_personalities = result.get("possible_personalities", [])
-        trait_scores          = result.get("trait_scores", {})
+        trait_scores           = result.get("trait_scores", {})
 
         # ── 5. Build Gemini prompt ─────────────────────────────────────
-        top_archetype = (
+        top_archetype   = (
             possible_personalities[0].get("name", "غير محدد")
             if possible_personalities else "غير محدد"
         )
-        archetype_desc = (
+        archetype_desc  = (
             possible_personalities[0].get("description", "")
             if possible_personalities else ""
         )
@@ -148,7 +155,7 @@ def generate_parenting_plan(user_id: str):
                 """,
                 (user_id, plan_text)
             )
-            plan_row = cur.fetchone()
+            plan_row        = cur.fetchone()
             conn.commit()
             plan_id         = plan_row[0]
             plan_created_at = plan_row[1].isoformat() if plan_row[1] else None
@@ -171,7 +178,6 @@ def generate_parenting_plan(user_id: str):
         notification_warning = None
 
         if FIREBASE_ENABLED:
-            # Fetch the user's FCM token
             cur.execute(
                 "SELECT fcm_token FROM users WHERE user_id = %s",
                 (user_id,)
@@ -202,7 +208,7 @@ def generate_parenting_plan(user_id: str):
                     fb_messaging.send(message)
                     notification_sent = True
                 except fb_messaging.UnregisteredError:
-                    # Stale token — clear it
+                    # Stale token — clear it so we don't retry
                     cur.execute(
                         "UPDATE users SET fcm_token = NULL WHERE user_id = %s",
                         (user_id,)
@@ -219,18 +225,18 @@ def generate_parenting_plan(user_id: str):
                 "Firebase is not configured — plan saved but no push notification sent."
             )
 
-        # ── 10. Build and return response ──────────────────────────────
+        # ── 10. Return response ────────────────────────────────────────
         response: Dict[str, Any] = {
-            "ok":               True,
-            "user_id":          user_id,
-            "plan_generated":   True,
-            "plan_id":          plan_id,
-            "created_at":       plan_created_at,
-            "child_age":        child_age,
-            "top_archetype":    top_archetype,
-            "assessment_id":    assessment_id,
+            "ok":                True,
+            "user_id":           user_id,
+            "plan_generated":    True,
+            "plan_id":           plan_id,
+            "created_at":        plan_created_at,
+            "child_age":         child_age,
+            "top_archetype":     top_archetype,
+            "assessment_id":     assessment_id,
             "notification_sent": notification_sent,
-            "plan_text":        plan_text,
+            "plan_text":         plan_text,
         }
         if notification_warning:
             response["notification_warning"] = notification_warning
@@ -246,26 +252,15 @@ def generate_parenting_plan(user_id: str):
         conn.close()
 
 
-# ──────────────────────────────────────────────
-# OPTIONAL: GET /parenting-plans/{user_id}
-# Returns all saved plans for a user, newest first.
-# ──────────────────────────────────────────────
-
 @app.get("/parenting-plans/{user_id}", tags=["Parenting Plan"])
 def get_parenting_plans(user_id: str, limit: int = 10):
-    """
-    Retrieve previously generated parenting plans for a user.
-    Ordered newest first. `limit` is capped at 50.
-    """
+    """Return all saved parenting plans for a user, newest first. limit capped at 50."""
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
         if not cur.fetchone():
-            raise HTTPException(
-                status_code=404,
-                detail=f"User '{user_id}' not found."
-            )
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
         cur.execute(
             """
             SELECT id, plan_text, created_at
@@ -295,3 +290,8 @@ def get_parenting_plans(user_id: str, limit: int = 10):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     finally:
         conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ↓↓↓  EXISTING CODE CONTINUES BELOW — do not delete anything below here  ↓↓↓
+# ════════════════════════════════════════════════════════════════════════════
