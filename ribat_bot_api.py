@@ -1818,23 +1818,74 @@ def generate_parenting_plan(user_id: str):
                 detail=f"Failed to parse assessment result JSON: {exc}"
             )
 
-        top_traits             = result.get("top_traits", [])
-        possible_personalities = result.get("possible_personalities", [])
-        trait_scores           = result.get("trait_scores", {})
+        # Debug log — shows exact structure before any processing
+        print(f"[DEBUG] assessment result for user={user_id}: {json.dumps(result, ensure_ascii=False)[:600]}")
+
+        # ── Normalise helpers ──────────────────────────────────────────
+        # top_traits / low_traits can be:
+        #   format A (dict):  [{"trait": "focus", "score": 100}, ...]
+        #   format B (list):  [["focus", 100], ...]
+        def _norm_traits(raw: Any) -> List[Dict[str, Any]]:
+            out = []
+            for item in (raw or []):
+                if isinstance(item, dict):
+                    # already the expected dict format
+                    out.append({
+                        "trait": str(item.get("trait") or item.get("name") or ""),
+                        "score": int(item.get("score", 0)),
+                    })
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # ["focus", 100]  or  ("focus", 100)
+                    out.append({"trait": str(item[0]), "score": int(item[1])})
+            return out
+
+        # possible_personalities can be:
+        #   format A (dict):  [{"id":"thinker","name":"المفكر","description":"...","needs":"...","match_pct":60}, ...]
+        #   format B (dict):  [{"id":"thinker","name":"المفكر","match":60}, ...]   ← no description/needs
+        #   format C (list):  [["thinker", 60], ...]   (unlikely but handled)
+        def _norm_personalities(raw: Any) -> List[Dict[str, Any]]:
+            out = []
+            for item in (raw or []):
+                if isinstance(item, dict):
+                    out.append({
+                        "id":          str(item.get("id", "")),
+                        "name":        str(item.get("name", "غير محدد")),
+                        "description": str(item.get("description", "")),
+                        "needs":       str(item.get("needs", "")),
+                        "match_pct":   int(item.get("match_pct") or item.get("match") or 0),
+                    })
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    out.append({
+                        "id": str(item[0]), "name": str(item[0]),
+                        "description": "", "needs": "",
+                        "match_pct": int(item[1]),
+                    })
+            return out
+
+        # trait_scores can be:
+        #   format A (dict):  {"focus": 100, "leadership": 0, ...}
+        #   format B (list):  [["focus", 100], ...]
+        def _norm_scores(raw: Any) -> Dict[str, int]:
+            if isinstance(raw, dict):
+                return {str(k): int(v) for k, v in raw.items()}
+            out = {}
+            for item in (raw or []):
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    out[str(item[0])] = int(item[1])
+            return out
+
+        top_traits             = _norm_traits(result.get("top_traits", []))
+        low_traits             = _norm_traits(result.get("low_traits", []))
+        possible_personalities = _norm_personalities(result.get("possible_personalities", []))
+        trait_scores           = _norm_scores(result.get("trait_scores", {}))
+
+        print(f"[DEBUG] normalised — top_traits={top_traits}, personalities={possible_personalities}, scores={trait_scores}")
 
         # 5. Build Gemini prompt
-        top_archetype   = (
-            possible_personalities[0].get("name", "غير محدد")
-            if possible_personalities else "غير محدد"
-        )
-        archetype_desc  = (
-            possible_personalities[0].get("description", "")
-            if possible_personalities else ""
-        )
-        archetype_needs = (
-            possible_personalities[0].get("needs", "")
-            if possible_personalities else ""
-        )
+        top_arch_entry  = possible_personalities[0] if possible_personalities else {}
+        top_archetype   = top_arch_entry.get("name", "غير محدد")
+        archetype_desc  = top_arch_entry.get("description", "")
+        archetype_needs = top_arch_entry.get("needs", "")
 
         traits_text = "\n".join(
             f"  - {t['trait'].replace('_', ' ').title()}: {t['score']}%"
