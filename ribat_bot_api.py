@@ -20,8 +20,25 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 import psycopg2
+import io
+
+# reportlab — PDF generation
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
+    )
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+    _REPORTLAB_AVAILABLE = True
+except ImportError:
+    _REPORTLAB_AVAILABLE = False
+    print("WARNING: reportlab not installed — PDF export disabled. Run: pip install reportlab")
 
 try:
     from google import genai
@@ -2082,5 +2099,352 @@ def get_parenting_plans(user_id: str, limit: int = 10):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
+
+
+# ──────────────────────────────────────────────
+# ROUTES — PDF EXPORT
+# ──────────────────────────────────────────────
+
+def _build_parenting_plan_pdf(
+    user_id: str,
+    child_age: Optional[int],
+    top_archetype: str,
+    plan_text: str,
+    generated_at: str,
+) -> bytes:
+    """
+    Render a professional Arabic-friendly PDF for the parenting plan.
+    Returns raw PDF bytes.
+    """
+    buf = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2.5 * cm,
+        bottomMargin=2 * cm,
+        title=f"Rafiq Parenting Plan — {user_id}",
+        author="Rafiq AI",
+    )
+
+    W, H = A4
+    styles = getSampleStyleSheet()
+
+    # ── Custom styles ──────────────────────────────────────────────────
+    brand_green  = colors.HexColor("#1B6B3A")
+    brand_light  = colors.HexColor("#E8F5E9")
+    text_dark    = colors.HexColor("#1A1A1A")
+    text_muted   = colors.HexColor("#555555")
+    accent_gold  = colors.HexColor("#C8860A")
+
+    style_main_title = ParagraphStyle(
+        "MainTitle",
+        parent=styles["Title"],
+        fontSize=26,
+        textColor=brand_green,
+        spaceAfter=4,
+        spaceBefore=0,
+        alignment=TA_CENTER,
+        fontName="Helvetica-Bold",
+    )
+    style_subtitle = ParagraphStyle(
+        "SubTitle",
+        parent=styles["Normal"],
+        fontSize=12,
+        textColor=text_muted,
+        spaceAfter=2,
+        alignment=TA_CENTER,
+        fontName="Helvetica",
+    )
+    style_section_heading = ParagraphStyle(
+        "SectionHeading",
+        parent=styles["Heading1"],
+        fontSize=13,
+        textColor=brand_green,
+        spaceBefore=14,
+        spaceAfter=4,
+        fontName="Helvetica-Bold",
+        borderPad=4,
+    )
+    style_label = ParagraphStyle(
+        "Label",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=text_muted,
+        fontName="Helvetica-Bold",
+        spaceAfter=1,
+    )
+    style_value = ParagraphStyle(
+        "Value",
+        parent=styles["Normal"],
+        fontSize=11,
+        textColor=text_dark,
+        fontName="Helvetica",
+        spaceAfter=6,
+    )
+    style_plan_heading = ParagraphStyle(
+        "PlanHeading",
+        parent=styles["Heading2"],
+        fontSize=12,
+        textColor=accent_gold,
+        spaceBefore=10,
+        spaceAfter=3,
+        fontName="Helvetica-Bold",
+    )
+    style_plan_body = ParagraphStyle(
+        "PlanBody",
+        parent=styles["Normal"],
+        fontSize=10.5,
+        textColor=text_dark,
+        fontName="Helvetica",
+        leading=16,
+        spaceAfter=4,
+    )
+    style_bullet = ParagraphStyle(
+        "Bullet",
+        parent=styles["Normal"],
+        fontSize=10.5,
+        textColor=text_dark,
+        fontName="Helvetica",
+        leading=16,
+        leftIndent=16,
+        spaceAfter=3,
+        bulletIndent=4,
+    )
+    style_footer = ParagraphStyle(
+        "Footer",
+        parent=styles["Normal"],
+        fontSize=8,
+        textColor=text_muted,
+        alignment=TA_CENTER,
+        fontName="Helvetica",
+    )
+
+    story = []
+
+    # ── Header banner (coloured table row) ────────────────────────────
+    banner_table = Table(
+        [[Paragraph("&#x1F916; Rafiq AI", style_main_title),
+          Paragraph("رفيق", ParagraphStyle("AR", parent=style_main_title, fontSize=22))]],
+        colWidths=[(W - 4 * cm) * 0.7, (W - 4 * cm) * 0.3],
+    )
+    banner_table.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, -1), brand_green),
+        ("TEXTCOLOR",   (0, 0), (-1, -1), colors.white),
+        ("ALIGN",       (0, 0), (0, 0),   "LEFT"),
+        ("ALIGN",       (1, 0), (1, 0),   "RIGHT"),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 14),
+        ("BOTTOMPADDING",(0, 0),(-1, -1), 14),
+        ("LEFTPADDING", (0, 0), (0, 0),   16),
+        ("RIGHTPADDING",(1, 0), (1, 0),   16),
+        ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+    ]))
+    story.append(banner_table)
+    story.append(Spacer(1, 0.35 * cm))
+
+    story.append(Paragraph("Personalised 30-Day Parenting Plan", style_subtitle))
+    story.append(Paragraph("خطة تربوية مخصصة — 30 يومًا", style_subtitle))
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=brand_green, spaceAfter=10))
+
+    # ── Meta info table ────────────────────────────────────────────────
+    age_display    = f"{child_age} years" if child_age else "Not specified"
+    arch_display   = top_archetype or "Not specified"
+    date_display   = generated_at[:10] if generated_at else "—"
+
+    meta_data = [
+        ["User ID",            user_id,        "Child Age",         age_display],
+        ["Top Archetype",      arch_display,   "Generated",         date_display],
+    ]
+    meta_table = Table(
+        meta_data,
+        colWidths=[
+            (W - 4 * cm) * 0.18,
+            (W - 4 * cm) * 0.32,
+            (W - 4 * cm) * 0.18,
+            (W - 4 * cm) * 0.32,
+        ],
+        hAlign="LEFT",
+    )
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), brand_light),
+        ("BACKGROUND",    (0, 0), (0, -1), colors.HexColor("#D0EAD8")),
+        ("BACKGROUND",    (2, 0), (2, -1), colors.HexColor("#D0EAD8")),
+        ("TEXTCOLOR",     (0, 0), (0, -1), brand_green),
+        ("TEXTCOLOR",     (2, 0), (2, -1), brand_green),
+        ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME",      (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTNAME",      (1, 0), (1, -1), "Helvetica"),
+        ("FONTNAME",      (3, 0), (3, -1), "Helvetica"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("ALIGN",         (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#BBDDC7")),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
+
+    # ── Plan content ───────────────────────────────────────────────────
+    story.append(Paragraph("Parenting Plan / الخطة التربوية", style_section_heading))
+    story.append(Spacer(1, 0.2 * cm))
+
+    # Smart line-by-line rendering
+    week_keywords  = ("الأسبوع", "Week", "أسبوع")
+    bullet_markers = ("•", "-", "–", "*", "·")
+
+    for raw_line in plan_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            story.append(Spacer(1, 0.18 * cm))
+            continue
+
+        # Section/week headings
+        if any(line.startswith(kw) for kw in week_keywords) or (
+            len(line) < 80 and line.endswith(":") and not line.startswith(" ")
+        ):
+            story.append(Paragraph(_safe_xml(line), style_plan_heading))
+            continue
+
+        # Numbered list items  (1. / ١.)
+        if (len(line) > 2 and line[0].isdigit() and line[1] in (".", ")")):
+            story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(line[2:].strip())}",
+                                    style_bullet))
+            continue
+
+        # Bullet items
+        if line[0] in bullet_markers:
+            story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(line[1:].strip())}",
+                                    style_bullet))
+            continue
+
+        # Regular paragraph
+        story.append(Paragraph(_safe_xml(line), style_plan_body))
+
+    # ── Footer ─────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.6 * cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
+    story.append(Paragraph(
+        "Generated by Rafiq AI &nbsp;|&nbsp; This plan is for guidance only and is not a clinical diagnosis.",
+        style_footer,
+    ))
+    story.append(Paragraph(
+        "أُنشئت بواسطة رفيق AI &nbsp;|&nbsp; هذه الخطة إرشادية وليست تشخيصًا طبيًا.",
+        style_footer,
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+def _safe_xml(text: str) -> str:
+    """Escape characters that break ReportLab's XML parser inside Paragraph."""
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+@app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
+def export_plan_pdf(user_id: str):
+    """
+    Generate and stream a PDF of the user's latest parenting plan.
+    Returns application/pdf with filename parenting_plan_{user_id}.pdf
+    """
+    if not _REPORTLAB_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="PDF export is unavailable — reportlab is not installed. "
+                   "Run: pip install reportlab"
+        )
+
+    conn = get_conn()
+    try:
+        # ── 1. Fetch latest parenting plan ─────────────────────────────
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT pp.id, pp.plan_text, pp.created_at,
+                   u.child_age,
+                   a.result
+            FROM   parenting_plans pp
+            LEFT   JOIN users       u  ON u.user_id  = pp.user_id
+            LEFT   JOIN assessments a  ON a.user_id  = pp.user_id
+            WHERE  pp.user_id = %s
+            ORDER  BY pp.created_at DESC
+            LIMIT  1
+            """,
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No parenting plan found for user '{user_id}'. "
+                       "Generate one first via POST /generate-parenting-plan/{user_id}."
+            )
+
+        plan_id, plan_text, created_at, child_age, result_raw = row
+        generated_at = created_at.isoformat() if created_at else ""
+
+        # ── 2. Extract top archetype from assessment result ─────────────
+        top_archetype = "Not specified"
+        if result_raw:
+            try:
+                result_obj = (
+                    json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+                )
+                personalities = result_obj.get("possible_personalities", [])
+                if personalities:
+                    first = personalities[0]
+                    if isinstance(first, dict):
+                        top_archetype = first.get("name") or first.get("id") or top_archetype
+                    elif isinstance(first, (list, tuple)) and len(first) >= 1:
+                        top_archetype = str(first[0])
+            except Exception as parse_exc:
+                print(f"[PDF] Could not parse archetype: {parse_exc}")
+
+        # ── 3. Build PDF bytes ──────────────────────────────────────────
+        try:
+            pdf_bytes = _build_parenting_plan_pdf(
+                user_id=user_id,
+                child_age=child_age,
+                top_archetype=top_archetype,
+                plan_text=plan_text or "",
+                generated_at=generated_at,
+            )
+        except Exception as pdf_exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"PDF generation failed: {pdf_exc}"
+            )
+
+        # ── 4. Stream PDF response ──────────────────────────────────────
+        filename = f"parenting_plan_{user_id}.pdf"
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(pdf_bytes)),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
     finally:
         conn.close()
