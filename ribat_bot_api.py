@@ -533,48 +533,6 @@ def kb_search_v2(topic: str, query: str, age: Optional[int]) -> KbSearchResult:
     defaults = [x for x in KB if x["topic"] == topic][:3]
     return KbSearchResult(tips=defaults, matched=False, match_count=0, used_default=True)
 
-# ──────────────────────────────────────────────
-# SPECIALISTS & SLOTS
-# ──────────────────────────────────────────────
-def recommend_specialists(topic: str) -> List[Dict[str, Any]]:
-    rec = sorted(
-        [s for s in SPECIALISTS if topic in s["topics"]],
-        key=lambda x: (-x["rating"], x["price_egp"])
-    )
-    return rec[:3] or SPECIALISTS[:2]
-
-def available_slots(specialist_id: str) -> List[Dict[str, Any]]:
-    return [sl for sl in SLOTS if sl["specialist_id"] == specialist_id and sl["available"]][:3]
-
-def sync_slots_with_booked(conn) -> None:
-    cur = conn.cursor()
-    cur.execute("SELECT slot_id FROM appointments WHERE status != 'cancelled'")
-    booked = {r[0] for r in cur.fetchall()}
-    for sl in SLOTS:
-        if sl["slot_id"] in booked:
-            sl["available"] = False
-
-def book_slot(conn, user_id: str, specialist_id: str, slot_id: str) -> Dict[str, Any]:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM appointments WHERE slot_id=%s AND status != 'cancelled'",
-        (slot_id,)
-    )
-    if cur.fetchone()[0] > 0:
-        raise ValueError("Slot not available")
-    slot = next((s for s in SLOTS if s["slot_id"] == slot_id and s["specialist_id"] == specialist_id), None)
-    if not slot or not slot["available"]:
-        raise ValueError("Slot not available")
-    appt_id = "ap_" + uuid.uuid4().hex[:8]
-    cur.execute(
-        "INSERT INTO appointments (appointment_id, user_id, specialist_id, slot_id, status) VALUES (%s,%s,%s,%s,'pending')",
-        (appt_id, user_id, specialist_id, slot_id)
-    )
-    conn.commit()
-    slot["available"] = False
-    return {"appointment_id": appt_id, "user_id": user_id,
-            "specialist_id": specialist_id, "slot_id": slot_id,
-            "status": "pending", "created_at": datetime.utcnow().isoformat() + "Z"}
 
 # ──────────────────────────────────────────────
 # USER / MEMORY
@@ -1402,70 +1360,7 @@ def get_assessments(user_id: str):
         ]
     }
 
-# ──────────────────────────────────────────────
-# ROUTES — SPECIALISTS & SLOTS
-# ──────────────────────────────────────────────
-@app.get("/specialists", tags=["Specialists"])
-def specialists_list():
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT id, name, title, topics, price_egp, rating FROM specialists ORDER BY rating DESC")
-    rows = cur.fetchall()
-    conn.close()
-    if rows:
-        return {"specialists": [{"id": r[0], "name": r[1], "title": r[2], "topics": r[3],
-                                  "price_egp": float(r[4]), "rating": float(r[5])} for r in rows]}
-    return {"specialists": sorted(SPECIALISTS, key=lambda x: -x["rating"])}
-
-@app.get("/slots/{specialist_id}", tags=["Specialists"])
-def get_slots(specialist_id: str):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT slot_id, start_time, duration_min, available FROM slots WHERE specialist_id=%s ORDER BY start_time",
-        (specialist_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    if rows:
-        return {"slots": [{"slot_id": r[0], "start_time": r[1], "duration_min": r[2], "available": r[3]} for r in rows]}
-    return {"slots": [s for s in SLOTS if s["specialist_id"] == specialist_id]}
-
-# ──────────────────────────────────────────────
-# ROUTES — APPOINTMENTS
-# ──────────────────────────────────────────────
-@app.post("/appointments/book", tags=["Appointments"])
-def book(req: BookingReq):
-    conn = get_conn()
-    try:
-        ensure_user_exists(conn, req.user_id)
-        sync_slots_with_booked(conn)
-        appt = book_slot(conn, req.user_id, req.specialist_id, req.slot_id)
-        log_event(conn, req.user_id, "booking_created", value=req.slot_id)
-        return {"ok": True, "appointment": appt}
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Slot not available")
-    finally:
-        conn.close()
-
-@app.get("/appointments/{user_id}", tags=["Appointments"])
-def get_appointments(user_id: str, limit: int = 50):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT appointment_id, specialist_id, slot_id, status, created_at FROM appointments WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-        (user_id, max(1, min(200, limit)))
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return {
-        "appointments": [
-            {"appointment_id": r[0], "specialist_id": r[1], "slot_id": r[2],
-             "status": r[3], "created_at": r[4].isoformat() if r[4] else None}
-            for r in rows
-        ]
-    }
-
+# ───────────────────────────────────────
 # ──────────────────────────────────────────────
 # ROUTES — ANALYTICS
 # ──────────────────────────────────────────────
