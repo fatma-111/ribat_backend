@@ -1022,10 +1022,15 @@ def compute_personality_profile(
         print(f"[DEBUG] unmatched={unmatched_ids}")
         print(f"[DEBUG] raw scores={raw}")
 
-    # Behavior signal bonuses
+    # Behavior signal bonuses — only applied when trait already has answer data
+    # (avoids inflating max_ denominator for traits with zero answers → all-zero scores)
     bs = behavior_signals or {}
-    raw["focus"]   += max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2;  max_["focus"]   += 6
-    raw["empathy"] += int(bs.get("helps_others", 0)) * 2;               max_["empathy"] += 4
+    if max_["focus"] > 0:
+        raw["focus"]   += max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2
+        max_["focus"]  += 6
+    if max_["empathy"] > 0:
+        raw["empathy"] += int(bs.get("helps_others", 0)) * 2
+        max_["empathy"] += 4
 
     def _norm(r: float, m: float) -> int:
         return max(0, min(100, int(round(r / m * 100)))) if m > 0 else 0
@@ -2239,6 +2244,11 @@ def chat(req: ChatRequest):
 # ──────────────────────────────────────────────
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str, preferred_language: Optional[str] = None):
+    """
+    Generate a 30-day parenting plan.
+    Pass ?preferred_language=en or ?preferred_language=ar to control language.
+    Falls back to user's stored preferred_language, then 'ar'.
+    """
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini is disabled. Set GEMINI_API_KEY.")
 
@@ -2247,15 +2257,16 @@ def generate_parenting_plan(user_id: str, preferred_language: Optional[str] = No
         ensure_user_exists(conn, user_id)
         cur = conn.cursor()
 
-        # Resolve language
+        # Resolve language: explicit param > DB preference > 'ar'
         lang: Lang = "ar"
-        if preferred_language in ("ar","en"):
-            lang = preferred_language  # type: ignore[assignment]
-        else:
-            cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (user_id,))
-            row = cur.fetchone()
-            if row and row[0] in ("ar","en"):
-                lang = row[0]
+        cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (user_id,))
+        db_row = cur.fetchone()
+        db_lang = db_row[0] if db_row else None
+        for candidate in (preferred_language, db_lang):
+            if candidate in ("ar", "en"):
+                lang = candidate  # type: ignore[assignment]
+                break
+        print(f"[PLAN] user={user_id}, resolved lang={lang} (param={preferred_language}, db={db_lang})")
 
         # Fetch latest assessment
         cur.execute(
@@ -2332,9 +2343,19 @@ def generate_parenting_plan(user_id: str, preferred_language: Optional[str] = No
         notification_sent    = False
         notification_warning = None
 
-        if FIREBASE_ENABLED:
-            cur.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
-            token_row = cur.fetchone()
+        if not FIREBASE_ENABLED:
+            # Surface the real reason so it's easy to debug
+            if not _FIREBASE_AVAILABLE:
+                notification_warning = "firebase-admin package not installed. Run: pip install firebase-admin"
+            elif not _FIREBASE_CREDS_JSON:
+                notification_warning = "FIREBASE_CREDENTIALS env var is not set — push notifications disabled."
+            else:
+                notification_warning = t("firebase_not_configured", lang)
+        else:
+            # Fresh cursor — previous cursor may be in a finished transaction
+            notif_cur = conn.cursor()
+            notif_cur.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
+            token_row = notif_cur.fetchone()
             fcm_token: Optional[str] = token_row[0] if token_row else None
 
             if not fcm_token:
@@ -2351,14 +2372,15 @@ def generate_parenting_plan(user_id: str, preferred_language: Optional[str] = No
                     )
                     fb_messaging.send(message)
                     notification_sent = True
+                    print(f"[FCM] Notification sent to user={user_id}, plan_id={plan_id}")
                 except fb_messaging.UnregisteredError:
-                    cur.execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,))
+                    notif_cur.execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,))
                     conn.commit()
                     notification_warning = t("fcm_token_expired", lang)
+                    print(f"[FCM] Token expired for user={user_id}, cleared.")
                 except Exception as fb_exc:
                     notification_warning = f"Firebase send error: {fb_exc}"
-        else:
-            notification_warning = t("firebase_not_configured", lang)
+                    print(f"[FCM] Error for user={user_id}: {fb_exc}")
 
         response: Dict[str, Any] = {
             "ok":                True,
@@ -2414,7 +2436,13 @@ def get_parenting_plans(user_id: str, limit: int = 10):
 # ROUTES — PDF EXPORT
 # ──────────────────────────────────────────────
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
-def export_plan_pdf(user_id: str):
+def export_plan_pdf(user_id: str, lang: Optional[str] = None):
+    """
+    Export the latest parenting plan as a PDF.
+    - ?lang=en  → English PDF (default when user's preferred_language is 'en')
+    - ?lang=ar  → Arabic PDF
+    - omit      → auto-detected from plan_language → user preferred_language → 'ar'
+    """
     if not _REPORTLAB_AVAILABLE:
         raise HTTPException(status_code=503, detail=t("pdf_unavailable", "en"))
 
@@ -2442,12 +2470,17 @@ def export_plan_pdf(user_id: str):
         plan_id, plan_text, created_at, plan_language, child_age, user_lang_pref, result_raw = row
         generated_at = created_at.isoformat() if created_at else ""
 
-        # Resolve language: plan_language > user preferred > "ar"
-        lang: Lang = "ar"
-        for candidate in (plan_language, user_lang_pref):
-            if candidate in ("ar","en"):
-                lang = candidate  # type: ignore[assignment]
+        # Language priority:
+        #  1. Explicit ?lang= query param
+        #  2. plan_language stored when plan was generated
+        #  3. user's preferred_language
+        #  4. fallback "ar"
+        resolved_lang: Lang = "ar"
+        for candidate in (lang, plan_language, user_lang_pref):
+            if candidate in ("ar", "en"):
+                resolved_lang = candidate  # type: ignore[assignment]
                 break
+        lang = resolved_lang  # type: ignore[assignment]
 
         # Extract archetype name
         top_archetype = "Not specified" if lang == "en" else "غير محدد"
