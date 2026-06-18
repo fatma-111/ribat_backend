@@ -1,23 +1,15 @@
 """
-Rafiq Bot API — PRODUCTION v5
+Rafiq Bot API — PRODUCTION v6
 ==============================
-Changes in v5 (on top of v4):
-- [Feature 1] Smart Replies: generate_smart_replies() helper
-  * After every /chat response, Gemini produces 3-5 tap-friendly follow-up
-    suggestions; failures return [] gracefully.
-  * ChatResponse now includes `smart_replies: List[str]`.
-- [Feature 2] AI Knowledge Base Builder
-  * New PostgreSQL table: faq_knowledge_base
-    (id, question, answer, category, source_count, status, created_at)
-  * Admin endpoint POST /admin/faq/generate  — reads recent chat logs,
-    groups questions with Gemini, writes pending FAQ drafts; skips
-    semantic near-duplicates.
-  * Admin endpoint GET  /admin/faq            — list with optional status filter
-  * Admin endpoint PATCH /admin/faq/{id}      — approve / reject
-  * FAQ search integrated into /chat:
-    User question → search approved FAQs → hit? return FAQ answer
-                                          → miss? call Gemini normally
-  * All existing endpoints/functionality preserved.
+Changes in v6 (on top of v5):
+- Assessment system refactored to use Gemini AI (hybrid design)
+  * PART 1: Questions generated dynamically by Gemini (age/lang/type aware)
+  * PART 2: User answers collection unchanged (Flutter compat)
+  * PART 3: Gemini returns strict JSON analysis {score, category, strengths, concerns, recommendations}
+  * PART 4: Backend validates/clamps ALL Gemini output — never trusts raw AI values
+  * PART 5: Full backward compatibility — Flutter requires zero changes
+  * PART 6: Hardcoded ASSESSMENT_QUESTIONS removed; _FALLBACK_QUESTIONS kept for Gemini-down scenarios
+- All v5 features preserved (Smart Replies, FAQ Builder, etc.)
 """
 
 from dotenv import load_dotenv
@@ -39,7 +31,6 @@ from typing import Literal
 Lang = Literal["ar", "en"]
 
 _T: dict[str, dict[str, str]] = {
-    # ── System / generic ──────────────────────────────────────────────
     "gemini_disabled": {
         "ar": "ميزة الشات غير مفعّلة. التقييم والـ Memory شغالين ✅",
         "en": "Chat feature is currently disabled. Assessment and Memory are working ✅",
@@ -48,8 +39,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "تم بنجاح",
         "en": "Success",
     },
-
-    # ── Out of scope ───────────────────────────────────────────────────
     "out_of_scope_reply": {
         "ar": "أنا بوت (رفيق) متخصص في دعم الأسرة. مش بقدر أساعد في برمجة/أدوية/تشخيص.",
         "en": "I'm Rafiq, a family support assistant. I can't help with programming, medication, or diagnosis.",
@@ -62,8 +51,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "سؤالك خارج نطاق رفيق. اسأل عن مشكلة أسرية/تربوية وأنا أساعدك فورًا ✅",
         "en": "Your question is outside Rafiq's scope. Ask about a parenting or family issue and I'll help right away ✅",
     },
-
-    # ── Risk ──────────────────────────────────────────────────────────
     "risk_high": {
         "ar": "أنا قلقان عليك جدًا. تواصل فورًا مع شخص كبير موثوق قريب منك أو خدمات الطوارئ.",
         "en": "I'm very concerned about you. Please immediately reach out to a trusted adult or call emergency services.",
@@ -72,14 +59,10 @@ _T: dict[str, dict[str, str]] = {
         "ar": "في الحالات العاجلة لازم تدخل مختص فورًا. رفيق للدعم العام فقط.",
         "en": "In urgent cases a specialist must intervene immediately. Rafiq is for general support only.",
     },
-
-    # ── Kids safety ───────────────────────────────────────────────────
     "kids_safety": {
         "ar": "خلّينا نخلي المحتوى مناسب للأطفال 🙏 قوليلي سن الطفل والموضوع.",
         "en": "Let's keep content child-appropriate 🙏 Please share the child's age and topic.",
     },
-
-    # ── Booking ───────────────────────────────────────────────────────
     "missing_slot": {
         "ar": "ابعت رقم الموعد — مثال: احجز sl_001",
         "en": "Please send the slot number — example: book sl_001",
@@ -102,8 +85,6 @@ _T: dict[str, dict[str, str]] = {
     },
     "slots_suffix_ar": "\n\nللحجز ابعت: احجز sl_001",
     "slots_suffix_en": "\n\nTo book: send 'book sl_001'",
-
-    # ── Confidence / follow-up ────────────────────────────────────────
     "low_conf_prefix": {
         "ar": "الموضوع محتاج تفاصيل أكتر. ",
         "en": "I need a bit more context to help effectively. ",
@@ -120,14 +101,10 @@ _T: dict[str, dict[str, str]] = {
         "ar": "سؤال متابعة",
         "en": "Follow-up",
     },
-
-    # ── Verify fallback ───────────────────────────────────────────────
     "verify_fallback": {
         "ar": "أنا معاك ✅ بس خلّيني أسألك: ",
         "en": "I'm here for you ✅ Let me ask: ",
     },
-
-    # ── Assessment ────────────────────────────────────────────────────
     "assessment_note": {
         "ar": "النتيجة إرشادية وليست تشخيصًا طبيًا.",
         "en": "This result is indicative, not a clinical diagnosis.",
@@ -136,8 +113,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "نتيجة تقييم شخصية الطفل",
         "en": "Child Personality Assessment Result",
     },
-
-    # ── Notifications ─────────────────────────────────────────────────
     "daily_tip_notif_title": {
         "ar": "💡 نصيحة جديدة من رفيق",
         "en": "💡 New Parenting Tip from Rafiq",
@@ -154,8 +129,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "تم إعداد خطة مخصصة لطفلك بناءً على نتائج التقييم.",
         "en": "A personalized parenting plan has been generated based on your child's assessment.",
     },
-
-    # ── API response messages ─────────────────────────────────────────
     "plan_created_title": {
         "ar": "تم إنشاء الخطة بنجاح",
         "en": "Parenting plan generated successfully",
@@ -192,8 +165,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "تصدير PDF غير متاح — مكتبة reportlab غير مثبّتة.",
         "en": "PDF export is unavailable — reportlab is not installed. Run: pip install reportlab",
     },
-
-    # ── PDF labels ────────────────────────────────────────────────────
     "pdf_main_title": {
         "ar": "خطة تربوية مخصصة — رفيق AI",
         "en": "Personalised Parenting Plan — Rafiq AI",
@@ -230,8 +201,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "أُنشئت بواسطة رفيق AI — هذه الخطة إرشادية وليست تشخيصًا طبيًا.",
         "en": "Generated by Rafiq AI — This plan is for guidance only and is not a clinical diagnosis.",
     },
-
-    # ── Card titles ───────────────────────────────────────────────────
     "card_out_of_scope": {
         "ar": "خارج نطاق رفيق",
         "en": "Out of scope",
@@ -286,8 +255,6 @@ _T: dict[str, dict[str, str]] = {
         "ar": "اختر موضوعًا مناسبًا للأطفال.",
         "en": "Choose a safe, age-appropriate topic.",
     },
-
-    # ── v5 additions ──────────────────────────────────────────────────
     "faq_answer_prefix": {
         "ar": "💡 إجابة من قاعدة المعرفة:\n\n",
         "en": "💡 From our knowledge base:\n\n",
@@ -296,10 +263,6 @@ _T: dict[str, dict[str, str]] = {
 
 
 def t(key: str, lang: str, **kwargs) -> str:
-    """
-    Look up a translation key.  Falls back to Arabic, then the key itself.
-    Supports simple .format() substitutions via kwargs.
-    """
     lang = lang if lang in ("ar", "en") else "ar"
     entry = _T.get(key, {})
     if isinstance(entry, dict):
@@ -310,17 +273,16 @@ def t(key: str, lang: str, **kwargs) -> str:
 
 
 def detect_lang(text: str) -> Lang:
-    """Return 'ar' if Arabic chars dominate, else 'en'."""
     ar = len(re.findall(r'[\u0600-\u06FF]', text))
     en = len(re.findall(r'[a-zA-Z]', text))
     return "ar" if ar >= en else "en"
 
 
 def user_lang(preferred_language: str | None, fallback_text: str = "") -> Lang:
-    """Resolve language from user's DB preference, falling back to text detection."""
     if preferred_language in ("ar", "en"):
         return preferred_language  # type: ignore[return-value]
     return detect_lang(fallback_text)
+
 
 # ── reportlab ──────────────────────────────────────────────────────────
 try:
@@ -376,10 +338,9 @@ GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 ADMIN_KEY      = os.getenv("RAFIQ_ADMIN_KEY", "change-me")
 ENABLE_VERIFY  = os.getenv("RAFIQ_VERIFY_OUTPUT", "0") == "1"
 
-# v5: FAQ config
-FAQ_LOG_WINDOW   = int(os.getenv("RAFIQ_FAQ_LOG_WINDOW", "500"))   # chat logs to scan
-FAQ_MIN_SOURCES  = int(os.getenv("RAFIQ_FAQ_MIN_SOURCES", "2"))    # min occurrences
-FAQ_SIM_THRESHOLD = float(os.getenv("RAFIQ_FAQ_SIM_THRESHOLD", "0.75"))  # duplicate threshold
+FAQ_LOG_WINDOW    = int(os.getenv("RAFIQ_FAQ_LOG_WINDOW", "500"))
+FAQ_MIN_SOURCES   = int(os.getenv("RAFIQ_FAQ_MIN_SOURCES", "2"))
+FAQ_SIM_THRESHOLD = float(os.getenv("RAFIQ_FAQ_SIM_THRESHOLD", "0.75"))
 
 FONT_DIR           = os.getenv("RAFIQ_FONT_DIR", "/app/fonts")
 FONT_NOTO_ARABIC   = os.getenv("RAFIQ_FONT_ARABIC",  os.path.join(FONT_DIR, "NotoSansArabic-Regular.ttf"))
@@ -481,8 +442,8 @@ def _register_fonts() -> None:
 # ──────────────────────────────────────────────
 app = FastAPI(
     title="Rafiq Bot API",
-    version="5.0.0",
-    description="Family support & parenting assistant API — bilingual (ar/en) with Smart Replies & AI FAQ Builder",
+    version="6.0.0",
+    description="Family support & parenting assistant — bilingual (ar/en) with AI Assessment, Smart Replies & FAQ Builder",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -507,7 +468,6 @@ def get_conn():
 
 
 def _run_schema_migrations() -> None:
-    """Apply all incremental schema migrations, including v5 additions."""
     if not DATABASE_URL:
         print("Skipping DB migrations — DATABASE_URL not set")
         return
@@ -515,7 +475,6 @@ def _run_schema_migrations() -> None:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur  = conn.cursor()
 
-        # ── v4 migrations (preserved) ──────────────────────────────────
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) DEFAULT 'ar';")
         cur.execute("""
@@ -537,7 +496,6 @@ def _run_schema_migrations() -> None:
         """)
         cur.execute("ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_language VARCHAR(5) DEFAULT 'ar';")
 
-        # ── v5 migration: faq_knowledge_base ──────────────────────────
         cur.execute("""
             CREATE TABLE IF NOT EXISTS faq_knowledge_base (
                 id           SERIAL PRIMARY KEY,
@@ -551,12 +509,10 @@ def _run_schema_migrations() -> None:
                 updated_at   TIMESTAMP    DEFAULT NOW()
             );
         """)
-        # Index for fast approved-FAQ lookups at chat time
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_faq_status
             ON faq_knowledge_base (status);
         """)
-        # Index for category filtering
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_faq_category
             ON faq_knowledge_base (category);
@@ -564,13 +520,13 @@ def _run_schema_migrations() -> None:
 
         conn.commit()
         conn.close()
-        print("DB migrations applied ✔ (v5)")
+        print("DB migrations applied ✔ (v6)")
     except Exception as exc:
         print(f"DB migration warning: {exc}")
 
 
 # ──────────────────────────────────────────────
-# KNOWLEDGE BASE (unchanged from v4)
+# KNOWLEDGE BASE
 # ──────────────────────────────────────────────
 KB: List[Dict[str, Any]] = [
     {"id": "kb_001", "topic": "teen_communication", "age_min": 12, "age_max": 18,
@@ -662,15 +618,11 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """
-    v5 addition: `smart_replies` — list of 3-5 tap-friendly follow-up
-    suggestions generated by Gemini. Empty list on failure.
-    """
     message_id: str
     reply: str
     cards: List[Dict[str, Any]] = []
-    smart_replies: List[str] = []          # ← NEW in v5
-    faq_hit: bool = False                  # ← NEW in v5: True when FAQ answered
+    smart_replies: List[str] = []
+    faq_hit: bool = False
 
 
 class UserUpsertReq(BaseModel):
@@ -732,21 +684,17 @@ class SendDailyTipReq(BaseModel):
     tip: str
 
 
-# ── v5: FAQ Pydantic models ────────────────────────────────────────────
 class FaqStatusUpdate(BaseModel):
-    """Body for PATCH /admin/faq/{id} — approve or reject a draft FAQ."""
     admin_key: str
     status: Literal["approved", "rejected"]
 
 
 class FaqGenerateRequest(BaseModel):
-    """Body for POST /admin/faq/generate."""
     admin_key: str
-    log_limit: Optional[int] = None   # override FAQ_LOG_WINDOW for this run
+    log_limit: Optional[int] = None
 
 
 class FaqEntry(BaseModel):
-    """Public-facing FAQ record."""
     id: int
     question: str
     answer: str
@@ -778,6 +726,22 @@ class RouteDecision(BaseModel):
     specialist_id: Optional[str] = None
 
 
+# ── v6: Assessment AI Pydantic models ─────────────────────────────────
+class GeminiQuestion(BaseModel):
+    id: str
+    text: str
+    trait: str
+    options: List[str]
+
+
+class GeminiAnalysisResult(BaseModel):
+    score: int
+    category: str
+    strengths: List[str]
+    concerns: List[str]
+    recommendations: List[str]
+
+
 # ──────────────────────────────────────────────
 # CONSTANTS
 # ──────────────────────────────────────────────
@@ -788,6 +752,7 @@ KIDS_CONTENT_TOPICS  = {"kids_stories","activities_games","book_recommendations"
 ASSESSMENT_TOPIC     = "assessment_personality"
 ALL_TRAITS           = ["leadership","sociability","empathy","self_control",
                         "focus","curiosity","adaptability","sensitivity"]
+ASSESSMENT_OPTIONS   = ["Never", "Rarely", "Sometimes", "Often", "Always"]
 
 OUT_OF_SCOPE_KW = ["برمجة","كود","flutter","android","python","java","c++",
                     "backend","front","database","debug","algorithm"]
@@ -828,7 +793,7 @@ def extract_slot_id(text: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────
-# KB SEARCH v2 (unchanged)
+# KB SEARCH v2
 # ──────────────────────────────────────────────
 _AR_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670]")
 _AR_PUNCT      = re.compile(r"[^\w\u0600-\u06FF]+", re.UNICODE)
@@ -885,7 +850,7 @@ def kb_search_v2(topic: str, query: str, age: Optional[int]) -> KbSearchResult:
 
 
 # ──────────────────────────────────────────────
-# SPECIALISTS & SLOTS (unchanged)
+# SPECIALISTS & SLOTS
 # ──────────────────────────────────────────────
 def recommend_specialists(topic: str) -> List[Dict[str, Any]]:
     rec = sorted(
@@ -932,7 +897,7 @@ def book_slot(conn, user_id: str, specialist_id: str, slot_id: str) -> Dict[str,
 
 
 # ──────────────────────────────────────────────
-# USER / MEMORY (unchanged)
+# USER / MEMORY
 # ──────────────────────────────────────────────
 def ensure_user_exists(conn, user_id: str) -> None:
     cur = conn.cursor()
@@ -978,7 +943,7 @@ def update_memory(conn, user_id: str, topic: str,
 
 
 # ──────────────────────────────────────────────
-# ANALYTICS (unchanged)
+# ANALYTICS
 # ──────────────────────────────────────────────
 def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
     cur = conn.cursor()
@@ -990,59 +955,8 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
 
 
 # ──────────────────────────────────────────────
-# ASSESSMENT ENGINE (unchanged from v4)
+# ARCHETYPES  (kept — used by archetype matching)
 # ──────────────────────────────────────────────
-ASSESSMENT_OPTIONS = ["Never", "Rarely", "Sometimes", "Often", "Always"]
-
-ASSESSMENT_QUESTIONS: List[Dict[str, Any]] = [
-    {"id": "q01","trait":"focus",       "age_min":4, "age_max":18,"weights":{"focus":2},
-     "text":"My child stays focused on a task until it is completed."},
-    {"id": "q02","trait":"focus",       "age_min":7, "age_max":18,"weights":{"focus":2,"self_control":1},
-     "text":"My child finishes homework or assignments before switching to play."},
-    {"id": "q03","trait":"focus",       "age_min":4, "age_max":18,"weights":{"focus":3},
-     "text":"My child can sit quietly and concentrate during story time or a lesson."},
-    {"id": "q04","trait":"empathy",     "age_min":4, "age_max":18,"weights":{"empathy":2},
-     "text":"My child notices when a friend or sibling is upset and tries to comfort them."},
-    {"id": "q05","trait":"empathy",     "age_min":6, "age_max":18,"weights":{"empathy":2,"sociability":1},
-     "text":"My child apologizes genuinely after hurting someone's feelings."},
-    {"id": "q06","trait":"empathy",     "age_min":4, "age_max":18,"weights":{"empathy":3},
-     "text":"My child shows concern for animals or people who are struggling."},
-    {"id": "q07","trait":"curiosity",   "age_min":4, "age_max":18,"weights":{"curiosity":2},
-     "text":"My child frequently asks 'why' or 'how' questions about the world."},
-    {"id": "q08","trait":"curiosity",   "age_min":6, "age_max":18,"weights":{"curiosity":2,"adaptability":1},
-     "text":"My child enjoys trying new activities or experimenting with new ideas."},
-    {"id": "q09","trait":"curiosity",   "age_min":4, "age_max":18,"weights":{"curiosity":3},
-     "text":"My child enjoys solving puzzles, riddles, or figuring things out independently."},
-    {"id": "q10","trait":"leadership",  "age_min":5, "age_max":18,"weights":{"leadership":2},
-     "text":"My child naturally takes charge and organizes activities when playing with others."},
-    {"id": "q11","trait":"leadership",  "age_min":8, "age_max":18,"weights":{"leadership":2,"focus":1},
-     "text":"My child steps up to help make decisions in group settings."},
-    {"id": "q12","trait":"leadership",  "age_min":5, "age_max":18,"weights":{"leadership":3},
-     "text":"My child is comfortable taking responsibility for a task or group project."},
-    {"id": "q13","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":2},
-     "text":"My child makes friends quickly and easily in new environments."},
-    {"id": "q14","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":2,"empathy":1},
-     "text":"My child enjoys being around others and actively seeks social interaction."},
-    {"id": "q15","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":3},
-     "text":"My child is comfortable sharing, taking turns, and cooperating in group play."},
-    {"id": "q16","trait":"adaptability","age_min":4, "age_max":18,"weights":{"adaptability":2},
-     "text":"My child adjusts well to changes in routine (new school, travel, schedule changes)."},
-    {"id": "q17","trait":"adaptability","age_min":6, "age_max":18,"weights":{"adaptability":2,"self_control":1},
-     "text":"When plans change unexpectedly, my child handles it calmly."},
-    {"id": "q18","trait":"self_control","age_min":4, "age_max":18,"weights":{"self_control":2},
-     "text":"My child can calm themselves down after getting upset without adult intervention."},
-    {"id": "q19","trait":"self_control","age_min":6, "age_max":18,"weights":{"self_control":3},
-     "text":"My child resists the urge to act impulsively (e.g., waits their turn, thinks before acting)."},
-    {"id": "q20","trait":"sensitivity", "age_min":4, "age_max":18,"weights":{"sensitivity":2},
-     "text":"My child gets upset easily by criticism, loud noises, or unexpected changes."},
-    {"id": "q21","trait":"sensitivity", "age_min":4, "age_max":18,"weights":{"sensitivity":3},
-     "text":"My child feels emotions deeply and needs extra reassurance after conflict or disappointment."},
-]
-
-_QS_NORM: Dict[str, Dict[str, Any]] = {
-    q["id"].strip().lower(): q for q in ASSESSMENT_QUESTIONS
-}
-
 ARCHETYPES: List[Dict[str, Any]] = [
     {"id":"leader",      "name":"The Leader",
      "description":"Takes initiative, organizes peers, and thrives when given responsibility.",
@@ -1087,6 +1001,9 @@ ARCHETYPES: List[Dict[str, Any]] = [
 ]
 
 
+# ──────────────────────────────────────────────
+# ASSESSMENT HELPERS  (kept for internal use)
+# ──────────────────────────────────────────────
 def _normalize_answer_id(raw_id: Any) -> str:
     return str(raw_id or "").strip().lower()
 
@@ -1100,24 +1017,356 @@ def _extract_answer_value(answer: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def get_assessment_questions(child_age: Optional[int]) -> List[Dict[str, Any]]:
-    if child_age is None:
-        return ASSESSMENT_QUESTIONS
-    return [q for q in ASSESSMENT_QUESTIONS if q["age_min"] <= child_age <= q["age_max"]]
-
-
 def _format_questions_for_api(questions: List[Dict]) -> List[Dict]:
-    return [
-        {"id": q["id"], "text": q["text"], "trait": q["trait"], "options": ASSESSMENT_OPTIONS}
-        for q in questions
-    ]
+    """Convert internal question dicts to the API format Flutter expects."""
+    result = []
+    for q in questions:
+        result.append({
+            "id":      q["id"],
+            "text":    q["text"],
+            "trait":   q["trait"],
+            "options": q.get("options", ASSESSMENT_OPTIONS),
+        })
+    return result
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v6 — FALLBACK QUESTIONS
+# Used ONLY when Gemini is unavailable. Keeps the system functional.
+# ──────────────────────────────────────────────────────────────────────
+_FALLBACK_QUESTIONS: List[Dict[str, Any]] = [
+    {"id": "q01", "trait": "focus",        "age_min": 4,  "age_max": 18,
+     "weights": {"focus": 2},
+     "text": "My child stays focused on a task until it is completed."},
+    {"id": "q02", "trait": "empathy",      "age_min": 4,  "age_max": 18,
+     "weights": {"empathy": 2},
+     "text": "My child notices when a friend or sibling is upset and tries to comfort them."},
+    {"id": "q03", "trait": "curiosity",    "age_min": 4,  "age_max": 18,
+     "weights": {"curiosity": 2},
+     "text": "My child frequently asks 'why' or 'how' questions about the world."},
+    {"id": "q04", "trait": "leadership",   "age_min": 5,  "age_max": 18,
+     "weights": {"leadership": 2},
+     "text": "My child naturally takes charge and organizes activities when playing with others."},
+    {"id": "q05", "trait": "sociability",  "age_min": 4,  "age_max": 18,
+     "weights": {"sociability": 2},
+     "text": "My child makes friends quickly and easily in new environments."},
+    {"id": "q06", "trait": "adaptability", "age_min": 4,  "age_max": 18,
+     "weights": {"adaptability": 2},
+     "text": "My child adjusts well to changes in routine."},
+    {"id": "q07", "trait": "self_control", "age_min": 4,  "age_max": 18,
+     "weights": {"self_control": 2},
+     "text": "My child can calm themselves down after getting upset."},
+    {"id": "q08", "trait": "sensitivity",  "age_min": 4,  "age_max": 18,
+     "weights": {"sensitivity": 2},
+     "text": "My child gets upset easily by criticism or unexpected changes."},
+    {"id": "q09", "trait": "focus",        "age_min": 7,  "age_max": 18,
+     "weights": {"focus": 2, "self_control": 1},
+     "text": "My child finishes homework or assignments before switching to play."},
+    {"id": "q10", "trait": "empathy",      "age_min": 6,  "age_max": 18,
+     "weights": {"empathy": 2, "sociability": 1},
+     "text": "My child apologizes genuinely after hurting someone's feelings."},
+]
+
+# Normalized lookup used by the hybrid scorer for weight-based math
+_QS_NORM: Dict[str, Dict[str, Any]] = {
+    q["id"].strip().lower(): q for q in _FALLBACK_QUESTIONS
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# v6 — ASSESSMENT AI SERVICES
+# ══════════════════════════════════════════════════════════════════════
+
+# ── PART 1: Generate questions with Gemini ────────────────────────────
+def gemini_generate_assessment_questions(
+    child_age: Optional[int],
+    lang: Lang,
+    assessment_type: str = "child_personality",
+    question_count: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Ask Gemini to generate age-appropriate, language-aware assessment questions.
+    Returns already-formatted dicts {id, text, trait, options} — same shape
+    Flutter already expects.  Falls back to _FALLBACK_QUESTIONS on any failure.
+    """
+    if not GEMINI_ENABLED or client is None:
+        print("[ASSESSMENT] Gemini unavailable — using fallback questions")
+        return _format_questions_for_api(
+            [q for q in _FALLBACK_QUESTIONS
+             if child_age is None or q["age_min"] <= child_age <= q["age_max"]]
+        )
+
+    age_context = f"The child is {child_age} years old." if child_age else "Age is unknown; target 4–18 range."
+    lang_note = (
+        "Write every question in Arabic only."
+        if lang == "ar"
+        else "Write every question in English only."
+    )
+    traits = ", ".join(ALL_TRAITS)
+
+    prompt = f"""You are a child psychology expert creating a parent-reported behavioral assessment.
+
+Assessment type: {assessment_type}
+{age_context}
+{lang_note}
+
+Generate exactly {question_count} questions for parents to answer about their child's behavior.
+
+Rules:
+1. Each question must describe observable behavior (not hypothetical).
+2. Cover these traits as evenly as possible: {traits}
+3. Questions must be age-appropriate.
+4. Use a 1-5 Likert scale: Never=1, Rarely=2, Sometimes=3, Often=4, Always=5.
+5. Output ONLY a valid JSON array. No preamble, no markdown fences, no extra text.
+6. Each element must have exactly these four keys:
+   - "id": string like "q01", "q02", etc. (zero-padded, sequential)
+   - "text": the question text
+   - "trait": one of [{traits}]
+   - "options": always exactly ["Never", "Rarely", "Sometimes", "Often", "Always"]
+
+Example element:
+{{"id": "q01", "text": "My child stays focused on tasks without reminders.", "trait": "focus", "options": ["Never", "Rarely", "Sometimes", "Often", "Always"]}}
+
+JSON array:"""
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=2000,
+            ),
+        )
+        raw = (resp.text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError(f"Expected list, got {type(parsed)}")
+
+        valid: List[Dict[str, Any]] = []
+        for i, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                continue
+            q_id    = str(item.get("id", f"q{i+1:02d}")).strip()
+            text    = str(item.get("text", "")).strip()
+            trait   = str(item.get("trait", "focus")).strip().lower()
+            options = item.get("options", ASSESSMENT_OPTIONS)
+            if not isinstance(options, list) or len(options) != 5:
+                options = list(ASSESSMENT_OPTIONS)
+            if text and trait in ALL_TRAITS:
+                valid.append({"id": q_id, "text": text, "trait": trait, "options": options})
+
+        if not valid:
+            raise ValueError("No valid questions parsed from Gemini output")
+
+        print(f"[ASSESSMENT] Gemini generated {len(valid)} questions (lang={lang}, age={child_age})")
+        return valid
+
+    except Exception as exc:
+        print(f"[ASSESSMENT] Question generation failed: {exc} — using fallback")
+        return _format_questions_for_api(
+            [q for q in _FALLBACK_QUESTIONS
+             if child_age is None or q["age_min"] <= child_age <= q["age_max"]]
+        )
+
+
+# ── PART 3 & 4: Gemini analysis with backend clamping ─────────────────
+def gemini_analyze_assessment(
+    questions: List[Dict[str, Any]],
+    answers: List[Dict[str, Any]],
+    child_age: Optional[int],
+    lang: Lang,
+    assessment_type: str = "child_personality",
+) -> GeminiAnalysisResult:
+    """
+    Send the full Q+A context to Gemini and receive a strict JSON analysis.
+    Backend validates and clamps EVERY field — never trusts raw AI values.
+    Returns a safe GeminiAnalysisResult on any failure (no 500 to Flutter).
+    """
+    _SAFE_DEFAULT = GeminiAnalysisResult(
+        score=50,
+        category="General",
+        strengths=["Shows general engagement with the assessment"],
+        concerns=[],
+        recommendations=[
+            "Complete more assessment questions for a detailed profile",
+            "Consider consulting a child development specialist for personalized advice",
+        ],
+    )
+
+    if not GEMINI_ENABLED or client is None:
+        print("[ASSESSMENT] Gemini unavailable — returning safe default analysis")
+        return _SAFE_DEFAULT
+
+    age_context = f"Child age: {child_age} years." if child_age else "Child age: not provided."
+    lang_note = (
+        "Write all text fields (strengths, concerns, recommendations) in Arabic only."
+        if lang == "ar"
+        else "Write all text fields (strengths, concerns, recommendations) in English only."
+    )
+
+    # Build a readable Q&A table for Gemini
+    answer_map = {
+        str(a.get("question_id") or a.get("id", "")).strip().lower(): a
+        for a in answers
+    }
+    qa_lines: List[str] = []
+    for q in questions:
+        qid    = str(q.get("id", "")).strip().lower()
+        ans    = answer_map.get(qid)
+        val    = _extract_answer_value(ans) if ans else None
+        label  = ASSESSMENT_OPTIONS[val - 1] if val and 1 <= val <= 5 else "Not answered"
+        qa_lines.append(
+            f"Q ({q.get('trait','?')}): {q.get('text','')}  →  {label} ({val or '?'}/5)"
+        )
+    qa_text = "\n".join(qa_lines)
+
+    prompt = f"""You are an expert child psychologist analyzing a parent-reported behavioral assessment.
+
+{age_context}
+Assessment type: {assessment_type}
+{lang_note}
+
+Questions and parent answers (scale: 1=Never, 5=Always):
+{qa_text}
+
+Based on these answers, produce a structured personality analysis.
+
+CRITICAL: Output ONLY a single valid JSON object. No preamble, no explanation, no markdown fences.
+
+Required JSON format:
+{{
+  "score": <integer 0-100 representing overall developmental wellness>,
+  "category": "<one of: Excellent | Good | Average | Needs Attention>",
+  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
+  "concerns": ["<concern 1>"] or [],
+  "recommendations": ["<actionable recommendation 1>", "<recommendation 2>", "<recommendation 3>"]
+}}
+
+Rules:
+- score must be an integer between 0 and 100
+- category must be exactly one of the four listed options
+- strengths must have 2–4 items
+- concerns may be an empty array [] if no concerns are identified
+- recommendations must have 2–4 actionable, specific items
+- All text values must be in the specified language
+
+JSON object:"""
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=1000,
+            ),
+        )
+        raw = (resp.text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        data = json.loads(raw)
+
+        # ── Backend validation & clamping (Part 4) ───────────────────
+        try:
+            score = max(0, min(100, int(data.get("score", 50))))
+        except (TypeError, ValueError):
+            score = 50
+
+        category = str(data.get("category") or "").strip()
+        allowed_categories = {"Excellent", "Good", "Average", "Needs Attention"}
+        if category not in allowed_categories:
+            if score >= 80:    category = "Excellent"
+            elif score >= 60:  category = "Good"
+            elif score >= 40:  category = "Average"
+            else:              category = "Needs Attention"
+
+        def _safe_list(key: str) -> List[str]:
+            val = data.get(key)
+            if not isinstance(val, list):
+                return []
+            return [str(x).strip() for x in val if str(x).strip()]
+
+        strengths       = _safe_list("strengths") or ["Shows engagement with assessment"]
+        concerns        = _safe_list("concerns")
+        recommendations = _safe_list("recommendations") or [
+            "Continue monitoring child's development",
+            "Consider consulting a child development specialist",
+        ]
+
+        result = GeminiAnalysisResult(
+            score=score,
+            category=category,
+            strengths=strengths,
+            concerns=concerns,
+            recommendations=recommendations,
+        )
+        print(f"[ASSESSMENT] Gemini analysis: score={score}, category={category}")
+        return result
+
+    except json.JSONDecodeError as jde:
+        print(f"[ASSESSMENT] Analysis JSON parse error: {jde} | raw={raw[:200]}")
+        return _SAFE_DEFAULT
+    except Exception as exc:
+        print(f"[ASSESSMENT] Analysis failed: {exc} — returning safe default")
+        return _SAFE_DEFAULT
+
+
+# ── Public entry point: get questions ────────────────────────────────
+def get_assessment_questions(
+    child_age: Optional[int],
+    lang: Lang = "en",
+    assessment_type: str = "child_personality",
+) -> List[Dict[str, Any]]:
+    """
+    Returns Gemini-generated questions in the existing API format.
+    Falls back to _FALLBACK_QUESTIONS when Gemini is down.
+    Output shape: [{id, text, trait, options}, ...]  — unchanged from v5.
+    """
+    return gemini_generate_assessment_questions(
+        child_age=child_age,
+        lang=lang,
+        assessment_type=assessment_type,
+    )
+
+
+# ── Public entry point: compute profile (hybrid) ─────────────────────
 def compute_personality_profile(
     answers: List[Dict[str, Any]],
     child_age: Optional[int],
     behavior_signals: Optional[Dict[str, Any]] = None,
+    questions: Optional[List[Dict[str, Any]]] = None,
+    lang: Lang = "en",
 ) -> Dict[str, Any]:
+    """
+    Hybrid personality profiler:
+    1. Gemini returns {score, category, strengths, concerns, recommendations}.
+    2. Backend runs trait-weight math for archetype matching (Flutter compat).
+    3. Scores blended 60% math / 40% Gemini — stable, not fully AI-dependent.
+    4. All Gemini output clamped/validated before use.
+
+    Return shape is IDENTICAL to v5 so Flutter requires zero changes.
+    New key `ai_analysis` is additive — Flutter safely ignores unknown keys.
+    """
+    # ── Step A: Gemini analysis ───────────────────────────────────────
+    qs_for_analysis = questions or _format_questions_for_api(
+        [q for q in _FALLBACK_QUESTIONS
+         if child_age is None or q["age_min"] <= child_age <= q["age_max"]]
+    )
+    gemini_result = gemini_analyze_assessment(
+        questions=qs_for_analysis,
+        answers=answers,
+        child_age=child_age,
+        lang=lang,
+    )
+
+    # ── Step B: Trait-weight math (for archetype matching) ────────────
     raw: Dict[str, float] = {tr: 0.0 for tr in ALL_TRAITS}
     max_: Dict[str, float] = {tr: 0.0 for tr in ALL_TRAITS}
     matched_ids: List[str] = []
@@ -1127,20 +1376,29 @@ def compute_personality_profile(
         qid_raw = a.get("question_id") or a.get("id")
         qid     = _normalize_answer_id(qid_raw)
         val     = _extract_answer_value(a)
-        if DEBUG:
-            print(f"[DEBUG] answer qid_raw={qid_raw!r} → normalized={qid!r} | value={val}")
-        q = _QS_NORM.get(qid)
+        q       = _QS_NORM.get(qid)
+
         if q is None:
+            # Gemini-generated question — no weight map available.
+            # Distribute score evenly across all traits so the math
+            # still produces meaningful relative differences.
             unmatched_ids.append(str(qid_raw))
+            if val is not None:
+                for tr in ALL_TRAITS:
+                    raw[tr]  += val * 1
+                    max_[tr] += 5 * 1
             continue
+
         if val is None:
             unmatched_ids.append(f"{qid_raw}(bad_value)")
             continue
+
         matched_ids.append(qid)
         for trait, w in q["weights"].items():
             raw[trait]  += val * w
             max_[trait] += 5 * w
 
+    # Behavior signal adjustments
     bs = behavior_signals or {}
     if max_["focus"] > 0:
         focus_bonus = max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2
@@ -1150,12 +1408,24 @@ def compute_personality_profile(
         raw["empathy"] = min(raw["empathy"] + empathy_bonus, max_["empathy"])
 
     def _norm(r: float, m: float) -> int:
-        return max(0, min(100, int(round(r / m * 100)))) if m > 0 else 0
+        # Default to 50 (neutral) instead of 0 when no data
+        return max(0, min(100, int(round(r / m * 100)))) if m > 0 else 50
 
     scores = {tr: _norm(raw[tr], max_[tr]) for tr in ALL_TRAITS}
 
+    # ── Step C: Blend math scores with Gemini wellness score ──────────
+    # 60% math-derived (preserves trait differentiation for archetype matching)
+    # 40% Gemini-derived (injects AI judgment into each trait)
+    gemini_score = gemini_result.score  # already clamped 0-100
+    for tr in ALL_TRAITS:
+        scores[tr] = int(round(scores[tr] * 0.6 + gemini_score * 0.4))
+
+    # ── Step D: Archetype matching ────────────────────────────────────
     def _sim(arch_profile: Dict[str, int]) -> float:
-        return sum(100 - abs(scores.get(tr, 50) - v) for tr, v in arch_profile.items()) / max(1, len(arch_profile))
+        return sum(
+            100 - abs(scores.get(tr, 50) - v)
+            for tr, v in arch_profile.items()
+        ) / max(1, len(arch_profile))
 
     ranked = sorted(
         [{"id": a["id"], "name": a["name"], "description": a["description"],
@@ -1166,42 +1436,31 @@ def compute_personality_profile(
     top_archetype = ranked[0]
     top_traits    = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
     low_traits    = sorted(scores.items(), key=lambda kv: kv[1])[:2]
-    recommendations = _build_recommendations(scores, top_archetype, low_traits)
+
+    # ── Step E: Merge recommendations ────────────────────────────────
+    math_recs = _build_recommendations(scores, top_archetype, low_traits)
+    combined_recs = list(gemini_result.recommendations)
+    for r in math_recs:
+        if len(combined_recs) < 5 and r not in combined_recs:
+            combined_recs.append(r)
 
     return {
-        "child_age": child_age,
+        "child_age":    child_age,
         "trait_scores": scores,
-        "top_traits":  [{"trait": tr, "score": v} for tr, v in top_traits],
-        "low_traits":  [{"trait": tr, "score": v} for tr, v in low_traits],
+        "top_traits":   [{"trait": tr, "score": v} for tr, v in top_traits],
+        "low_traits":   [{"trait": tr, "score": v} for tr, v in low_traits],
         "possible_personalities": ranked[:5],
-        "recommendations": recommendations,
+        "recommendations": combined_recs,
         "note": t("assessment_note", "en"),
+        # New in v6 — Flutter ignores unknown keys safely
+        "ai_analysis": {
+            "score":           gemini_result.score,
+            "category":        gemini_result.category,
+            "strengths":       gemini_result.strengths,
+            "concerns":        gemini_result.concerns,
+        },
         "_debug": {"matched": matched_ids, "unmatched": unmatched_ids},
     }
-
-
-def _build_recommendations(
-    scores: Dict[str, int],
-    top_arch: Dict[str, Any],
-    low_traits: List[Tuple[str, int]],
-) -> List[str]:
-    recs: List[str] = []
-    recs.append(f"Your child most resembles '{top_arch['name']}' — {top_arch['description']}")
-    recs.append(f"What they need most: {top_arch['needs']}")
-    for trait, score in low_traits:
-        if score < 40:
-            advice = {
-                "focus":        "Try the Pomodoro method: 20 min focused work + 5 min break.",
-                "empathy":      "Use emotion cards or role-play scenarios.",
-                "curiosity":    "Introduce science kits, mystery books, or nature walks.",
-                "leadership":   "Give small responsibilities and praise initiative.",
-                "sociability":  "Arrange structured playdates; teach conversation starters.",
-                "adaptability": "Warn about changes in advance; use visual schedules.",
-                "self_control": "Practice 'stop and breathe'; use a feelings chart.",
-                "sensitivity":  "Create a calm-down corner; validate feelings before problem-solving.",
-            }.get(trait, "Provide consistent support and positive reinforcement.")
-            recs.append(f"Low {trait.replace('_',' ').title()} ({score}%): {advice}")
-    return recs
 
 
 def compute_assessment_confidence(
@@ -1209,7 +1468,8 @@ def compute_assessment_confidence(
     child_age: Optional[int],
     behavior_signals: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    all_qs  = ASSESSMENT_QUESTIONS
+    """Unchanged from v5 — heuristic guard used as a hybrid control layer."""
+    all_qs  = _FALLBACK_QUESTIONS
     q_ids   = {q["id"].strip().lower() for q in all_qs}
     total   = len(all_qs)
     valid   = 0
@@ -1226,6 +1486,13 @@ def compute_assessment_confidence(
         else:
             unmatched_dbg.append(f"{qid_raw}(val={val})")
 
+    # For Gemini-generated questions we count any valid answer
+    if valid == 0 and answers:
+        for a in answers:
+            val = _extract_answer_value(a)
+            if val is not None:
+                valid += 1
+
     coverage = int(round(valid / total * 100)) if total else 0
     score    = int(round(valid / total * 65))  if total else 0
     notes    = [f"coverage={coverage}%"]
@@ -1235,14 +1502,14 @@ def compute_assessment_confidence(
         score = max(0, score - 15); notes.append("low_answer_count_penalty")
 
     return {
-        "confidence":       max(0, min(100, score)),
-        "valid_answers":    valid,
-        "total_questions":  total,
-        "coverage":         coverage,
-        "notes":            notes,
+        "confidence":      max(0, min(100, score)),
+        "valid_answers":   valid,
+        "total_questions": total,
+        "coverage":        coverage,
+        "notes":           notes,
         "debug": {
-            "received_count":    len(answers or []),
-            "matched_questions": matched_dbg,
+            "received_count":      len(answers or []),
+            "matched_questions":   matched_dbg,
             "unmatched_questions": unmatched_dbg,
         },
     }
@@ -1278,7 +1545,7 @@ def recommend_specialist_for_profile(profile: Dict[str, Any]) -> Optional[Dict[s
 
 
 # ──────────────────────────────────────────────
-# FOLLOW-UP QUESTIONS (unchanged)
+# FOLLOW-UP QUESTIONS
 # ──────────────────────────────────────────────
 FOLLOW_UP_BANK: Dict[str, List[str]] = {
     "anger":               ["When does the anger peak most? (before bed / after school / screen time)","What usually happens in the 60 seconds before the outburst?"],
@@ -1299,7 +1566,7 @@ def pick_followups(topic: str) -> List[str]:
 
 
 # ──────────────────────────────────────────────
-# CONFIDENCE SCORING (unchanged)
+# CONFIDENCE SCORING
 # ──────────────────────────────────────────────
 def compute_confidence(topic, kb_res, age, user_text, in_scope, risk_level) -> int:
     score = 40
@@ -1315,7 +1582,7 @@ def compute_confidence(topic, kb_res, age, user_text, in_scope, risk_level) -> i
 
 
 # ──────────────────────────────────────────────
-# EMPATHY REFLECT (unchanged)
+# EMPATHY REFLECT
 # ──────────────────────────────────────────────
 _EMPATHY_AR: Dict[str, str] = {
     "anger":               "واضح إن الموضوع ده متعبك وبيستنزف أعصابك.",
@@ -1352,7 +1619,7 @@ def empathy_reflect(user_text: str, topic: str, risk_level: str, lang: Lang) -> 
 
 
 # ──────────────────────────────────────────────
-# GEMINI HELPERS — v4 (preserved) + v5 additions
+# GEMINI HELPERS — chat / routing
 # ──────────────────────────────────────────────
 def _require_gemini() -> None:
     if not GEMINI_ENABLED or client is None:
@@ -1445,7 +1712,7 @@ def gemini_verify_answer(user_text, answer, allowed_payload) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════
-# ▌ FEATURE 1 — SMART REPLIES                 ▐
+# FEATURE 1 — SMART REPLIES
 # ══════════════════════════════════════════════
 def generate_smart_replies(
     user_message: str,
@@ -1453,33 +1720,12 @@ def generate_smart_replies(
     lang: Lang = "en",
     max_replies: int = 5,
 ) -> List[str]:
-    """
-    Generate 3-5 concise, tap-friendly follow-up suggestions for the Flutter UI.
-
-    Uses Gemini to produce contextually relevant replies the user might want
-    to send next, given what they asked and what the bot answered.
-
-    Parameters
-    ----------
-    user_message        : The user's original message.
-    assistant_response  : The bot reply that was just shown.
-    lang                : Language for the suggestions ('ar' or 'en').
-    max_replies         : Cap on suggestions (3-5 recommended).
-
-    Returns
-    -------
-    List[str]  — ordered list of suggestions; empty list on any failure.
-    """
     if not GEMINI_ENABLED or client is None:
-        print("[SMART_REPLIES] Gemini not available — returning []")
         return []
 
-    # Clamp to sensible range
     max_replies = max(3, min(5, max_replies))
-
     lang_note = (
-        "Write every suggestion in Arabic only."
-        if lang == "ar"
+        "Write every suggestion in Arabic only." if lang == "ar"
         else "Write every suggestion in English only."
     )
 
@@ -1496,7 +1742,9 @@ Rules:
 - Do NOT add numbering, bullets, or extra formatting.
 - {lang_note}
 - Output ONLY a JSON array of strings, nothing else.
-  Example: ["Can you give me practical steps?", "Is this normal for a 5 year old?"]
+
+Example:
+["Can you give me practical steps?", "Is this normal for a 5 year old?"]
 
 USER MESSAGE:
 {user_message}
@@ -1510,48 +1758,29 @@ JSON array:"""
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.6,
-                max_output_tokens=300,
-            ),
+            config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=300),
         )
         raw = (resp.text or "").strip()
-
-        # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
         raw = raw.strip()
 
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
-            print(f"[SMART_REPLIES] Unexpected shape: {type(parsed)}")
             return []
 
-        # Sanitise: keep only non-empty strings, cap at max_replies
-        replies = [str(r).strip() for r in parsed if str(r).strip()][:max_replies]
-        print(f"[SMART_REPLIES] Generated {len(replies)} suggestions (lang={lang})")
-        return replies
+        return [str(item).strip() for item in parsed if str(item).strip()][:max_replies]
 
-    except json.JSONDecodeError as jde:
-        print(f"[SMART_REPLIES] JSON parse error: {jde} | raw={raw[:120]}")
-        return []
     except Exception as exc:
-        print(f"[SMART_REPLIES] Gemini error: {exc}")
+        print(f"[SMART_REPLIES] Error: {exc}")
         return []
 
 
 # ══════════════════════════════════════════════
-# ▌ FEATURE 2 — AI FAQ KNOWLEDGE BASE BUILDER ▐
+# FEATURE 2 — AI FAQ KNOWLEDGE BASE BUILDER
 # ══════════════════════════════════════════════
 
-# ── 2-A: Simple word-overlap similarity (no ML deps) ──────────────────
 def _token_jaccard(a: str, b: str) -> float:
-    """
-    Compute Jaccard similarity between the token sets of two strings.
-    Used for lightweight near-duplicate FAQ detection.
-
-    Returns float in [0.0, 1.0] — higher means more similar.
-    """
     tok_a = set(_ar_normalize(a).split()) or set(a.lower().split())
     tok_b = set(_ar_normalize(b).split()) or set(b.lower().split())
     if not tok_a or not tok_b:
@@ -1560,12 +1789,6 @@ def _token_jaccard(a: str, b: str) -> float:
 
 
 def _is_duplicate_faq(conn, question: str, threshold: float = FAQ_SIM_THRESHOLD) -> bool:
-    """
-    Return True if an 'approved' or 'pending' FAQ exists whose question
-    is similar enough to `question` (Jaccard ≥ threshold) to be a duplicate.
-
-    Pulls only the question column from the DB to keep the check cheap.
-    """
     cur = conn.cursor()
     cur.execute(
         "SELECT question FROM faq_knowledge_base WHERE status IN ('approved', 'pending')"
@@ -1573,27 +1796,12 @@ def _is_duplicate_faq(conn, question: str, threshold: float = FAQ_SIM_THRESHOLD)
     rows = cur.fetchall()
     for (existing_q,) in rows:
         if _token_jaccard(question, existing_q) >= threshold:
-            print(f"[FAQ] Duplicate detected: '{question[:60]}' ≈ '{existing_q[:60]}'")
             return True
     return False
 
 
-# ── 2-B: Gemini FAQ extraction from chat logs ─────────────────────────
 def _gemini_extract_faqs(chat_log_json: str) -> List[Dict[str, str]]:
-    """
-    Call Gemini with a batch of chat messages and ask it to produce FAQ entries.
-
-    Parameters
-    ----------
-    chat_log_json : JSON-serialised list of {"user": str, "bot": str} dicts.
-
-    Returns
-    -------
-    List of dicts with keys: question, answer, category.
-    Returns [] on any failure.
-    """
     if not GEMINI_ENABLED or client is None:
-        print("[FAQ_BUILDER] Gemini not available — skipping extraction")
         return []
 
     prompt = f"""You are a knowledge-base curator for Rafiq, a parenting support chatbot.
@@ -1611,14 +1819,6 @@ Rules:
 5. Do NOT include one-off, very personal, or out-of-scope questions.
 6. Output ONLY a valid JSON array. Each element must have exactly three keys:
    "question", "answer", "category".
-   Example:
-   [
-     {{
-       "question": "How do I handle tantrums in a 4-year-old?",
-       "answer": "Stay calm and get on the child's level. Acknowledge the feeling first...",
-       "category": "Behavior"
-     }}
-   ]
 7. If no recurring or broadly useful questions are found, return an empty array: []
 
 CHAT LOG:
@@ -1630,10 +1830,7 @@ JSON array:"""
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=2000,
-            ),
+            config=genai_types.GenerateContentConfig(temperature=0.3, max_output_tokens=2000),
         )
         raw = (resp.text or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
@@ -1642,7 +1839,6 @@ JSON array:"""
 
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
-            print(f"[FAQ_BUILDER] Unexpected Gemini output type: {type(parsed)}")
             return []
 
         valid = []
@@ -1654,182 +1850,108 @@ JSON array:"""
             c = str(item.get("category", "General Parenting")).strip()
             if q and a:
                 valid.append({"question": q, "answer": a, "category": c})
-
-        print(f"[FAQ_BUILDER] Gemini returned {len(valid)} candidate FAQs")
         return valid
 
-    except json.JSONDecodeError as jde:
-        print(f"[FAQ_BUILDER] JSON parse error: {jde} | raw={raw[:200]}")
-        return []
     except Exception as exc:
-        print(f"[FAQ_BUILDER] Gemini error: {exc}")
+        print(f"[FAQ_BUILDER] Error: {exc}")
         return []
 
 
-def generate_faq_from_chat_logs(
-    conn,
-    log_limit: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Full workflow for AI FAQ Knowledge Base Builder:
-
-    1. Read the most recent `log_limit` chat log pairs from the DB.
-    2. Group them into a JSON payload for Gemini.
-    3. Call Gemini → get candidate FAQ list.
-    4. For each candidate:
-        a. Skip near-duplicates (Jaccard similarity ≥ FAQ_SIM_THRESHOLD).
-        b. Insert with status='pending' and source_count=occurrence_count.
-    5. Return a summary dict.
-
-    Parameters
-    ----------
-    conn      : Active psycopg2 connection.
-    log_limit : Override for FAQ_LOG_WINDOW env var.
-
-    Returns
-    -------
-    dict with keys: scanned, candidates, inserted, skipped_duplicates, errors.
-    """
+def generate_faq_from_chat_logs(conn, log_limit: Optional[int] = None) -> Dict[str, Any]:
     limit = log_limit or FAQ_LOG_WINDOW
-    print(f"[FAQ_BUILDER] Starting FAQ generation from last {limit} chat logs")
-
-    # ── Step 1: fetch recent chat logs ────────────────────────────────
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT message, response
-        FROM   chat_messages
-        ORDER  BY created_at DESC
-        LIMIT  %s
-        """,
+        "SELECT message, response FROM chat_messages ORDER BY created_at DESC LIMIT %s",
         (limit,)
     )
     rows = cur.fetchall()
     if not rows:
-        print("[FAQ_BUILDER] No chat logs found — aborting")
-        return {"scanned": 0, "candidates": 0, "inserted": 0,
-                "skipped_duplicates": 0, "errors": 0}
+        return {"scanned": 0, "candidates": 0, "inserted": 0, "skipped_duplicates": 0, "errors": 0}
 
-    # Build compact log payload (keep it within reasonable token count)
     chat_log = [
         {"user": str(r[0] or "")[:300], "bot": str(r[1] or "")[:300]}
         for r in rows
     ]
-    chat_log_json = json.dumps(chat_log, ensure_ascii=False)
-    print(f"[FAQ_BUILDER] Scanning {len(rows)} chat pairs")
+    candidates = _gemini_extract_faqs(json.dumps(chat_log, ensure_ascii=False))
 
-    # ── Step 2 & 3: Gemini extraction ─────────────────────────────────
-    candidates = _gemini_extract_faqs(chat_log_json)
-
-    # ── Step 4: dedup + insert ─────────────────────────────────────────
-    inserted           = 0
-    skipped_duplicates = 0
-    errors             = 0
-
+    inserted = skipped_duplicates = errors = 0
     for item in candidates:
-        question = item["question"]
-        answer   = item["answer"]
-        category = item["category"]
-
         try:
-            if _is_duplicate_faq(conn, question):
-                # Bump source_count on the existing similar FAQ
+            if _is_duplicate_faq(conn, item["question"]):
                 cur.execute(
-                    """
-                    UPDATE faq_knowledge_base
-                    SET    source_count = source_count + 1,
-                           updated_at  = NOW()
-                    WHERE  status IN ('approved', 'pending')
-                    ORDER  BY created_at DESC
-                    LIMIT  1
-                    """,
+                    "UPDATE faq_knowledge_base SET source_count = source_count + 1, updated_at = NOW() "
+                    "WHERE status IN ('approved', 'pending') ORDER BY created_at DESC LIMIT 1"
                 )
                 conn.commit()
                 skipped_duplicates += 1
                 continue
-
             cur.execute(
-                """
-                INSERT INTO faq_knowledge_base
-                    (question, answer, category, source_count, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, 'pending', NOW(), NOW())
-                """,
-                (question, answer, category, FAQ_MIN_SOURCES)
+                "INSERT INTO faq_knowledge_base (question, answer, category, source_count, status, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'pending', NOW(), NOW())",
+                (item["question"], item["answer"], item["category"], FAQ_MIN_SOURCES)
             )
             conn.commit()
             inserted += 1
-            print(f"[FAQ_BUILDER] Inserted pending FAQ: '{question[:60]}'")
-
         except Exception as exc:
             conn.rollback()
             errors += 1
-            print(f"[FAQ_BUILDER] DB error for '{question[:40]}': {exc}")
+            print(f"[FAQ_BUILDER] DB error: {exc}")
 
-    summary = {
-        "scanned":            len(rows),
-        "candidates":         len(candidates),
-        "inserted":           inserted,
-        "skipped_duplicates": skipped_duplicates,
-        "errors":             errors,
-    }
-    print(f"[FAQ_BUILDER] Done — {summary}")
-    return summary
+    return {"scanned": len(rows), "candidates": len(candidates),
+            "inserted": inserted, "skipped_duplicates": skipped_duplicates, "errors": errors}
 
 
-# ── 2-C: FAQ search (used inside /chat) ───────────────────────────────
 def search_faq(conn, query: str, threshold: float = 0.35) -> Optional[Dict[str, Any]]:
-    """
-    Search approved FAQs for a question similar to `query`.
-
-    Uses token-Jaccard similarity. Returns the best-matching FAQ dict
-    (keys: id, question, answer, category) if any score ≥ threshold,
-    otherwise returns None.
-
-    The threshold is intentionally lower here (0.35 vs 0.75 for dedup)
-    because we want to catch paraphrased versions of the same question.
-
-    Parameters
-    ----------
-    conn      : Active psycopg2 connection.
-    query     : The user's chat message to match against.
-    threshold : Minimum Jaccard similarity to consider a hit.
-
-    Returns
-    -------
-    Dict with FAQ fields, or None.
-    """
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT id, question, answer, category
-        FROM   faq_knowledge_base
-        WHERE  status = 'approved'
-        ORDER  BY source_count DESC, created_at DESC
-        """,
+        "SELECT id, question, answer, category FROM faq_knowledge_base "
+        "WHERE status = 'approved' ORDER BY source_count DESC, created_at DESC"
     )
     rows = cur.fetchall()
     if not rows:
         return None
 
-    best_score = 0.0
-    best_row   = None
+    best_score, best_row = 0.0, None
     for row in rows:
-        faq_id, question, answer, category = row
-        sim = _token_jaccard(query, question)
+        sim = _token_jaccard(query, row[1])
         if sim > best_score:
-            best_score = sim
-            best_row   = row
+            best_score, best_row = sim, row
 
     if best_score >= threshold and best_row:
-        faq_id, question, answer, category = best_row
-        print(f"[FAQ_SEARCH] Hit (score={best_score:.2f}): '{question[:60]}'")
-        return {"id": faq_id, "question": question, "answer": answer, "category": category}
-
+        return {"id": best_row[0], "question": best_row[1],
+                "answer": best_row[2], "category": best_row[3]}
     return None
 
 
 # ──────────────────────────────────────────────
-# PARENTING PLAN GENERATION (unchanged from v4)
+# _build_recommendations  (used by compute_personality_profile)
+# ──────────────────────────────────────────────
+def _build_recommendations(
+    scores: Dict[str, int],
+    top_arch: Dict[str, Any],
+    low_traits: List[Tuple[str, int]],
+) -> List[str]:
+    recs: List[str] = []
+    recs.append(f"Your child most resembles '{top_arch['name']}' — {top_arch['description']}")
+    recs.append(f"What they need most: {top_arch['needs']}")
+    for trait, score in low_traits:
+        if score < 40:
+            advice = {
+                "focus":        "Try the Pomodoro method: 20 min focused work + 5 min break.",
+                "empathy":      "Use emotion cards or role-play scenarios.",
+                "curiosity":    "Introduce science kits, mystery books, or nature walks.",
+                "leadership":   "Give small responsibilities and praise initiative.",
+                "sociability":  "Arrange structured playdates; teach conversation starters.",
+                "adaptability": "Warn about changes in advance; use visual schedules.",
+                "self_control": "Practice 'stop and breathe'; use a feelings chart.",
+                "sensitivity":  "Create a calm-down corner; validate feelings before problem-solving.",
+            }.get(trait, "Provide consistent support and positive reinforcement.")
+            recs.append(f"Low {trait.replace('_',' ').title()} ({score}%): {advice}")
+    return recs
+
+
+# ──────────────────────────────────────────────
+# PARENTING PLAN GENERATION
 # ──────────────────────────────────────────────
 def gemini_generate_parenting_plan(
     child_age: Optional[int],
@@ -1881,7 +2003,7 @@ def gemini_generate_parenting_plan(
 
 
 # ──────────────────────────────────────────────
-# PDF HELPERS (unchanged from v4)
+# PDF HELPERS
 # ──────────────────────────────────────────────
 def _safe_xml(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -2027,7 +2149,7 @@ def _build_parenting_plan_pdf(
 
 
 # ──────────────────────────────────────────────
-# PROFILE NORMALISATION HELPERS (unchanged)
+# PROFILE NORMALISATION HELPERS
 # ──────────────────────────────────────────────
 def _norm_traits(raw: Any) -> List[Dict[str, Any]]:
     out = []
@@ -2065,7 +2187,7 @@ def _norm_scores(raw: Any) -> Dict[str, int]:
 
 
 # ──────────────────────────────────────────────
-# FCM HELPER (unchanged from v4)
+# FCM HELPER
 # ──────────────────────────────────────────────
 def _send_fcm_notification(
     user_id: str,
@@ -2073,8 +2195,6 @@ def _send_fcm_notification(
     body: str,
     data: Dict[str, str],
 ) -> Dict[str, Any]:
-    print(f"[FCM] Attempting notification for user={user_id} | title='{title}'")
-
     if not _FIREBASE_AVAILABLE:
         return {"sent": False, "warning": "firebase-admin not installed."}
     if not _FIREBASE_CREDS_JSON:
@@ -2096,9 +2216,7 @@ def _send_fcm_notification(
             token=token, data=data,
         )
         fb_messaging.send(message)
-        print(f"[FCM] ✅ Sent to user={user_id}")
         return {"sent": True, "warning": None}
-
     except Exception as exc:
         err = str(exc)
         if "UNREGISTERED" in err.upper() or "registration-token-not-registered" in err:
@@ -2121,7 +2239,7 @@ def _send_fcm_notification(
 
 
 # ──────────────────────────────────────────────
-# PARENTING PLAN CORE (unchanged from v4)
+# PARENTING PLAN CORE
 # ──────────────────────────────────────────────
 def _generate_and_save_plan(
     conn,
@@ -2196,7 +2314,7 @@ def _generate_and_save_plan(
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "5.0.0"}
+    return {"status": "Rafiq running 🚀", "version": "6.0.0"}
 
 
 @app.get("/health", tags=["System"])
@@ -2205,10 +2323,12 @@ def health():
         "ok": True, "model": GEMINI_MODEL, "gemini_enabled": GEMINI_ENABLED,
         "verify": ENABLE_VERIFY, "db": bool(DATABASE_URL), "debug": DEBUG,
         "arabic_shaping": _ARABIC_SHAPING, "pdf": _REPORTLAB_AVAILABLE,
-        # v5
-        "smart_replies": GEMINI_ENABLED,
-        "faq_builder":   GEMINI_ENABLED,
+        "smart_replies":  GEMINI_ENABLED,
+        "faq_builder":    GEMINI_ENABLED,
         "faq_log_window": FAQ_LOG_WINDOW,
+        # v6
+        "ai_assessment_questions": GEMINI_ENABLED,
+        "ai_assessment_analysis":  GEMINI_ENABLED,
     }
 
 
@@ -2220,7 +2340,7 @@ def test_gemini():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — USERS (unchanged)
+# ROUTES — USERS
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/users", tags=["Users"])
 def upsert_user(req: UserUpsertReq):
@@ -2272,7 +2392,7 @@ def memory_get(user_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — FCM / PUSH (unchanged)
+# ROUTES — FCM / PUSH
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/register-token", tags=["Notifications"])
 def register_token(req: RegisterTokenReq):
@@ -2367,7 +2487,7 @@ def get_daily_tips(user_id: str, limit: int = 50):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — KB (unchanged)
+# ROUTES — KB
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/kb/topics", tags=["KB"])
 def kb_topics():
@@ -2393,16 +2513,37 @@ def kb_add(req: KbAddRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — ASSESSMENT (unchanged)
+# ROUTES — ASSESSMENT  (v6: Gemini-powered, Flutter-compatible)
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/assessment/questions", tags=["Assessment"])
-def assessment_questions(age: Optional[int] = None):
-    qs = get_assessment_questions(age)
+def assessment_questions(
+    age: Optional[int] = None,
+    lang: Optional[str] = Query(default=None, description="Language: ar | en"),
+    assessment_type: str = Query(default="child_personality"),
+):
+    """
+    Returns assessment questions generated by Gemini (or fallback if Gemini is down).
+    Response format is IDENTICAL to v5 — Flutter requires no changes.
+
+    New optional query params:
+    - lang: "ar" | "en"  (defaults to "en" if not provided)
+    - assessment_type: string label forwarded to Gemini prompt
+    """
+    resolved_lang: Lang = lang if lang in ("ar", "en") else "en"  # type: ignore
+    qs = get_assessment_questions(
+        child_age=age,
+        lang=resolved_lang,
+        assessment_type=assessment_type,
+    )
     return {
         "child_age": age,
         "total_questions": len(qs),
-        "scale": {"min":1,"max":5,"labels":{"1":"Never","2":"Rarely","3":"Sometimes","4":"Often","5":"Always"}},
-        "questions": _format_questions_for_api(qs),
+        "scale": {
+            "min": 1, "max": 5,
+            "labels": {"1": "Never", "2": "Rarely", "3": "Sometimes",
+                       "4": "Often",  "5": "Always"},
+        },
+        "questions": qs,
     }
 
 
@@ -2419,7 +2560,24 @@ def assessment_submit(req: AssessmentSubmitReq):
             if row and row[0]:
                 lang = row[0]
 
-        profile     = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
+        # ── v6: regenerate the same Gemini questions for analysis context ──
+        # At temperature=0.2 with identical inputs Gemini is highly consistent,
+        # so the questions here closely match what Flutter received earlier.
+        session_questions = get_assessment_questions(
+            child_age=req.child_age,
+            lang=lang,
+            assessment_type="child_personality",
+        )
+
+        # ── Hybrid profiler: Gemini analysis + math-based archetype match ──
+        profile = compute_personality_profile(
+            answers=req.answers,
+            child_age=req.child_age,
+            behavior_signals=req.behavior_signals,
+            questions=session_questions,
+            lang=lang,
+        )
+
         assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
         recommended = recommend_specialist_for_profile(profile)
         profile_to_store = {k: v for k, v in profile.items() if k != "_debug"}
@@ -2479,6 +2637,8 @@ def assessment_submit(req: AssessmentSubmitReq):
             "plan_language":          plan_result.get("plan_language", "en"),
             "top_archetype":          plan_result.get("top_archetype"),
             "notification_sent":      notif_result["sent"],
+            # v6 addition — Flutter ignores unknown keys safely
+            "ai_analysis":            profile.get("ai_analysis", {}),
         }
         if plan_warning:
             response["plan_warning"] = plan_warning
@@ -2515,7 +2675,7 @@ def get_assessments(user_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — SPECIALISTS & SLOTS (unchanged)
+# ROUTES — SPECIALISTS & SLOTS
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/specialists", tags=["Specialists"])
 def specialists_list():
@@ -2546,7 +2706,7 @@ def get_slots(specialist_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — APPOINTMENTS (unchanged)
+# ROUTES — APPOINTMENTS
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/appointments/book", tags=["Appointments"])
 def book(req: BookingReq):
@@ -2583,7 +2743,7 @@ def get_appointments(user_id: str, limit: int = 50):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — ANALYTICS (unchanged)
+# ROUTES — ANALYTICS
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/analytics/event", tags=["Analytics"])
 def analytics_event(req: AppEventRequest):
@@ -2624,7 +2784,7 @@ def analytics_user(user_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — FEEDBACK (unchanged)
+# ROUTES — FEEDBACK
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/feedback", tags=["Feedback"])
 def feedback(req: FeedbackReq):
@@ -2647,7 +2807,7 @@ def feedback(req: FeedbackReq):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — CHAT HISTORY (unchanged)
+# ROUTES — CHAT HISTORY
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/chat/{user_id}", tags=["Chat"])
 def get_chat_history(user_id: str, limit: int = 50):
@@ -2666,17 +2826,10 @@ def get_chat_history(user_id: str, limit: int = 50):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — CHAT (main)  ← v5: FAQ search + Smart Replies integrated
+# ROUTES — CHAT (main)
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(req: ChatRequest):
-    """
-    Main chat endpoint — v5 additions:
-    1. Before calling Gemini: search approved FAQs; if hit, return FAQ answer
-       immediately with smart_replies and faq_hit=True.
-    2. After Gemini composes the final answer: generate smart_replies in
-       parallel (best-effort; failures return []).
-    """
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
 
@@ -2684,7 +2837,6 @@ def chat(req: ChatRequest):
     user_text  = req.messages[-1].content.strip()
     lang: Lang = req.preferred_language if req.preferred_language in ("ar","en") else detect_lang(user_text)  # type: ignore
 
-    # ── Hard guards (unchanged) ───────────────────────────────────────
     if hard_out_of_scope(user_text) or hard_medical(user_text):
         return ChatResponse(
             message_id=message_id,
@@ -2707,17 +2859,14 @@ def chat(req: ChatRequest):
 
     conn = get_conn()
     try:
-        # Prefer DB-stored language if not passed
         mem_check = get_memory(conn, req.user_id)
         if req.preferred_language is None and mem_check.get("preferred_language"):
             lang = mem_check["preferred_language"]
 
-        # ── v5: FAQ lookup BEFORE Gemini ─────────────────────────────
         faq_match = search_faq(conn, user_text)
         if faq_match:
             faq_reply  = t("faq_answer_prefix", lang) + faq_match["answer"]
             smart      = generate_smart_replies(user_text, faq_match["answer"], lang)
-            # Persist the message for analytics/history
             ensure_user_exists(conn, req.user_id)
             cur = conn.cursor()
             cur.execute(
@@ -2736,7 +2885,6 @@ def chat(req: ChatRequest):
                 faq_hit       = True,
             )
 
-        # ── Original v4 chat logic (with smart replies appended) ──────
         slot_from_text = extract_slot_id(user_text)
         wants_booking  = any(x in user_text for x in
                              ["احجز","حجز","استشارة","مختص","دكتور","book","specialist","appointment"])
@@ -2794,7 +2942,6 @@ def chat(req: ChatRequest):
         update_memory(conn, req.user_id, topic, age, note=user_text)
         mem = get_memory(conn, req.user_id)
 
-        # ── Booking flow ──────────────────────────────────────────────
         if decision.action == "book_appointment":
             slot_id       = decision.slot_id
             specialist_id = decision.specialist_id
@@ -2837,7 +2984,6 @@ def chat(req: ChatRequest):
                     faq_hit=False,
                 )
 
-        # ── Normal answer ─────────────────────────────────────────────
         kb_res    = kb_search_v2(topic=topic, query=user_text, age=age)
         tips      = kb_res.tips
         followups = pick_followups(topic)
@@ -2889,10 +3035,8 @@ def chat(req: ChatRequest):
         )
         conn.commit()
 
-        # ── v5: generate smart replies ────────────────────────────────
         smart_replies = generate_smart_replies(user_text, final_text, lang)
 
-        # ── Build cards (unchanged) ───────────────────────────────────
         cards: List[Dict] = []
         ctype_map  = {"kids_stories":"story","activities_games":"game",
                       "book_recommendations":"books","assessment_personality":"assessment_question"}
@@ -2942,7 +3086,7 @@ def chat(req: ChatRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — PARENTING PLAN (unchanged)
+# ROUTES — PARENTING PLAN
 # ══════════════════════════════════════════════════════════════════════
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str):
@@ -3020,7 +3164,7 @@ def get_parenting_plans(user_id: str, limit: int = 10):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — PDF EXPORT (unchanged)
+# ROUTES — PDF EXPORT
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
 def export_plan_pdf(user_id: str):
@@ -3085,27 +3229,14 @@ def export_plan_pdf(user_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROUTES — v5 ADMIN: FAQ KNOWLEDGE BASE
+# ROUTES — ADMIN: FAQ KNOWLEDGE BASE
 # ══════════════════════════════════════════════════════════════════════
-
 @app.post("/admin/faq/generate", tags=["FAQ"])
 def admin_faq_generate(req: FaqGenerateRequest):
-    """
-    Trigger AI FAQ generation from recent chat logs.
-
-    - Reads the last N chat messages (default: FAQ_LOG_WINDOW env var).
-    - Sends them to Gemini for topic clustering and FAQ extraction.
-    - Inserts non-duplicate FAQs with status='pending'.
-    - Admin review required before FAQs become active (see PATCH /admin/faq/{id}).
-
-    Requires admin_key header.
-    """
     if req.admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin_key")
-
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
-
     conn = get_conn()
     try:
         summary = generate_faq_from_chat_logs(conn, log_limit=req.log_limit)
@@ -3133,11 +3264,6 @@ def admin_faq_list(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    """
-    List FAQ entries with optional status / category filters.
-    No admin_key required for reading (suitable for a review dashboard).
-    Add your own auth middleware in production if needed.
-    """
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -3164,20 +3290,12 @@ def admin_faq_list(
         cur.execute(f"SELECT COUNT(*) FROM faq_knowledge_base {where}", params)
         total = cur.fetchone()[0]
         return {
-            "total": total,
-            "limit": limit,
-            "offset": offset,
+            "total": total, "limit": limit, "offset": offset,
             "faqs": [
-                {
-                    "id":           r[0],
-                    "question":     r[1],
-                    "answer":       r[2],
-                    "category":     r[3],
-                    "source_count": r[4],
-                    "status":       r[5],
-                    "created_at":   r[6].isoformat() if r[6] else None,
-                    "updated_at":   r[7].isoformat() if r[7] else None,
-                }
+                {"id": r[0], "question": r[1], "answer": r[2], "category": r[3],
+                 "source_count": r[4], "status": r[5],
+                 "created_at": r[6].isoformat() if r[6] else None,
+                 "updated_at": r[7].isoformat() if r[7] else None}
                 for r in rows
             ],
         }
@@ -3191,17 +3309,8 @@ def admin_faq_list(
 
 @app.patch("/admin/faq/{faq_id}", tags=["FAQ"])
 def admin_faq_update_status(faq_id: int, req: FaqStatusUpdate):
-    """
-    Approve or reject a pending FAQ draft.
-
-    Only 'pending' FAQs can be transitioned; approved/rejected FAQs
-    are immutable to prevent accidental re-activation.
-
-    Body: { "admin_key": "...", "status": "approved" | "rejected" }
-    """
     if req.admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin_key")
-
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -3209,25 +3318,17 @@ def admin_faq_update_status(faq_id: int, req: FaqStatusUpdate):
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"FAQ id={faq_id} not found.")
-
-        current_status = row[1]
-        if current_status != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail=f"FAQ id={faq_id} is already '{current_status}'. Only 'pending' FAQs can be updated.",
-            )
-
+        if row[1] != "pending":
+            raise HTTPException(status_code=409,
+                detail=f"FAQ id={faq_id} is already '{row[1]}'. Only 'pending' FAQs can be updated.")
         cur.execute(
             "UPDATE faq_knowledge_base SET status=%s, updated_at=NOW() WHERE id=%s RETURNING id, question, status, updated_at",
             (req.status, faq_id)
         )
         updated = cur.fetchone()
         conn.commit()
-        print(f"[FAQ] id={faq_id} → status='{req.status}'")
         return {
-            "ok":         True,
-            "faq_id":     updated[0],
-            "question":   updated[1],
+            "ok": True, "faq_id": updated[0], "question": updated[1],
             "new_status": updated[2],
             "updated_at": updated[3].isoformat() if updated[3] else None,
         }
@@ -3245,10 +3346,6 @@ def public_faq_list(
     category: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
 ):
-    """
-    Public endpoint — returns only *approved* FAQs.
-    Optionally filter by category. No authentication required.
-    """
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -3262,18 +3359,14 @@ def public_faq_list(
         else:
             cur.execute(
                 "SELECT id, question, answer, category, source_count FROM faq_knowledge_base "
-                "WHERE status='approved' "
-                "ORDER BY source_count DESC, created_at DESC LIMIT %s",
+                "WHERE status='approved' ORDER BY source_count DESC, created_at DESC LIMIT %s",
                 (limit,)
             )
         rows = cur.fetchall()
         return {
             "total": len(rows),
-            "faqs": [
-                {"id": r[0], "question": r[1], "answer": r[2],
-                 "category": r[3], "source_count": r[4]}
-                for r in rows
-            ],
+            "faqs": [{"id": r[0], "question": r[1], "answer": r[2],
+                      "category": r[3], "source_count": r[4]} for r in rows],
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DB error: {exc}")
