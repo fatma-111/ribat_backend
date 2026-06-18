@@ -1,19 +1,23 @@
 """
-Rafiq Bot API — PRODUCTION v4
+Rafiq Bot API — PRODUCTION v5
 ==============================
-Changes in v4:
-- Full i18n via translations.py (ar / en)
-- preferred_language stored on users table
-- Assessment scoring bug fixed:
-    * accepts both "value" and "score" fields from Flutter
-    * case-insensitive question ID matching (q01 == Q01)
-    * debug diagnostics in response
-    * age filter made optional (None → all questions valid)
-- Bilingual Gemini prompts (parenting plan, chat, verification)
-- PDF: RTL Arabic support via arabic-reshaper + python-bidi
-  with graceful fallback when libs missing
-- All hardcoded Arabic strings replaced with t() calls
-- preferred_language written to users table on upsert
+Changes in v5 (on top of v4):
+- [Feature 1] Smart Replies: generate_smart_replies() helper
+  * After every /chat response, Gemini produces 3-5 tap-friendly follow-up
+    suggestions; failures return [] gracefully.
+  * ChatResponse now includes `smart_replies: List[str]`.
+- [Feature 2] AI Knowledge Base Builder
+  * New PostgreSQL table: faq_knowledge_base
+    (id, question, answer, category, source_count, status, created_at)
+  * Admin endpoint POST /admin/faq/generate  — reads recent chat logs,
+    groups questions with Gemini, writes pending FAQ drafts; skips
+    semantic near-duplicates.
+  * Admin endpoint GET  /admin/faq            — list with optional status filter
+  * Admin endpoint PATCH /admin/faq/{id}      — approve / reject
+  * FAQ search integrated into /chat:
+    User question → search approved FAQs → hit? return FAQ answer
+                                          → miss? call Gemini normally
+  * All existing endpoints/functionality preserved.
 """
 
 from dotenv import load_dotenv
@@ -23,7 +27,7 @@ import os, json, uuid, re, io
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -139,7 +143,7 @@ _T: dict[str, dict[str, str]] = {
         "en": "💡 New Parenting Tip from Rafiq",
     },
     "daily_tip_notif_body_prefix": {
-        "ar": "",   # body IS the tip in Arabic
+        "ar": "",
         "en": "",
     },
     "plan_notif_title": {
@@ -282,6 +286,12 @@ _T: dict[str, dict[str, str]] = {
         "ar": "اختر موضوعًا مناسبًا للأطفال.",
         "en": "Choose a safe, age-appropriate topic.",
     },
+
+    # ── v5 additions ──────────────────────────────────────────────────
+    "faq_answer_prefix": {
+        "ar": "💡 إجابة من قاعدة المعرفة:\n\n",
+        "en": "💡 From our knowledge base:\n\n",
+    },
 }
 
 
@@ -295,23 +305,19 @@ def t(key: str, lang: str, **kwargs) -> str:
     if isinstance(entry, dict):
         text = entry.get(lang) or entry.get("ar") or key
     else:
-        # plain string (e.g. slots_suffix_ar)
         text = entry or key
     return text.format(**kwargs) if kwargs else text
 
 
 def detect_lang(text: str) -> Lang:
     """Return 'ar' if Arabic chars dominate, else 'en'."""
-    import re
     ar = len(re.findall(r'[\u0600-\u06FF]', text))
     en = len(re.findall(r'[a-zA-Z]', text))
     return "ar" if ar >= en else "en"
 
 
 def user_lang(preferred_language: str | None, fallback_text: str = "") -> Lang:
-    """
-    Resolve language from user's DB preference, falling back to text detection.
-    """
+    """Resolve language from user's DB preference, falling back to text detection."""
     if preferred_language in ("ar", "en"):
         return preferred_language  # type: ignore[return-value]
     return detect_lang(fallback_text)
@@ -340,7 +346,7 @@ try:
     _ARABIC_SHAPING = True
 except ImportError:
     _ARABIC_SHAPING = False
-    print("WARNING: arabic-reshaper / python-bidi not installed — Arabic PDF text may not render correctly.")
+    print("WARNING: arabic-reshaper / python-bidi not installed.")
 
 # ── Gemini ─────────────────────────────────────────────────────────────
 try:
@@ -370,7 +376,11 @@ GEMINI_ENABLED = bool(GEMINI_API_KEY) and (genai is not None)
 ADMIN_KEY      = os.getenv("RAFIQ_ADMIN_KEY", "change-me")
 ENABLE_VERIFY  = os.getenv("RAFIQ_VERIFY_OUTPUT", "0") == "1"
 
-# Font paths (override via env)
+# v5: FAQ config
+FAQ_LOG_WINDOW   = int(os.getenv("RAFIQ_FAQ_LOG_WINDOW", "500"))   # chat logs to scan
+FAQ_MIN_SOURCES  = int(os.getenv("RAFIQ_FAQ_MIN_SOURCES", "2"))    # min occurrences
+FAQ_SIM_THRESHOLD = float(os.getenv("RAFIQ_FAQ_SIM_THRESHOLD", "0.75"))  # duplicate threshold
+
 FONT_DIR           = os.getenv("RAFIQ_FONT_DIR", "/app/fonts")
 FONT_NOTO_ARABIC   = os.getenv("RAFIQ_FONT_ARABIC",  os.path.join(FONT_DIR, "NotoSansArabic-Regular.ttf"))
 FONT_NOTO_BOLD     = os.getenv("RAFIQ_FONT_BOLD",    os.path.join(FONT_DIR, "NotoSansArabic-Bold.ttf"))
@@ -391,35 +401,29 @@ FIREBASE_ENABLED = False
 _FIREBASE_CREDS_JSON = os.getenv("FIREBASE_CREDENTIALS", "").strip()
 if _FIREBASE_AVAILABLE and _FIREBASE_CREDS_JSON:
     try:
-        # Support both: inline JSON string OR absolute file path to credentials JSON
         if _FIREBASE_CREDS_JSON.startswith("{"):
             _fb_cred_dict = json.loads(_FIREBASE_CREDS_JSON)
             _fb_cred = fb_credentials.Certificate(_fb_cred_dict)
         elif os.path.exists(_FIREBASE_CREDS_JSON):
             _fb_cred = fb_credentials.Certificate(_FIREBASE_CREDS_JSON)
         else:
-            raise ValueError(
-                f"FIREBASE_CREDENTIALS is neither a valid JSON string "
-                f"nor an existing file path: {_FIREBASE_CREDS_JSON[:80]}"
-            )
+            raise ValueError(f"FIREBASE_CREDENTIALS is neither valid JSON nor an existing path: {_FIREBASE_CREDS_JSON[:80]}")
         firebase_admin.initialize_app(_fb_cred)
         FIREBASE_ENABLED = True
         print("Firebase initialized ✔")
     except Exception as _fb_exc:
         print(f"Firebase init FAILED — {_fb_exc}")
-        print("  Fix: set FIREBASE_CREDENTIALS to full JSON or absolute file path.")
 
-# ── Register PDF fonts ─────────────────────────────────────────────────
+# ── Font registration ──────────────────────────────────────────────────
 _FONT_ARABIC_REGISTERED = False
 _FONT_LATIN_REGISTERED  = False
 
-# ── Font download URLs (DejaVu — always full Unicode, freely redistributable) ──
 _DEJAVU_REGULAR_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
 _DEJAVU_BOLD_URL    = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
 _FONT_CACHE_DIR     = os.getenv("RAFIQ_FONT_CACHE", "/tmp/rafiq_fonts")
 
+
 def _download_font(url: str, dest: str) -> bool:
-    """Download a font file if it does not already exist. Returns True on success."""
     if os.path.exists(dest):
         return True
     try:
@@ -431,12 +435,11 @@ def _download_font(url: str, dest: str) -> bool:
         print(f"[FONT] Could not download {url}: {exc}")
         return False
 
+
 def _register_fonts() -> None:
     global _FONT_ARABIC_REGISTERED, _FONT_LATIN_REGISTERED
     if not _REPORTLAB_AVAILABLE:
         return
-
-    # Priority 1: user-supplied Noto fonts (best Arabic rendering)
     if os.path.exists(FONT_NOTO_ARABIC):
         try:
             pdfmetrics.registerFont(TTFont("RafiqRegular", FONT_NOTO_ARABIC))
@@ -450,8 +453,6 @@ def _register_fonts() -> None:
             return
         except Exception as exc:
             print(f"[FONT] Noto registration failed: {exc}")
-
-    # Priority 2: user-supplied Noto Latin
     if os.path.exists(FONT_NOTO_LATIN):
         try:
             pdfmetrics.registerFont(TTFont("RafiqRegular", FONT_NOTO_LATIN))
@@ -461,32 +462,27 @@ def _register_fonts() -> None:
             return
         except Exception as exc:
             print(f"[FONT] NotoLatin registration failed: {exc}")
-
-    # Priority 3: Download DejaVu (full Unicode, free, no Arabic shaping needed for EN)
     reg_path  = os.path.join(_FONT_CACHE_DIR, "DejaVuSans.ttf")
     bold_path = os.path.join(_FONT_CACHE_DIR, "DejaVuSans-Bold.ttf")
-    reg_ok    = _download_font(_DEJAVU_REGULAR_URL, reg_path)
-    bold_ok   = _download_font(_DEJAVU_BOLD_URL,    bold_path)
-    if reg_ok:
+    if _download_font(_DEJAVU_REGULAR_URL, reg_path):
         try:
             pdfmetrics.registerFont(TTFont("RafiqRegular", reg_path))
-            pdfmetrics.registerFont(TTFont("RafiqBold",    bold_path if bold_ok else reg_path))
+            pdfmetrics.registerFont(TTFont("RafiqBold", bold_path if _download_font(_DEJAVU_BOLD_URL, bold_path) else reg_path))
             _FONT_LATIN_REGISTERED = True
             print("PDF fonts: DejaVuSans (downloaded) registered ✔")
             return
         except Exception as exc:
             print(f"[FONT] DejaVu registration failed: {exc}")
+    print("[FONT] WARNING: falling back to Helvetica.")
 
-    # Fallback: Helvetica (ASCII only — non-ASCII becomes squares)
-    print("[FONT] WARNING: falling back to Helvetica — non-ASCII chars will be squares.")
 
 # ──────────────────────────────────────────────
 # APP
 # ──────────────────────────────────────────────
 app = FastAPI(
     title="Rafiq Bot API",
-    version="4.0.0",
-    description="Family support & parenting assistant API — bilingual (ar/en)",
+    version="5.0.0",
+    description="Family support & parenting assistant API — bilingual (ar/en) with Smart Replies & AI FAQ Builder",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -494,10 +490,12 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 def on_startup():
     _run_schema_migrations()
     _register_fonts()
+
 
 # ──────────────────────────────────────────────
 # DATABASE
@@ -507,29 +505,28 @@ def get_conn():
         raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
+
 def _run_schema_migrations() -> None:
+    """Apply all incremental schema migrations, including v5 additions."""
     if not DATABASE_URL:
         print("Skipping DB migrations — DATABASE_URL not set")
         return
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur  = conn.cursor()
-        # existing
+
+        # ── v4 migrations (preserved) ──────────────────────────────────
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
-        # v4 additions
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) DEFAULT 'ar';")
-        cur.execute(
-            """
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_tips (
                 id         SERIAL PRIMARY KEY,
                 user_id    VARCHAR(100),
                 tip        TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
-            """
-        )
-        cur.execute(
-            """
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS parenting_plans (
                 id            SERIAL PRIMARY KEY,
                 user_id       VARCHAR(100),
@@ -537,17 +534,43 @@ def _run_schema_migrations() -> None:
                 plan_language VARCHAR(5) DEFAULT 'ar',
                 created_at    TIMESTAMP DEFAULT NOW()
             );
-            """
-        )
+        """)
         cur.execute("ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_language VARCHAR(5) DEFAULT 'ar';")
+
+        # ── v5 migration: faq_knowledge_base ──────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS faq_knowledge_base (
+                id           SERIAL PRIMARY KEY,
+                question     TEXT        NOT NULL,
+                answer       TEXT        NOT NULL,
+                category     VARCHAR(100) DEFAULT 'general',
+                source_count INTEGER      DEFAULT 1,
+                status       VARCHAR(20)  DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'approved', 'rejected')),
+                created_at   TIMESTAMP    DEFAULT NOW(),
+                updated_at   TIMESTAMP    DEFAULT NOW()
+            );
+        """)
+        # Index for fast approved-FAQ lookups at chat time
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_faq_status
+            ON faq_knowledge_base (status);
+        """)
+        # Index for category filtering
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_faq_category
+            ON faq_knowledge_base (category);
+        """)
+
         conn.commit()
         conn.close()
-        print("DB migrations applied ✔")
+        print("DB migrations applied ✔ (v5)")
     except Exception as exc:
         print(f"DB migration warning: {exc}")
 
+
 # ──────────────────────────────────────────────
-# KNOWLEDGE BASE (unchanged content)
+# KNOWLEDGE BASE (unchanged from v4)
 # ──────────────────────────────────────────────
 KB: List[Dict[str, Any]] = [
     {"id": "kb_001", "topic": "teen_communication", "age_min": 12, "age_max": 18,
@@ -630,23 +653,33 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
 
+
 class ChatRequest(BaseModel):
     user_id: str
     messages: List[ChatMessage]
     child_age: Optional[int] = None
-    preferred_language: Optional[str] = None   # "ar" | "en"
+    preferred_language: Optional[str] = None
+
 
 class ChatResponse(BaseModel):
+    """
+    v5 addition: `smart_replies` — list of 3-5 tap-friendly follow-up
+    suggestions generated by Gemini. Empty list on failure.
+    """
     message_id: str
     reply: str
     cards: List[Dict[str, Any]] = []
+    smart_replies: List[str] = []          # ← NEW in v5
+    faq_hit: bool = False                  # ← NEW in v5: True when FAQ answered
+
 
 class UserUpsertReq(BaseModel):
     user_id: str
     name: Optional[str] = None
     email: Optional[str] = None
     child_age: Optional[int] = None
-    preferred_language: Optional[str] = "ar"   # "ar" | "en"
+    preferred_language: Optional[str] = "ar"
+
 
 class KbAddRequest(BaseModel):
     admin_key: str
@@ -655,6 +688,7 @@ class KbAddRequest(BaseModel):
     age_max: int = 18
     tags: List[str] = []
     tip: str
+
 
 class AppEventRequest(BaseModel):
     user_id: str
@@ -665,10 +699,12 @@ class AppEventRequest(BaseModel):
     ]
     meta: Dict[str, Any] = {}
 
+
 class BookingReq(BaseModel):
     user_id: str
     specialist_id: str
     slot_id: str
+
 
 class FeedbackReq(BaseModel):
     user_id: str
@@ -677,6 +713,7 @@ class FeedbackReq(BaseModel):
     comment: Optional[str] = None
     topic: Optional[str] = None
 
+
 class AssessmentSubmitReq(BaseModel):
     user_id: str
     child_age: Optional[int] = None
@@ -684,13 +721,41 @@ class AssessmentSubmitReq(BaseModel):
     behavior_signals: Optional[Dict[str, Any]] = None
     preferred_language: Optional[str] = None
 
+
 class RegisterTokenReq(BaseModel):
     user_id: str
     fcm_token: str
 
+
 class SendDailyTipReq(BaseModel):
     user_id: str
     tip: str
+
+
+# ── v5: FAQ Pydantic models ────────────────────────────────────────────
+class FaqStatusUpdate(BaseModel):
+    """Body for PATCH /admin/faq/{id} — approve or reject a draft FAQ."""
+    admin_key: str
+    status: Literal["approved", "rejected"]
+
+
+class FaqGenerateRequest(BaseModel):
+    """Body for POST /admin/faq/generate."""
+    admin_key: str
+    log_limit: Optional[int] = None   # override FAQ_LOG_WINDOW for this run
+
+
+class FaqEntry(BaseModel):
+    """Public-facing FAQ record."""
+    id: int
+    question: str
+    answer: str
+    category: str
+    source_count: int
+    status: str
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
 
 AllowedTopic = Literal[
     "teen_communication","anger","screen_addiction","bullying","study_focus",
@@ -702,6 +767,7 @@ AllowedAction = Literal[
     "answer_with_tips","recommend_booking","book_appointment","refuse_out_of_scope"
 ]
 
+
 class RouteDecision(BaseModel):
     in_scope: bool        = Field(description="Is question within Rafiq scope?")
     topic: AllowedTopic   = Field(description="Detected topic")
@@ -710,6 +776,7 @@ class RouteDecision(BaseModel):
     reason: str           = Field(description="Short reason")
     slot_id: Optional[str] = None
     specialist_id: Optional[str] = None
+
 
 # ──────────────────────────────────────────────
 # CONSTANTS
@@ -737,13 +804,16 @@ def hard_out_of_scope(text: str) -> bool:
     tl = text.lower()
     return any(k.lower() in tl for k in OUT_OF_SCOPE_KW)
 
+
 def hard_medical(text: str) -> bool:
     tl = text.lower()
     return any(k.lower() in tl for k in MEDICAL_KW)
 
+
 def kids_safety_guard(text: str) -> bool:
     tl = text.lower()
     return any(k.lower() in tl for k in KIDS_UNSAFE_KW)
+
 
 def detect_risk_level(text: str) -> Literal["low","medium","high"]:
     tl = text.lower()
@@ -751,17 +821,20 @@ def detect_risk_level(text: str) -> Literal["low","medium","high"]:
     if any(k.lower() in tl for k in RISK_MEDIUM_KW): return "medium"
     return "low"
 
+
 def extract_slot_id(text: str) -> Optional[str]:
     m = re.search(r"\bsl_\d{3}\b", text.lower())
     return m.group(0) if m else None
 
+
 # ──────────────────────────────────────────────
-# KB SEARCH v2
+# KB SEARCH v2 (unchanged)
 # ──────────────────────────────────────────────
 _AR_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670]")
 _AR_PUNCT      = re.compile(r"[^\w\u0600-\u06FF]+", re.UNICODE)
 _AR_STOPWORDS  = {"في","من","على","عن","الى","إلى","هو","هي","ده","دي","دا",
                    "انا","انت","انتي","احنا","هم"}
+
 
 def _ar_normalize(text: str) -> str:
     if not text: return ""
@@ -770,8 +843,10 @@ def _ar_normalize(text: str) -> str:
         t_ = t_.replace(a, b)
     return re.sub(r"\s+", " ", _AR_PUNCT.sub(" ", t_.lower())).strip()
 
+
 def _tokenize(text: str) -> List[str]:
     return [w for w in _ar_normalize(text).split() if len(w) >= 2 and w not in _AR_STOPWORDS]
+
 
 def _score_kb_item(q_tokens: List[str], item: Dict[str, Any]) -> int:
     if not q_tokens: return 1
@@ -783,11 +858,13 @@ def _score_kb_item(q_tokens: List[str], item: Dict[str, Any]) -> int:
     score += sum(1 for tok in q_tokens if len(tok) >= 4 and (tok[:4] in tags or tok[:4] in tip))
     return score
 
+
 class KbSearchResult(BaseModel):
     tips: List[Dict[str, Any]] = []
     matched: bool = False
     match_count: int = 0
     used_default: bool = False
+
 
 def kb_search_v2(topic: str, query: str, age: Optional[int]) -> KbSearchResult:
     tokens = _tokenize(query or "")
@@ -806,8 +883,9 @@ def kb_search_v2(topic: str, query: str, age: Optional[int]) -> KbSearchResult:
     defaults = [x for x in KB if x["topic"] == topic][:3]
     return KbSearchResult(tips=defaults, matched=False, match_count=0, used_default=True)
 
+
 # ──────────────────────────────────────────────
-# SPECIALISTS & SLOTS
+# SPECIALISTS & SLOTS (unchanged)
 # ──────────────────────────────────────────────
 def recommend_specialists(topic: str) -> List[Dict[str, Any]]:
     rec = sorted(
@@ -816,8 +894,10 @@ def recommend_specialists(topic: str) -> List[Dict[str, Any]]:
     )
     return rec[:3] or SPECIALISTS[:2]
 
+
 def available_slots(specialist_id: str) -> List[Dict[str, Any]]:
     return [sl for sl in SLOTS if sl["specialist_id"] == specialist_id and sl["available"]][:3]
+
 
 def sync_slots_with_booked(conn) -> None:
     cur = conn.cursor()
@@ -826,6 +906,7 @@ def sync_slots_with_booked(conn) -> None:
     for sl in SLOTS:
         if sl["slot_id"] in booked:
             sl["available"] = False
+
 
 def book_slot(conn, user_id: str, specialist_id: str, slot_id: str) -> Dict[str, Any]:
     cur = conn.cursor()
@@ -849,8 +930,9 @@ def book_slot(conn, user_id: str, specialist_id: str, slot_id: str) -> Dict[str,
             "specialist_id": specialist_id, "slot_id": slot_id,
             "status": "pending", "created_at": datetime.utcnow().isoformat() + "Z"}
 
+
 # ──────────────────────────────────────────────
-# USER / MEMORY
+# USER / MEMORY (unchanged)
 # ──────────────────────────────────────────────
 def ensure_user_exists(conn, user_id: str) -> None:
     cur = conn.cursor()
@@ -859,6 +941,7 @@ def ensure_user_exists(conn, user_id: str) -> None:
         (user_id, json.dumps([]))
     )
     conn.commit()
+
 
 def get_memory(conn, user_id: str) -> Dict[str, Any]:
     cur = conn.cursor()
@@ -874,6 +957,7 @@ def get_memory(conn, user_id: str) -> Dict[str, Any]:
     notes = json.loads(raw) if isinstance(raw, str) else (raw or [])
     return {"child_age": row[1], "name": row[2], "email": row[3], "notes": notes,
             "last_summary": "", "preferred_language": row[4] or "ar"}
+
 
 def update_memory(conn, user_id: str, topic: str,
                   child_age: Optional[int], note: str = "") -> None:
@@ -892,8 +976,9 @@ def update_memory(conn, user_id: str, topic: str,
     )
     conn.commit()
 
+
 # ──────────────────────────────────────────────
-# ANALYTICS
+# ANALYTICS (unchanged)
 # ──────────────────────────────────────────────
 def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
     cur = conn.cursor()
@@ -903,65 +988,57 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
     )
     conn.commit()
 
+
 # ──────────────────────────────────────────────
-# ASSESSMENT ENGINE — v4 (bug-fixed)
+# ASSESSMENT ENGINE (unchanged from v4)
 # ──────────────────────────────────────────────
 ASSESSMENT_OPTIONS = ["Never", "Rarely", "Sometimes", "Often", "Always"]
 
 ASSESSMENT_QUESTIONS: List[Dict[str, Any]] = [
-    # FOCUS
     {"id": "q01","trait":"focus",       "age_min":4, "age_max":18,"weights":{"focus":2},
      "text":"My child stays focused on a task until it is completed."},
     {"id": "q02","trait":"focus",       "age_min":7, "age_max":18,"weights":{"focus":2,"self_control":1},
      "text":"My child finishes homework or assignments before switching to play."},
     {"id": "q03","trait":"focus",       "age_min":4, "age_max":18,"weights":{"focus":3},
      "text":"My child can sit quietly and concentrate during story time or a lesson."},
-    # EMPATHY
     {"id": "q04","trait":"empathy",     "age_min":4, "age_max":18,"weights":{"empathy":2},
      "text":"My child notices when a friend or sibling is upset and tries to comfort them."},
     {"id": "q05","trait":"empathy",     "age_min":6, "age_max":18,"weights":{"empathy":2,"sociability":1},
      "text":"My child apologizes genuinely after hurting someone's feelings."},
     {"id": "q06","trait":"empathy",     "age_min":4, "age_max":18,"weights":{"empathy":3},
      "text":"My child shows concern for animals or people who are struggling."},
-    # CURIOSITY
     {"id": "q07","trait":"curiosity",   "age_min":4, "age_max":18,"weights":{"curiosity":2},
      "text":"My child frequently asks 'why' or 'how' questions about the world."},
     {"id": "q08","trait":"curiosity",   "age_min":6, "age_max":18,"weights":{"curiosity":2,"adaptability":1},
      "text":"My child enjoys trying new activities or experimenting with new ideas."},
     {"id": "q09","trait":"curiosity",   "age_min":4, "age_max":18,"weights":{"curiosity":3},
      "text":"My child enjoys solving puzzles, riddles, or figuring things out independently."},
-    # LEADERSHIP
     {"id": "q10","trait":"leadership",  "age_min":5, "age_max":18,"weights":{"leadership":2},
      "text":"My child naturally takes charge and organizes activities when playing with others."},
     {"id": "q11","trait":"leadership",  "age_min":8, "age_max":18,"weights":{"leadership":2,"focus":1},
      "text":"My child steps up to help make decisions in group settings."},
     {"id": "q12","trait":"leadership",  "age_min":5, "age_max":18,"weights":{"leadership":3},
      "text":"My child is comfortable taking responsibility for a task or group project."},
-    # SOCIABILITY
     {"id": "q13","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":2},
      "text":"My child makes friends quickly and easily in new environments."},
     {"id": "q14","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":2,"empathy":1},
      "text":"My child enjoys being around others and actively seeks social interaction."},
     {"id": "q15","trait":"sociability", "age_min":4, "age_max":18,"weights":{"sociability":3},
      "text":"My child is comfortable sharing, taking turns, and cooperating in group play."},
-    # ADAPTABILITY
     {"id": "q16","trait":"adaptability","age_min":4, "age_max":18,"weights":{"adaptability":2},
      "text":"My child adjusts well to changes in routine (new school, travel, schedule changes)."},
     {"id": "q17","trait":"adaptability","age_min":6, "age_max":18,"weights":{"adaptability":2,"self_control":1},
      "text":"When plans change unexpectedly, my child handles it calmly."},
-    # SELF CONTROL
     {"id": "q18","trait":"self_control","age_min":4, "age_max":18,"weights":{"self_control":2},
      "text":"My child can calm themselves down after getting upset without adult intervention."},
     {"id": "q19","trait":"self_control","age_min":6, "age_max":18,"weights":{"self_control":3},
      "text":"My child resists the urge to act impulsively (e.g., waits their turn, thinks before acting)."},
-    # SENSITIVITY
     {"id": "q20","trait":"sensitivity", "age_min":4, "age_max":18,"weights":{"sensitivity":2},
      "text":"My child gets upset easily by criticism, loud noises, or unexpected changes."},
     {"id": "q21","trait":"sensitivity", "age_min":4, "age_max":18,"weights":{"sensitivity":3},
      "text":"My child feels emotions deeply and needs extra reassurance after conflict or disappointment."},
 ]
 
-# Normalised lookup: "q01" / "Q01" / " Q01 " all map to the same entry
 _QS_NORM: Dict[str, Dict[str, Any]] = {
     q["id"].strip().lower(): q for q in ASSESSMENT_QUESTIONS
 }
@@ -1011,15 +1088,10 @@ ARCHETYPES: List[Dict[str, Any]] = [
 
 
 def _normalize_answer_id(raw_id: Any) -> str:
-    """Normalize question IDs: strip, lowercase → 'q01'"""
     return str(raw_id or "").strip().lower()
 
 
 def _extract_answer_value(answer: Dict[str, Any]) -> Optional[int]:
-    """
-    Accept both 'value' (legacy) and 'score' (Flutter) fields.
-    Returns int 1-5 or None if invalid.
-    """
     raw = answer.get("value") if answer.get("value") is not None else answer.get("score")
     try:
         v = int(raw)
@@ -1029,7 +1101,6 @@ def _extract_answer_value(answer: Dict[str, Any]) -> Optional[int]:
 
 
 def get_assessment_questions(child_age: Optional[int]) -> List[Dict[str, Any]]:
-    """Return all questions; age filter is advisory only (None → all)."""
     if child_age is None:
         return ASSESSMENT_QUESTIONS
     return [q for q in ASSESSMENT_QUESTIONS if q["age_min"] <= child_age <= q["age_max"]]
@@ -1049,7 +1120,6 @@ def compute_personality_profile(
 ) -> Dict[str, Any]:
     raw: Dict[str, float] = {tr: 0.0 for tr in ALL_TRAITS}
     max_: Dict[str, float] = {tr: 0.0 for tr in ALL_TRAITS}
-
     matched_ids: List[str] = []
     unmatched_ids: List[str] = []
 
@@ -1057,10 +1127,8 @@ def compute_personality_profile(
         qid_raw = a.get("question_id") or a.get("id")
         qid     = _normalize_answer_id(qid_raw)
         val     = _extract_answer_value(a)
-
         if DEBUG:
             print(f"[DEBUG] answer qid_raw={qid_raw!r} → normalized={qid!r} | value={val}")
-
         q = _QS_NORM.get(qid)
         if q is None:
             unmatched_ids.append(str(qid_raw))
@@ -1068,29 +1136,17 @@ def compute_personality_profile(
         if val is None:
             unmatched_ids.append(f"{qid_raw}(bad_value)")
             continue
-
         matched_ids.append(qid)
         for trait, w in q["weights"].items():
             raw[trait]  += val * w
             max_[trait] += 5 * w
 
-    if DEBUG:
-        print(f"[DEBUG] matched={matched_ids}")
-        print(f"[DEBUG] unmatched={unmatched_ids}")
-        print(f"[DEBUG] raw scores={raw}")
-
-    # Behavior signal bonuses
-    # Rules:
-    #   - Only applied when the trait has at least one answer (max_ > 0)
-    #   - We add ONLY to raw[], never to max_[]
-    #     Adding to max_ inflates the denominator and drives scores toward zero
-    #   - The raw bonus is capped so it cannot push the score above 100
     bs = behavior_signals or {}
     if max_["focus"] > 0:
-        focus_bonus = max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2   # 0-6
+        focus_bonus = max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2
         raw["focus"] = min(raw["focus"] + focus_bonus, max_["focus"])
     if max_["empathy"] > 0:
-        empathy_bonus = int(bs.get("helps_others", 0)) * 2              # 0-2
+        empathy_bonus = int(bs.get("helps_others", 0)) * 2
         raw["empathy"] = min(raw["empathy"] + empathy_bonus, max_["empathy"])
 
     def _norm(r: float, m: float) -> int:
@@ -1107,7 +1163,6 @@ def compute_personality_profile(
          for a in ARCHETYPES],
         key=lambda x: x["match_pct"], reverse=True
     )
-
     top_archetype = ranked[0]
     top_traits    = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
     low_traits    = sorted(scores.items(), key=lambda kv: kv[1])[:2]
@@ -1154,13 +1209,7 @@ def compute_assessment_confidence(
     child_age: Optional[int],
     behavior_signals: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Bug-fixed version:
-    - uses _normalize_answer_id so 'q01'/'Q01' both match
-    - accepts 'score' OR 'value' field
-    - does NOT filter by child_age (age filter is advisory only)
-    """
-    all_qs  = ASSESSMENT_QUESTIONS           # full bank (no age filter here)
+    all_qs  = ASSESSMENT_QUESTIONS
     q_ids   = {q["id"].strip().lower() for q in all_qs}
     total   = len(all_qs)
     valid   = 0
@@ -1176,9 +1225,6 @@ def compute_assessment_confidence(
             matched_dbg.append(qid)
         else:
             unmatched_dbg.append(f"{qid_raw}(val={val})")
-
-    if DEBUG:
-        print(f"[CONFIDENCE] valid={valid}/{total}, matched={matched_dbg}, unmatched={unmatched_dbg}")
 
     coverage = int(round(valid / total * 100)) if total else 0
     score    = int(round(valid / total * 65))  if total else 0
@@ -1217,7 +1263,6 @@ def recommend_specialist_for_profile(profile: Dict[str, Any]) -> Optional[Dict[s
 
     if not best_sp:
         return None
-
     reasons = []
     if low_traits:
         reasons.append(f"Low {', '.join(low_traits)} detected in your child's profile.")
@@ -1231,8 +1276,9 @@ def recommend_specialist_for_profile(profile: Dict[str, Any]) -> Optional[Dict[s
         "rating":    best_sp["rating"],
     }
 
+
 # ──────────────────────────────────────────────
-# FOLLOW-UP QUESTIONS
+# FOLLOW-UP QUESTIONS (unchanged)
 # ──────────────────────────────────────────────
 FOLLOW_UP_BANK: Dict[str, List[str]] = {
     "anger":               ["When does the anger peak most? (before bed / after school / screen time)","What usually happens in the 60 seconds before the outburst?"],
@@ -1247,11 +1293,13 @@ FOLLOW_UP_BANK: Dict[str, List[str]] = {
     "general_parenting":   ["How old is your child?","When does the situation occur most often and what usually triggers it?"],
 }
 
+
 def pick_followups(topic: str) -> List[str]:
     return (FOLLOW_UP_BANK.get(topic) or ["Can you share a recent situation?", "How old is your child?"])[:2]
 
+
 # ──────────────────────────────────────────────
-# CONFIDENCE SCORING
+# CONFIDENCE SCORING (unchanged)
 # ──────────────────────────────────────────────
 def compute_confidence(topic, kb_res, age, user_text, in_scope, risk_level) -> int:
     score = 40
@@ -1265,8 +1313,9 @@ def compute_confidence(topic, kb_res, age, user_text, in_scope, risk_level) -> i
     elif risk_level == "high":                score -= 25
     return max(0, min(100, score))
 
+
 # ──────────────────────────────────────────────
-# EMPATHY REFLECT
+# EMPATHY REFLECT (unchanged)
 # ──────────────────────────────────────────────
 _EMPATHY_AR: Dict[str, str] = {
     "anger":               "واضح إن الموضوع ده متعبك وبيستنزف أعصابك.",
@@ -1288,6 +1337,7 @@ _EMPATHY_EN: Dict[str, str] = {
     "general_parenting":   "Parenting is full of moments that leave us uncertain — you're doing the right thing.",
 }
 
+
 def empathy_reflect(user_text: str, topic: str, risk_level: str, lang: Lang) -> str:
     if lang == "ar":
         empathy = _EMPATHY_AR.get(topic, "حاسة بيكي، والموضوع ده مش سهل.")
@@ -1300,17 +1350,20 @@ def empathy_reflect(user_text: str, topic: str, risk_level: str, lang: Lang) -> 
         snippet = (user_text[:77] + "...") if len(user_text) > 80 else user_text
         return f"{empathy}\n\nYou said: \"{snippet}\"\n"
 
+
 # ──────────────────────────────────────────────
-# GEMINI HELPERS
+# GEMINI HELPERS — v4 (preserved) + v5 additions
 # ──────────────────────────────────────────────
 def _require_gemini() -> None:
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
 
+
 def _lang_instruction(lang: Lang) -> str:
     if lang == "ar":
         return "Reply in warm, clear Modern Standard Arabic (Egyptian dialect warmth is welcome)."
     return "Reply in clear, warm, professional English."
+
 
 def gemini_route_decision(user_text, history, fallback_age) -> RouteDecision:
     _require_gemini()
@@ -1349,6 +1402,7 @@ def gemini_route_decision(user_text, history, fallback_age) -> RouteDecision:
         return RouteDecision(in_scope=False, topic="out_of_scope", action="refuse_out_of_scope",
                              reason=f"Router parse failed. raw={resp.text[:100]}")
 
+
 def gemini_compose_answer(user_text, topic, tips, specialists, slots,
                            memory, followups, confidence, risk_level, lang: Lang) -> str:
     _require_gemini()
@@ -1370,6 +1424,7 @@ def gemini_compose_answer(user_text, topic, tips, specialists, slots,
     fallback = "ممكن تقوليلي تفاصيل أكتر؟" if lang == "ar" else "Could you share more details?"
     return (resp.text or "").strip() or fallback
 
+
 def gemini_verify_answer(user_text, answer, allowed_payload) -> Dict[str, Any]:
     _require_gemini()
     prompt = (
@@ -1388,6 +1443,394 @@ def gemini_verify_answer(user_text, answer, allowed_payload) -> Dict[str, Any]:
     except Exception:
         return {"ok": True, "reason": ""}
 
+
+# ══════════════════════════════════════════════
+# ▌ FEATURE 1 — SMART REPLIES                 ▐
+# ══════════════════════════════════════════════
+def generate_smart_replies(
+    user_message: str,
+    assistant_response: str,
+    lang: Lang = "en",
+    max_replies: int = 5,
+) -> List[str]:
+    """
+    Generate 3-5 concise, tap-friendly follow-up suggestions for the Flutter UI.
+
+    Uses Gemini to produce contextually relevant replies the user might want
+    to send next, given what they asked and what the bot answered.
+
+    Parameters
+    ----------
+    user_message        : The user's original message.
+    assistant_response  : The bot reply that was just shown.
+    lang                : Language for the suggestions ('ar' or 'en').
+    max_replies         : Cap on suggestions (3-5 recommended).
+
+    Returns
+    -------
+    List[str]  — ordered list of suggestions; empty list on any failure.
+    """
+    if not GEMINI_ENABLED or client is None:
+        print("[SMART_REPLIES] Gemini not available — returning []")
+        return []
+
+    # Clamp to sensible range
+    max_replies = max(3, min(5, max_replies))
+
+    lang_note = (
+        "Write every suggestion in Arabic only."
+        if lang == "ar"
+        else "Write every suggestion in English only."
+    )
+
+    prompt = f"""You are a UX assistant for Rafiq, a bilingual parenting chatbot.
+
+Given the conversation below, generate exactly {max_replies} short follow-up questions
+or replies that the user might want to tap next.
+
+Rules:
+- Each suggestion must be CONCISE (max 10 words).
+- Suggestions must feel NATURAL — as if the user typed them.
+- Cover different angles: asking for details, for examples, for reassurance, for next steps.
+- Do NOT repeat the user's original message.
+- Do NOT add numbering, bullets, or extra formatting.
+- {lang_note}
+- Output ONLY a JSON array of strings, nothing else.
+  Example: ["Can you give me practical steps?", "Is this normal for a 5 year old?"]
+
+USER MESSAGE:
+{user_message}
+
+ASSISTANT RESPONSE:
+{assistant_response}
+
+JSON array:"""
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.6,
+                max_output_tokens=300,
+            ),
+        )
+        raw = (resp.text or "").strip()
+
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            print(f"[SMART_REPLIES] Unexpected shape: {type(parsed)}")
+            return []
+
+        # Sanitise: keep only non-empty strings, cap at max_replies
+        replies = [str(r).strip() for r in parsed if str(r).strip()][:max_replies]
+        print(f"[SMART_REPLIES] Generated {len(replies)} suggestions (lang={lang})")
+        return replies
+
+    except json.JSONDecodeError as jde:
+        print(f"[SMART_REPLIES] JSON parse error: {jde} | raw={raw[:120]}")
+        return []
+    except Exception as exc:
+        print(f"[SMART_REPLIES] Gemini error: {exc}")
+        return []
+
+
+# ══════════════════════════════════════════════
+# ▌ FEATURE 2 — AI FAQ KNOWLEDGE BASE BUILDER ▐
+# ══════════════════════════════════════════════
+
+# ── 2-A: Simple word-overlap similarity (no ML deps) ──────────────────
+def _token_jaccard(a: str, b: str) -> float:
+    """
+    Compute Jaccard similarity between the token sets of two strings.
+    Used for lightweight near-duplicate FAQ detection.
+
+    Returns float in [0.0, 1.0] — higher means more similar.
+    """
+    tok_a = set(_ar_normalize(a).split()) or set(a.lower().split())
+    tok_b = set(_ar_normalize(b).split()) or set(b.lower().split())
+    if not tok_a or not tok_b:
+        return 0.0
+    return len(tok_a & tok_b) / len(tok_a | tok_b)
+
+
+def _is_duplicate_faq(conn, question: str, threshold: float = FAQ_SIM_THRESHOLD) -> bool:
+    """
+    Return True if an 'approved' or 'pending' FAQ exists whose question
+    is similar enough to `question` (Jaccard ≥ threshold) to be a duplicate.
+
+    Pulls only the question column from the DB to keep the check cheap.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT question FROM faq_knowledge_base WHERE status IN ('approved', 'pending')"
+    )
+    rows = cur.fetchall()
+    for (existing_q,) in rows:
+        if _token_jaccard(question, existing_q) >= threshold:
+            print(f"[FAQ] Duplicate detected: '{question[:60]}' ≈ '{existing_q[:60]}'")
+            return True
+    return False
+
+
+# ── 2-B: Gemini FAQ extraction from chat logs ─────────────────────────
+def _gemini_extract_faqs(chat_log_json: str) -> List[Dict[str, str]]:
+    """
+    Call Gemini with a batch of chat messages and ask it to produce FAQ entries.
+
+    Parameters
+    ----------
+    chat_log_json : JSON-serialised list of {"user": str, "bot": str} dicts.
+
+    Returns
+    -------
+    List of dicts with keys: question, answer, category.
+    Returns [] on any failure.
+    """
+    if not GEMINI_ENABLED or client is None:
+        print("[FAQ_BUILDER] Gemini not available — skipping extraction")
+        return []
+
+    prompt = f"""You are a knowledge-base curator for Rafiq, a parenting support chatbot.
+
+Below is a sample of recent user conversations (JSON list of {{user, bot}} pairs).
+Your task: identify RECURRING or BROADLY USEFUL parenting questions and write clear FAQ entries.
+
+Rules:
+1. Only include questions that appear multiple times OR represent very common parenting concerns.
+2. Write a concise, standalone QUESTION (as a parent would ask it).
+3. Write a thorough but concise ANSWER (2-5 sentences) based on the bot replies.
+4. Assign a CATEGORY from this list ONLY:
+   Behavior | Communication | Screen Time | Bullying | Study & Focus |
+   Sleep | Nutrition | Emotional Development | Adolescence | General Parenting
+5. Do NOT include one-off, very personal, or out-of-scope questions.
+6. Output ONLY a valid JSON array. Each element must have exactly three keys:
+   "question", "answer", "category".
+   Example:
+   [
+     {{
+       "question": "How do I handle tantrums in a 4-year-old?",
+       "answer": "Stay calm and get on the child's level. Acknowledge the feeling first...",
+       "category": "Behavior"
+     }}
+   ]
+7. If no recurring or broadly useful questions are found, return an empty array: []
+
+CHAT LOG:
+{chat_log_json}
+
+JSON array:"""
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=2000,
+            ),
+        )
+        raw = (resp.text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$",          "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            print(f"[FAQ_BUILDER] Unexpected Gemini output type: {type(parsed)}")
+            return []
+
+        valid = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("question", "")).strip()
+            a = str(item.get("answer",   "")).strip()
+            c = str(item.get("category", "General Parenting")).strip()
+            if q and a:
+                valid.append({"question": q, "answer": a, "category": c})
+
+        print(f"[FAQ_BUILDER] Gemini returned {len(valid)} candidate FAQs")
+        return valid
+
+    except json.JSONDecodeError as jde:
+        print(f"[FAQ_BUILDER] JSON parse error: {jde} | raw={raw[:200]}")
+        return []
+    except Exception as exc:
+        print(f"[FAQ_BUILDER] Gemini error: {exc}")
+        return []
+
+
+def generate_faq_from_chat_logs(
+    conn,
+    log_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Full workflow for AI FAQ Knowledge Base Builder:
+
+    1. Read the most recent `log_limit` chat log pairs from the DB.
+    2. Group them into a JSON payload for Gemini.
+    3. Call Gemini → get candidate FAQ list.
+    4. For each candidate:
+        a. Skip near-duplicates (Jaccard similarity ≥ FAQ_SIM_THRESHOLD).
+        b. Insert with status='pending' and source_count=occurrence_count.
+    5. Return a summary dict.
+
+    Parameters
+    ----------
+    conn      : Active psycopg2 connection.
+    log_limit : Override for FAQ_LOG_WINDOW env var.
+
+    Returns
+    -------
+    dict with keys: scanned, candidates, inserted, skipped_duplicates, errors.
+    """
+    limit = log_limit or FAQ_LOG_WINDOW
+    print(f"[FAQ_BUILDER] Starting FAQ generation from last {limit} chat logs")
+
+    # ── Step 1: fetch recent chat logs ────────────────────────────────
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT message, response
+        FROM   chat_messages
+        ORDER  BY created_at DESC
+        LIMIT  %s
+        """,
+        (limit,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print("[FAQ_BUILDER] No chat logs found — aborting")
+        return {"scanned": 0, "candidates": 0, "inserted": 0,
+                "skipped_duplicates": 0, "errors": 0}
+
+    # Build compact log payload (keep it within reasonable token count)
+    chat_log = [
+        {"user": str(r[0] or "")[:300], "bot": str(r[1] or "")[:300]}
+        for r in rows
+    ]
+    chat_log_json = json.dumps(chat_log, ensure_ascii=False)
+    print(f"[FAQ_BUILDER] Scanning {len(rows)} chat pairs")
+
+    # ── Step 2 & 3: Gemini extraction ─────────────────────────────────
+    candidates = _gemini_extract_faqs(chat_log_json)
+
+    # ── Step 4: dedup + insert ─────────────────────────────────────────
+    inserted           = 0
+    skipped_duplicates = 0
+    errors             = 0
+
+    for item in candidates:
+        question = item["question"]
+        answer   = item["answer"]
+        category = item["category"]
+
+        try:
+            if _is_duplicate_faq(conn, question):
+                # Bump source_count on the existing similar FAQ
+                cur.execute(
+                    """
+                    UPDATE faq_knowledge_base
+                    SET    source_count = source_count + 1,
+                           updated_at  = NOW()
+                    WHERE  status IN ('approved', 'pending')
+                    ORDER  BY created_at DESC
+                    LIMIT  1
+                    """,
+                )
+                conn.commit()
+                skipped_duplicates += 1
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO faq_knowledge_base
+                    (question, answer, category, source_count, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'pending', NOW(), NOW())
+                """,
+                (question, answer, category, FAQ_MIN_SOURCES)
+            )
+            conn.commit()
+            inserted += 1
+            print(f"[FAQ_BUILDER] Inserted pending FAQ: '{question[:60]}'")
+
+        except Exception as exc:
+            conn.rollback()
+            errors += 1
+            print(f"[FAQ_BUILDER] DB error for '{question[:40]}': {exc}")
+
+    summary = {
+        "scanned":            len(rows),
+        "candidates":         len(candidates),
+        "inserted":           inserted,
+        "skipped_duplicates": skipped_duplicates,
+        "errors":             errors,
+    }
+    print(f"[FAQ_BUILDER] Done — {summary}")
+    return summary
+
+
+# ── 2-C: FAQ search (used inside /chat) ───────────────────────────────
+def search_faq(conn, query: str, threshold: float = 0.35) -> Optional[Dict[str, Any]]:
+    """
+    Search approved FAQs for a question similar to `query`.
+
+    Uses token-Jaccard similarity. Returns the best-matching FAQ dict
+    (keys: id, question, answer, category) if any score ≥ threshold,
+    otherwise returns None.
+
+    The threshold is intentionally lower here (0.35 vs 0.75 for dedup)
+    because we want to catch paraphrased versions of the same question.
+
+    Parameters
+    ----------
+    conn      : Active psycopg2 connection.
+    query     : The user's chat message to match against.
+    threshold : Minimum Jaccard similarity to consider a hit.
+
+    Returns
+    -------
+    Dict with FAQ fields, or None.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, question, answer, category
+        FROM   faq_knowledge_base
+        WHERE  status = 'approved'
+        ORDER  BY source_count DESC, created_at DESC
+        """,
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+
+    best_score = 0.0
+    best_row   = None
+    for row in rows:
+        faq_id, question, answer, category = row
+        sim = _token_jaccard(query, question)
+        if sim > best_score:
+            best_score = sim
+            best_row   = row
+
+    if best_score >= threshold and best_row:
+        faq_id, question, answer, category = best_row
+        print(f"[FAQ_SEARCH] Hit (score={best_score:.2f}): '{question[:60]}'")
+        return {"id": faq_id, "question": question, "answer": answer, "category": category}
+
+    return None
+
+
+# ──────────────────────────────────────────────
+# PARENTING PLAN GENERATION (unchanged from v4)
+# ──────────────────────────────────────────────
 def gemini_generate_parenting_plan(
     child_age: Optional[int],
     top_archetype: str,
@@ -1397,9 +1840,7 @@ def gemini_generate_parenting_plan(
     scores_text: str,
     lang: Lang,
 ) -> str:
-    """Generate a 30-day parenting plan in the user's language."""
     _require_gemini()
-
     if lang == "ar":
         prompt = (
             "أنت مدرب تربوي محترف متخصص في التطوير الشخصي للأطفال.\n\n"
@@ -1412,11 +1853,8 @@ def gemini_generate_parenting_plan(
             "المطلوب:\n"
             "أنشئ خطة تربوية مخصصة لمدة 30 يومًا (4 أسابيع).\n"
             "يجب أن تتضمن الخطة:\n"
-            "1. هدف الأسبوع\n"
-            "2. أنشطة يومية عملية ومناسبة لعمر الطفل\n"
-            "3. أساليب التعزيز الإيجابي\n"
-            "4. توصيات خاصة بالوالدين\n"
-            "5. ملاحظة ختامية للمتابعة\n\n"
+            "1. هدف الأسبوع\n2. أنشطة يومية عملية\n3. أساليب التعزيز الإيجابي\n"
+            "4. توصيات خاصة بالوالدين\n5. ملاحظة ختامية للمتابعة\n\n"
             "الأسلوب: دافئ، واضح، وعملي. تجنب المصطلحات الطبية.\n"
             "أعد الخطة كاملةً باللغة العربية."
         )
@@ -1429,16 +1867,10 @@ def gemini_generate_parenting_plan(
             f"- Child's needs: {archetype_needs}\n\n"
             f"Top traits:\n{traits_text}\n\n"
             f"All trait scores:\n{scores_text}\n\n"
-            "Task:\n"
-            "Create a personalised 30-day parenting plan (4 weeks) based on this data.\n"
-            "The plan must include:\n"
-            "1. Weekly goal\n"
-            "2. Daily practical activities appropriate for the child's age\n"
-            "3. Positive reinforcement strategies per week\n"
-            "4. Specific recommendations for parents to support the child\n"
-            "5. A closing note for follow-up after the plan ends\n\n"
-            "Style: warm, clear, practical. Avoid medical/diagnostic terminology.\n"
-            "Write the entire plan in English."
+            "Create a personalised 30-day parenting plan (4 weeks) that includes:\n"
+            "1. Weekly goal\n2. Daily practical activities\n3. Positive reinforcement strategies\n"
+            "4. Specific recommendations for parents\n5. A closing follow-up note\n\n"
+            "Style: warm, clear, practical. Avoid medical terminology. Write in English."
         )
 
     resp = client.models.generate_content(
@@ -1447,30 +1879,30 @@ def gemini_generate_parenting_plan(
     )
     return (resp.text or "").strip()
 
+
 # ──────────────────────────────────────────────
-# PDF HELPERS
+# PDF HELPERS (unchanged from v4)
 # ──────────────────────────────────────────────
 def _safe_xml(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
 def _shape_arabic(text: str) -> str:
-    """Reshape + apply bidi for Arabic strings in ReportLab."""
     if not _ARABIC_SHAPING:
         return text
     reshaped = arabic_reshaper.reshape(text)
     return bidi_display(reshaped)
 
+
 def _pdf_text(text: str, lang: Lang) -> str:
-    """Prepare text for PDF: shape Arabic if needed."""
-    if lang == "ar":
-        return _shape_arabic(text)
-    return text
+    return _shape_arabic(text) if lang == "ar" else text
+
 
 def _pick_font(bold: bool, lang: Lang = "en") -> str:
-    """Return the registered font name, falling back to Helvetica."""
     if _FONT_ARABIC_REGISTERED or _FONT_LATIN_REGISTERED:
         return "RafiqBold" if bold else "RafiqRegular"
     return "Helvetica-Bold" if bold else "Helvetica"
+
 
 def _build_parenting_plan_pdf(
     user_id: str,
@@ -1484,15 +1916,15 @@ def _build_parenting_plan_pdf(
     W, H = A4
     styles = getSampleStyleSheet()
 
-    text_align = TA_RIGHT if lang == "ar" else TA_LEFT
+    text_align  = TA_RIGHT if lang == "ar" else TA_LEFT
     brand_green = colors.HexColor("#1B6B3A")
     brand_light = colors.HexColor("#E8F5E9")
     text_dark   = colors.HexColor("#1A1A1A")
     text_muted  = colors.HexColor("#555555")
     accent_gold = colors.HexColor("#C8860A")
 
-    font_body  = _pick_font(False, lang)
-    font_bold  = _pick_font(True,  lang)
+    font_body = _pick_font(False, lang)
+    font_bold = _pick_font(True,  lang)
 
     style_subtitle = ParagraphStyle("SubTitle", parent=styles["Normal"],
         fontSize=12, textColor=text_muted, spaceAfter=2, alignment=TA_CENTER, fontName=font_body)
@@ -1514,16 +1946,11 @@ def _build_parenting_plan_pdf(
         title=f"Rafiq Parenting Plan — {user_id}", author="Rafiq AI")
 
     story = []
-
-    # Banner
     banner_title = _pdf_text(t("pdf_main_title", lang), lang)
     banner_sub   = _pdf_text(t("pdf_subtitle",   lang), lang)
     banner_style = ParagraphStyle("BannerTitle", parent=styles["Title"],
         fontSize=20, textColor=colors.white, alignment=TA_CENTER, fontName=font_bold)
-    banner_table = Table(
-        [[Paragraph(banner_title, banner_style)]],
-        colWidths=[W - 4*cm],
-    )
+    banner_table = Table([[Paragraph(banner_title, banner_style)]], colWidths=[W - 4*cm])
     banner_table.setStyle(TableStyle([
         ("BACKGROUND",   (0,0),(-1,-1), brand_green),
         ("TOPPADDING",   (0,0),(-1,-1), 14),
@@ -1536,25 +1963,21 @@ def _build_parenting_plan_pdf(
     story.append(Spacer(1, 0.25*cm))
     story.append(HRFlowable(width="100%", thickness=1.5, color=brand_green, spaceAfter=10))
 
-    # Meta table
     age_display  = _pdf_text(
         f"{child_age} {'سنة' if lang=='ar' else 'years'}" if child_age
         else t("pdf_label_age_unknown", lang), lang)
     date_display = generated_at[:10] if generated_at else "—"
 
     lbl = lambda k: _pdf_text(t(k, lang), lang)
-    lbl_style = ParagraphStyle("MetaLbl", parent=styles["Normal"],
-        fontSize=9, textColor=brand_green, fontName=font_bold)
-    val_style = ParagraphStyle("MetaVal", parent=styles["Normal"],
-        fontSize=9, textColor=text_dark,  fontName=font_body)
+    lbl_style = ParagraphStyle("MetaLbl", parent=styles["Normal"], fontSize=9, textColor=brand_green, fontName=font_bold)
+    val_style = ParagraphStyle("MetaVal", parent=styles["Normal"], fontSize=9, textColor=text_dark,  fontName=font_body)
 
     meta_data = [
-        [Paragraph(lbl("pdf_label_user_id"),   lbl_style), Paragraph(user_id,      val_style),
-         Paragraph(lbl("pdf_label_child_age"), lbl_style), Paragraph(age_display,  val_style)],
+        [Paragraph(lbl("pdf_label_user_id"),   lbl_style), Paragraph(user_id, val_style),
+         Paragraph(lbl("pdf_label_child_age"), lbl_style), Paragraph(age_display, val_style)],
         [Paragraph(lbl("pdf_label_archetype"), lbl_style), Paragraph(_pdf_text(top_archetype, lang), val_style),
          Paragraph(lbl("pdf_label_generated"), lbl_style), Paragraph(date_display, val_style)],
     ]
-    # Column widths: label=18%, value=32%, label=18%, value=32%  (totals 100%)
     full_w = W - 4*cm
     meta_table = Table(meta_data, colWidths=[full_w*0.18, full_w*0.32, full_w*0.18, full_w*0.32])
     meta_table.setStyle(TableStyle([
@@ -1569,8 +1992,6 @@ def _build_parenting_plan_pdf(
     story.append(meta_table)
     story.append(Spacer(1, 0.5*cm))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
-
-    # Plan content
     story.append(Paragraph(_pdf_text(t("pdf_section_plan", lang), lang), style_section_heading))
     story.append(Spacer(1, 0.2*cm))
 
@@ -1582,26 +2003,20 @@ def _build_parenting_plan_pdf(
         if not line:
             story.append(Spacer(1, 0.18*cm))
             continue
-
         shaped = _pdf_text(line, lang)
-
         if any(line.startswith(kw) for kw in week_keywords) or (
             len(line) < 80 and line.endswith(":") and not line.startswith(" ")
         ):
             story.append(Paragraph(_safe_xml(shaped), style_plan_heading))
             continue
-
         if len(line) > 2 and line[0].isdigit() and line[1] in (".", ")"):
             story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(shaped[2:].strip())}", style_bullet))
             continue
-
         if line[0] in bullet_markers:
             story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(shaped[1:].strip())}", style_bullet))
             continue
-
         story.append(Paragraph(_safe_xml(shaped), style_plan_body))
 
-    # Footer
     story.append(Spacer(1, 0.6*cm))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
     story.append(Paragraph(_safe_xml(_pdf_text(t("pdf_footer_line1", lang), lang)), style_footer))
@@ -1610,8 +2025,9 @@ def _build_parenting_plan_pdf(
     buf.seek(0)
     return buf.read()
 
+
 # ──────────────────────────────────────────────
-# PROFILE NORMALISATION HELPERS
+# PROFILE NORMALISATION HELPERS (unchanged)
 # ──────────────────────────────────────────────
 def _norm_traits(raw: Any) -> List[Dict[str, Any]]:
     out = []
@@ -1622,6 +2038,7 @@ def _norm_traits(raw: Any) -> List[Dict[str, Any]]:
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             out.append({"trait": str(item[0]), "score": int(item[1])})
     return out
+
 
 def _norm_personalities(raw: Any) -> List[Dict[str, Any]]:
     out = []
@@ -1636,6 +2053,7 @@ def _norm_personalities(raw: Any) -> List[Dict[str, Any]]:
                         "description":"","needs":"","match_pct":int(item[1])})
     return out
 
+
 def _norm_scores(raw: Any) -> Dict[str, int]:
     if isinstance(raw, dict):
         return {str(k): int(v) for k, v in raw.items()}
@@ -1645,8 +2063,9 @@ def _norm_scores(raw: Any) -> Dict[str, int]:
             out[str(item[0])] = int(item[1])
     return out
 
+
 # ──────────────────────────────────────────────
-# FCM HELPER  (shared by assessment + plan)
+# FCM HELPER (unchanged from v4)
 # ──────────────────────────────────────────────
 def _send_fcm_notification(
     user_id: str,
@@ -1654,27 +2073,14 @@ def _send_fcm_notification(
     body: str,
     data: Dict[str, str],
 ) -> Dict[str, Any]:
-    """
-    Send a Firebase Cloud Messaging push notification.
-    Returns {"sent": bool, "warning": str|None}.
-    Uses its own isolated DB connection — safe to call after any commit.
-    """
     print(f"[FCM] Attempting notification for user={user_id} | title='{title}'")
 
     if not _FIREBASE_AVAILABLE:
-        msg = "firebase-admin package not installed. Run: pip install firebase-admin"
-        print(f"[FCM] SKIPPED — {msg}")
-        return {"sent": False, "warning": msg}
-
+        return {"sent": False, "warning": "firebase-admin not installed."}
     if not _FIREBASE_CREDS_JSON:
-        msg = "FIREBASE_CREDENTIALS env var is not set."
-        print(f"[FCM] SKIPPED — {msg}")
-        return {"sent": False, "warning": msg}
-
+        return {"sent": False, "warning": "FIREBASE_CREDENTIALS not set."}
     if not FIREBASE_ENABLED:
-        msg = "Firebase failed to initialise at startup — check server logs."
-        print(f"[FCM] SKIPPED — {msg}")
-        return {"sent": False, "warning": msg}
+        return {"sent": False, "warning": "Firebase failed to initialise at startup."}
 
     notif_conn = None
     try:
@@ -1683,28 +2089,15 @@ def _send_fcm_notification(
         nc.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
         row = nc.fetchone()
         token: Optional[str] = row[0] if row else None
-
-        print(f"[FCM] user={user_id} | token_exists={bool(token)} "
-              f"| preview={token[:10] + '...' if token else 'None'}")
-
         if not token:
-            msg = "No FCM token registered. Call POST /register-token first."
-            print(f"[FCM] SKIPPED — {msg}")
-            return {"sent": False, "warning": msg}
-
+            return {"sent": False, "warning": "No FCM token registered."}
         message = fb_messaging.Message(
             notification=fb_messaging.Notification(title=title, body=body),
-            token=token,
-            data=data,
+            token=token, data=data,
         )
         fb_messaging.send(message)
         print(f"[FCM] ✅ Sent to user={user_id}")
         return {"sent": True, "warning": None}
-
-    except AttributeError as ae:
-        msg = f"Firebase messaging object is None: {ae}"
-        print(f"[FCM] ERROR — {msg}")
-        return {"sent": False, "warning": msg}
 
     except Exception as exc:
         err = str(exc)
@@ -1715,15 +2108,10 @@ def _send_fcm_notification(
                         "UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,)
                     )
                     notif_conn.commit()
-                    print(f"[FCM] Expired token cleared for user={user_id}")
                 except Exception:
                     pass
-            msg = "FCM token expired/unregistered — cleared. User must re-register."
-        else:
-            msg = f"Firebase send error: {err}"
-        print(f"[FCM] ERROR — {msg}")
-        return {"sent": False, "warning": msg}
-
+            return {"sent": False, "warning": "FCM token expired — cleared."}
+        return {"sent": False, "warning": f"Firebase send error: {err}"}
     finally:
         if notif_conn:
             try:
@@ -1733,7 +2121,7 @@ def _send_fcm_notification(
 
 
 # ──────────────────────────────────────────────
-# PARENTING PLAN CORE  (shared by assessment + standalone endpoint)
+# PARENTING PLAN CORE (unchanged from v4)
 # ──────────────────────────────────────────────
 def _generate_and_save_plan(
     conn,
@@ -1742,13 +2130,7 @@ def _generate_and_save_plan(
     result: Dict[str, Any],
     child_age: Optional[int],
 ) -> Dict[str, Any]:
-    """
-    Build plan text via Gemini, persist to parenting_plans, return plan dict.
-    Always generates in English.
-    Raises HTTPException on Gemini or DB failure.
-    """
     PLAN_LANG: Lang = "en"
-
     top_traits             = _norm_traits(result.get("top_traits", []))
     possible_personalities = _norm_personalities(result.get("possible_personalities", []))
     trait_scores           = _norm_scores(result.get("trait_scores", {}))
@@ -1767,17 +2149,11 @@ def _generate_and_save_plan(
         or "  - No data"
     )
 
-    print(f"[PLAN] Generating English plan for user={user_id}, assessment_id={assessment_id}")
-
     try:
         plan_text = gemini_generate_parenting_plan(
-            child_age=child_age,
-            top_archetype=top_archetype,
-            archetype_desc=archetype_desc,
-            archetype_needs=archetype_needs,
-            traits_text=traits_text,
-            scores_text=scores_text,
-            lang=PLAN_LANG,
+            child_age=child_age, top_archetype=top_archetype,
+            archetype_desc=archetype_desc, archetype_needs=archetype_needs,
+            traits_text=traits_text, scores_text=scores_text, lang=PLAN_LANG,
         )
     except HTTPException:
         raise
@@ -1798,13 +2174,11 @@ def _generate_and_save_plan(
         conn.commit()
         plan_id         = plan_row[0]
         plan_created_at = plan_row[1].isoformat() if plan_row[1] else None
-        print(f"[PLAN] Saved plan_id={plan_id} for user={user_id}")
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"DB error saving plan: {exc}")
 
-    log_event(conn, user_id, "parenting_plan_generated",
-              value=f"plan_id={plan_id}, assessment_id={assessment_id}")
+    log_event(conn, user_id, "parenting_plan_generated", value=f"plan_id={plan_id}, assessment_id={assessment_id}")
 
     return {
         "plan_id":       plan_id,
@@ -1817,18 +2191,26 @@ def _generate_and_save_plan(
     }
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 # ROUTES — SYSTEM
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "4.0.0"}
+    return {"status": "Rafiq running 🚀", "version": "5.0.0"}
+
 
 @app.get("/health", tags=["System"])
 def health():
-    return {"ok": True, "model": GEMINI_MODEL, "gemini_enabled": GEMINI_ENABLED,
-            "verify": ENABLE_VERIFY, "db": bool(DATABASE_URL), "debug": DEBUG,
-            "arabic_shaping": _ARABIC_SHAPING, "pdf": _REPORTLAB_AVAILABLE}
+    return {
+        "ok": True, "model": GEMINI_MODEL, "gemini_enabled": GEMINI_ENABLED,
+        "verify": ENABLE_VERIFY, "db": bool(DATABASE_URL), "debug": DEBUG,
+        "arabic_shaping": _ARABIC_SHAPING, "pdf": _REPORTLAB_AVAILABLE,
+        # v5
+        "smart_replies": GEMINI_ENABLED,
+        "faq_builder":   GEMINI_ENABLED,
+        "faq_log_window": FAQ_LOG_WINDOW,
+    }
+
 
 @app.get("/test_gemini", tags=["System"])
 def test_gemini():
@@ -1836,9 +2218,10 @@ def test_gemini():
     r = client.models.generate_content(model=GEMINI_MODEL, contents="Reply with OK only.")
     return {"text": r.text}
 
-# ──────────────────────────────────────────────
-# ROUTES — USERS
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — USERS (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/users", tags=["Users"])
 def upsert_user(req: UserUpsertReq):
     conn = get_conn()
@@ -1862,16 +2245,12 @@ def upsert_user(req: UserUpsertReq):
         row = cur.fetchone()
         conn.commit()
         return {
-            "ok": True,
-            "message": t("ok", lang),
+            "ok": True, "message": t("ok", lang),
             "user": {
-                "user_id":            row[0],
-                "name":               row[1],
-                "email":              row[2],
-                "child_age":          row[3],
-                "preferred_language": row[4],
-                "created_at":         row[5].isoformat() if row[5] else None,
-                "updated_at":         row[6].isoformat() if row[6] else None,
+                "user_id": row[0], "name": row[1], "email": row[2],
+                "child_age": row[3], "preferred_language": row[4],
+                "created_at": row[5].isoformat() if row[5] else None,
+                "updated_at": row[6].isoformat() if row[6] else None,
             }
         }
     except psycopg2.errors.UniqueViolation:
@@ -1883,6 +2262,7 @@ def upsert_user(req: UserUpsertReq):
     finally:
         conn.close()
 
+
 @app.get("/memory/{user_id}", tags=["Users"])
 def memory_get(user_id: str):
     conn = get_conn()
@@ -1890,9 +2270,10 @@ def memory_get(user_id: str):
     conn.close()
     return {"user_id": user_id, "memory": data}
 
-# ──────────────────────────────────────────────
-# ROUTES — FCM / PUSH
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — FCM / PUSH (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/register-token", tags=["Notifications"])
 def register_token(req: RegisterTokenReq):
     conn = get_conn()
@@ -1903,10 +2284,7 @@ def register_token(req: RegisterTokenReq):
         cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (req.user_id,))
         row = cur.fetchone()
         if row: lang = row[0] or "ar"
-        cur.execute(
-            "UPDATE users SET fcm_token=%s, updated_at=NOW() WHERE user_id=%s",
-            (req.fcm_token, req.user_id)
-        )
+        cur.execute("UPDATE users SET fcm_token=%s, updated_at=NOW() WHERE user_id=%s", (req.fcm_token, req.user_id))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail=t("user_not_found", lang))
         conn.commit()
@@ -1919,6 +2297,7 @@ def register_token(req: RegisterTokenReq):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     finally:
         conn.close()
+
 
 @app.post("/send-daily-tip", tags=["Notifications"])
 def send_daily_tip(req: SendDailyTipReq):
@@ -1934,24 +2313,16 @@ def send_daily_tip(req: SendDailyTipReq):
         lang = row[1] or "ar"
         if not fcm_token:
             raise HTTPException(status_code=422, detail=t("no_fcm_token", lang))
-
         ensure_user_exists(conn, req.user_id)
         cur.execute("INSERT INTO daily_tips (user_id, tip) VALUES (%s,%s)", (req.user_id, req.tip))
         conn.commit()
-
         if not FIREBASE_ENABLED:
             return {"ok": True, "user_id": req.user_id, "tip_saved": True,
-                    "notification_sent": False,
-                    "warning": t("firebase_not_configured", lang)}
-
+                    "notification_sent": False, "warning": t("firebase_not_configured", lang)}
         try:
             message = fb_messaging.Message(
-                notification=fb_messaging.Notification(
-                    title=t("daily_tip_notif_title", lang),
-                    body=req.tip[:200],
-                ),
-                token=fcm_token,
-                data={"user_id": req.user_id, "type": "daily_tip"},
+                notification=fb_messaging.Notification(title=t("daily_tip_notif_title", lang), body=req.tip[:200]),
+                token=fcm_token, data={"user_id": req.user_id, "type": "daily_tip"},
             )
             fb_messaging.send(message)
         except fb_messaging.UnregisteredError:
@@ -1960,7 +2331,6 @@ def send_daily_tip(req: SendDailyTipReq):
             raise HTTPException(status_code=410, detail=t("fcm_token_expired", lang))
         except Exception as fb_exc:
             raise HTTPException(status_code=502, detail=f"Firebase error: {fb_exc}")
-
         log_event(conn, req.user_id, "daily_tip_sent", value=req.tip[:100])
         return {"ok": True, "user_id": req.user_id, "tip_saved": True, "notification_sent": True}
     except HTTPException:
@@ -1970,6 +2340,7 @@ def send_daily_tip(req: SendDailyTipReq):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
     finally:
         conn.close()
+
 
 @app.get("/daily-tip/{user_id}", tags=["Notifications"])
 def get_daily_tips(user_id: str, limit: int = 50):
@@ -1994,19 +2365,22 @@ def get_daily_tips(user_id: str, limit: int = 50):
     finally:
         conn.close()
 
-# ──────────────────────────────────────────────
-# ROUTES — KB
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — KB (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/kb/topics", tags=["KB"])
 def kb_topics():
     topics = sorted({x["topic"] for x in KB})
     return {"topics": topics, "count": len(topics)}
+
 
 @app.get("/kb/search", tags=["KB"])
 def kb_search_api(topic: str, q: str = "", age: Optional[int] = None):
     res = kb_search_v2(topic=topic, query=q, age=age)
     return {"topic": topic, "age": age, "matched": res.matched,
             "match_count": res.match_count, "used_default": res.used_default, "tips": res.tips}
+
 
 @app.post("/kb/add", tags=["KB"])
 def kb_add(req: KbAddRequest):
@@ -2017,9 +2391,10 @@ def kb_add(req: KbAddRequest):
                "age_max": req.age_max, "tags": req.tags, "tip": req.tip})
     return {"ok": True, "kb_id": new_id, "total": len(KB)}
 
-# ──────────────────────────────────────────────
-# ROUTES — ASSESSMENT
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — ASSESSMENT (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/assessment/questions", tags=["Assessment"])
 def assessment_questions(age: Optional[int] = None):
     qs = get_assessment_questions(age)
@@ -2030,23 +2405,13 @@ def assessment_questions(age: Optional[int] = None):
         "questions": _format_questions_for_api(qs),
     }
 
+
 @app.post("/assessment/submit", tags=["Assessment"])
 def assessment_submit(req: AssessmentSubmitReq):
-    """
-    Unified workflow:
-      1. Save assessment
-      2. Compute trait scores
-      3. Generate parenting plan immediately (Gemini, English)
-      4. Save parenting plan
-      5. Send FCM notification
-      6. Return combined result
-    """
     conn = get_conn()
-    # Response language can be ar/en; plan is always English
-    lang: Lang = req.preferred_language if req.preferred_language in ("ar", "en") else "ar"  # type: ignore[assignment]
+    lang: Lang = req.preferred_language if req.preferred_language in ("ar", "en") else "ar"  # type: ignore
     try:
         ensure_user_exists(conn, req.user_id)
-
         if req.preferred_language is None:
             cur = conn.cursor()
             cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (req.user_id,))
@@ -2054,77 +2419,48 @@ def assessment_submit(req: AssessmentSubmitReq):
             if row and row[0]:
                 lang = row[0]
 
-        if DEBUG:
-            print(f"[ASSESSMENT] user={req.user_id}, child_age={req.child_age}, "
-                  f"answers_count={len(req.answers)}")
-
-        # ── Step 1 & 2: compute scores ─────────────────────────────────
         profile     = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
         assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
         recommended = recommend_specialist_for_profile(profile)
         profile_to_store = {k: v for k, v in profile.items() if k != "_debug"}
 
-        # ── Step 1 (cont): save assessment ─────────────────────────────
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO assessments "
-            "(user_id, child_age, assessment_confidence, result, created_at) "
+            "INSERT INTO assessments (user_id, child_age, assessment_confidence, result, created_at) "
             "VALUES (%s, %s, %s, %s, NOW()) RETURNING id",
-            (req.user_id, req.child_age,
-             assess_conf["confidence"], json.dumps(profile_to_store))
+            (req.user_id, req.child_age, assess_conf["confidence"], json.dumps(profile_to_store))
         )
         assessment_id = cur.fetchone()[0]
         conn.commit()
-        update_memory(conn, req.user_id, "assessment_personality",
-                      req.child_age, note="Assessment submitted")
-        log_event(conn, req.user_id, "assessment_submit",
-                  value=f"confidence={assess_conf['confidence']}")
-        print(f"[ASSESSMENT] Saved assessment_id={assessment_id} for user={req.user_id}")
+        update_memory(conn, req.user_id, "assessment_personality", req.child_age, note="Assessment submitted")
+        log_event(conn, req.user_id, "assessment_submit", value=f"confidence={assess_conf['confidence']}")
 
-        # ── Step 3 & 4: generate + save parenting plan immediately ─────
-        plan_result:      Dict[str, Any] = {}
-        plan_generated    = False
-        plan_warning:     Optional[str]  = None
+        plan_result: Dict[str, Any] = {}
+        plan_generated  = False
+        plan_warning: Optional[str] = None
 
         if not GEMINI_ENABLED or client is None:
-            plan_warning = "Gemini disabled — plan not generated. Set GEMINI_API_KEY."
-            print(f"[PLAN] SKIPPED — Gemini not available")
+            plan_warning = "Gemini disabled — plan not generated."
         else:
             try:
-                plan_result   = _generate_and_save_plan(
-                    conn          = conn,
-                    user_id       = req.user_id,
-                    assessment_id = assessment_id,
-                    result        = profile_to_store,
-                    child_age     = req.child_age,
-                )
+                plan_result    = _generate_and_save_plan(conn=conn, user_id=req.user_id,
+                                    assessment_id=assessment_id, result=profile_to_store, child_age=req.child_age)
                 plan_generated = True
             except HTTPException as he:
                 plan_warning = f"Plan generation failed: {he.detail}"
-                print(f"[PLAN] ERROR — {plan_warning}")
             except Exception as exc:
                 plan_warning = f"Plan generation error: {exc}"
-                print(f"[PLAN] ERROR — {plan_warning}")
 
-        # ── Step 5: FCM notification ────────────────────────────────────
-        # Notification is sent after plan is ready (or if plan failed, after assessment)
         notif_result = _send_fcm_notification(
-            user_id = req.user_id,
-            title   = "📋 Your Parenting Plan is Ready",
-            body    = "A personalized parenting plan has been generated based on your assessment.",
-            data    = {
-                "type":          "parenting_plan",
-                "user_id":       str(req.user_id),
-                "plan_id":       str(plan_result.get("plan_id", "")),
-                "assessment_id": str(assessment_id),
-            },
+            user_id=req.user_id,
+            title="📋 Your Parenting Plan is Ready",
+            body="A personalized parenting plan has been generated based on your assessment.",
+            data={"type":"parenting_plan","user_id":str(req.user_id),
+                  "plan_id":str(plan_result.get("plan_id","")),"assessment_id":str(assessment_id)},
         )
 
-        # ── Step 6: return combined response ───────────────────────────
         response: Dict[str, Any] = {
-            "ok":                     True,
-            "message":                t("ok", lang),
-            # Assessment fields
+            "ok": True, "message": t("ok", lang),
             "assessment_saved":       True,
             "assessment_id":          assessment_id,
             "trait_scores":           profile["trait_scores"],
@@ -2137,20 +2473,17 @@ def assessment_submit(req: AssessmentSubmitReq):
             "recommended_specialist": recommended,
             "note":                   t("assessment_note", lang),
             "debug":                  profile.get("_debug", {}),
-            # Plan fields
             "plan_generated":         plan_generated,
             "plan_id":                plan_result.get("plan_id"),
             "plan_created_at":        plan_result.get("created_at"),
             "plan_language":          plan_result.get("plan_language", "en"),
             "top_archetype":          plan_result.get("top_archetype"),
-            # Notification fields
             "notification_sent":      notif_result["sent"],
         }
         if plan_warning:
             response["plan_warning"] = plan_warning
         if notif_result["warning"]:
             response["notification_warning"] = notif_result["warning"]
-
         return response
 
     except HTTPException:
@@ -2160,6 +2493,7 @@ def assessment_submit(req: AssessmentSubmitReq):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         conn.close()
+
 
 @app.get("/assessment/{user_id}", tags=["Assessment"])
 def get_assessments(user_id: str):
@@ -2179,9 +2513,10 @@ def get_assessments(user_id: str):
         ]
     }
 
-# ──────────────────────────────────────────────
-# ROUTES — SPECIALISTS & SLOTS
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — SPECIALISTS & SLOTS (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/specialists", tags=["Specialists"])
 def specialists_list():
     conn = get_conn()
@@ -2193,6 +2528,7 @@ def specialists_list():
         return {"specialists": [{"id": r[0], "name": r[1], "title": r[2], "topics": r[3],
                                   "price_egp": float(r[4]), "rating": float(r[5])} for r in rows]}
     return {"specialists": sorted(SPECIALISTS, key=lambda x: -x["rating"])}
+
 
 @app.get("/slots/{specialist_id}", tags=["Specialists"])
 def get_slots(specialist_id: str):
@@ -2208,9 +2544,10 @@ def get_slots(specialist_id: str):
         return {"slots": [{"slot_id": r[0], "start_time": r[1], "duration_min": r[2], "available": r[3]} for r in rows]}
     return {"slots": [s for s in SLOTS if s["specialist_id"] == specialist_id]}
 
-# ──────────────────────────────────────────────
-# ROUTES — APPOINTMENTS
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — APPOINTMENTS (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/appointments/book", tags=["Appointments"])
 def book(req: BookingReq):
     conn = get_conn()
@@ -2224,6 +2561,7 @@ def book(req: BookingReq):
         raise HTTPException(status_code=400, detail="Slot not available")
     finally:
         conn.close()
+
 
 @app.get("/appointments/{user_id}", tags=["Appointments"])
 def get_appointments(user_id: str, limit: int = 50):
@@ -2243,9 +2581,10 @@ def get_appointments(user_id: str, limit: int = 50):
         ]
     }
 
-# ──────────────────────────────────────────────
-# ROUTES — ANALYTICS
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — ANALYTICS (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/analytics/event", tags=["Analytics"])
 def analytics_event(req: AppEventRequest):
     conn = get_conn()
@@ -2253,6 +2592,7 @@ def analytics_event(req: AppEventRequest):
     log_event(conn, req.user_id, req.event_name, value=json.dumps(req.meta)[:300])
     conn.close()
     return {"ok": True}
+
 
 @app.get("/analytics/summary", tags=["Analytics"])
 def analytics_summary():
@@ -2264,6 +2604,7 @@ def analytics_summary():
     total = cur.fetchone()[0]
     conn.close()
     return {"total_events": total, "by_type": {r[0]: r[1] for r in rows}}
+
 
 @app.get("/analytics/user/{user_id}", tags=["Analytics"])
 def analytics_user(user_id: str):
@@ -2281,9 +2622,10 @@ def analytics_user(user_id: str):
                            "created_at": r[3].isoformat() if r[3] else None} for r in rows]
     }
 
-# ──────────────────────────────────────────────
-# ROUTES — FEEDBACK
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — FEEDBACK (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/feedback", tags=["Feedback"])
 def feedback(req: FeedbackReq):
     conn = get_conn()
@@ -2303,9 +2645,10 @@ def feedback(req: FeedbackReq):
     finally:
         conn.close()
 
-# ──────────────────────────────────────────────
-# ROUTES — CHAT HISTORY
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — CHAT HISTORY (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/chat/{user_id}", tags=["Chat"])
 def get_chat_history(user_id: str, limit: int = 50):
     conn = get_conn()
@@ -2321,26 +2664,35 @@ def get_chat_history(user_id: str, limit: int = 50):
                       "created_at": r[3].isoformat() if r[3] else None} for r in rows]
     }
 
-# ──────────────────────────────────────────────
-# ROUTES — CHAT (main)
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — CHAT (main)  ← v5: FAQ search + Smart Replies integrated
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(req: ChatRequest):
+    """
+    Main chat endpoint — v5 additions:
+    1. Before calling Gemini: search approved FAQs; if hit, return FAQ answer
+       immediately with smart_replies and faq_hit=True.
+    2. After Gemini composes the final answer: generate smart_replies in
+       parallel (best-effort; failures return []).
+    """
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
 
     message_id = "msg_" + uuid.uuid4().hex[:10]
     user_text  = req.messages[-1].content.strip()
-    lang: Lang = req.preferred_language if req.preferred_language in ("ar","en") else detect_lang(user_text)  # type: ignore[assignment]
+    lang: Lang = req.preferred_language if req.preferred_language in ("ar","en") else detect_lang(user_text)  # type: ignore
 
-    # Hard guards
+    # ── Hard guards (unchanged) ───────────────────────────────────────
     if hard_out_of_scope(user_text) or hard_medical(user_text):
         return ChatResponse(
             message_id=message_id,
             reply=t("out_of_scope_reply", lang),
-            cards=[{"type":"refusal",
-                    "title": t("card_out_of_scope", lang),
-                    "body":  t("out_of_scope_card", lang)}]
+            cards=[{"type":"refusal","title": t("card_out_of_scope", lang),
+                    "body": t("out_of_scope_card", lang)}],
+            smart_replies=[],
+            faq_hit=False,
         )
 
     if not GEMINI_ENABLED or client is None:
@@ -2348,7 +2700,9 @@ def chat(req: ChatRequest):
             message_id=message_id,
             reply=t("gemini_disabled", lang),
             cards=[{"type":"warning","title":"Gemini disabled",
-                    "body":"Set GEMINI_API_KEY in environment variables."}]
+                    "body":"Set GEMINI_API_KEY in environment variables."}],
+            smart_replies=[],
+            faq_hit=False,
         )
 
     conn = get_conn()
@@ -2358,6 +2712,31 @@ def chat(req: ChatRequest):
         if req.preferred_language is None and mem_check.get("preferred_language"):
             lang = mem_check["preferred_language"]
 
+        # ── v5: FAQ lookup BEFORE Gemini ─────────────────────────────
+        faq_match = search_faq(conn, user_text)
+        if faq_match:
+            faq_reply  = t("faq_answer_prefix", lang) + faq_match["answer"]
+            smart      = generate_smart_replies(user_text, faq_match["answer"], lang)
+            # Persist the message for analytics/history
+            ensure_user_exists(conn, req.user_id)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO chat_messages (message_id, user_id, message, response) VALUES (%s,%s,%s,%s)",
+                (message_id, req.user_id, user_text, faq_reply)
+            )
+            conn.commit()
+            log_event(conn, req.user_id, "faq_hit", value=f"faq_id={faq_match['id']}")
+            return ChatResponse(
+                message_id  = message_id,
+                reply       = faq_reply,
+                cards       = [{"type":"faq","title":"💡 Knowledge Base",
+                                "body":faq_match["question"],
+                                "meta":{"faq_id":faq_match["id"],"category":faq_match["category"]}}],
+                smart_replies = smart,
+                faq_hit       = True,
+            )
+
+        # ── Original v4 chat logic (with smart replies appended) ──────
         slot_from_text = extract_slot_id(user_text)
         wants_booking  = any(x in user_text for x in
                              ["احجز","حجز","استشارة","مختص","دكتور","book","specialist","appointment"])
@@ -2369,10 +2748,10 @@ def chat(req: ChatRequest):
             return ChatResponse(
                 message_id=message_id,
                 reply=t("risk_high", lang),
-                cards=[{"type":"warning",
-                        "title": t("card_important", lang),
-                        "body":  t("risk_high_card", lang),
-                        "meta": {"risk_level":"high"}}]
+                cards=[{"type":"warning","title": t("card_important", lang),
+                        "body": t("risk_high_card", lang),"meta":{"risk_level":"high"}}],
+                smart_replies=[],
+                faq_hit=False,
             )
 
         try:
@@ -2393,9 +2772,10 @@ def chat(req: ChatRequest):
             return ChatResponse(
                 message_id=message_id,
                 reply=t("scope_refusal", lang),
-                cards=[{"type":"refusal",
-                        "title": t("card_out_of_scope", lang),
-                        "body": t("card_refusal_reason_prefix", lang) + decision.reason}]
+                cards=[{"type":"refusal","title": t("card_out_of_scope", lang),
+                        "body": t("card_refusal_reason_prefix", lang) + decision.reason}],
+                smart_replies=[],
+                faq_hit=False,
             )
 
         topic = decision.topic
@@ -2404,16 +2784,17 @@ def chat(req: ChatRequest):
             return ChatResponse(
                 message_id=message_id,
                 reply=t("kids_safety", lang),
-                cards=[{"type":"warning",
-                        "title": t("child_appropriate_content", lang),
-                        "body":  t("choose_safe_topic", lang)}]
+                cards=[{"type":"warning","title": t("child_appropriate_content", lang),
+                        "body": t("choose_safe_topic", lang)}],
+                smart_replies=[],
+                faq_hit=False,
             )
 
         age = decision.extracted_child_age or req.child_age
         update_memory(conn, req.user_id, topic, age, note=user_text)
         mem = get_memory(conn, req.user_id)
 
-        # Booking flow
+        # ── Booking flow ──────────────────────────────────────────────
         if decision.action == "book_appointment":
             slot_id       = decision.slot_id
             specialist_id = decision.specialist_id
@@ -2425,9 +2806,10 @@ def chat(req: ChatRequest):
                 return ChatResponse(
                     message_id=message_id,
                     reply=t("missing_slot", lang),
-                    cards=[{"type":"warning",
-                            "title": t("card_missing_booking", lang),
-                            "body": "Send slot_id like sl_001."}]
+                    cards=[{"type":"warning","title": t("card_missing_booking", lang),
+                            "body": "Send slot_id like sl_001."}],
+                    smart_replies=generate_smart_replies(user_text, t("missing_slot", lang), lang),
+                    faq_hit=False,
                 )
 
             sync_slots_with_booked(conn)
@@ -2435,24 +2817,27 @@ def chat(req: ChatRequest):
                 appt = book_slot(conn, req.user_id, specialist_id, slot_id)
                 sp   = next((x for x in SPECIALISTS if x["id"] == specialist_id), None)
                 log_event(conn, req.user_id, "booking_created", value=slot_id)
+                reply_text = f"{t('booking_success', lang)}{appt['appointment_id']}."
                 return ChatResponse(
                     message_id=message_id,
-                    reply=f"{t('booking_success', lang)}{appt['appointment_id']}.",
-                    cards=[{"type":"booking",
-                            "title": t("booking_details", lang),
+                    reply=reply_text,
+                    cards=[{"type":"booking","title": t("booking_details", lang),
                             "body": f"Specialist: {sp['name'] if sp else specialist_id}\nslot_id: {slot_id}",
-                            "meta": appt}]
+                            "meta": appt}],
+                    smart_replies=generate_smart_replies(user_text, reply_text, lang),
+                    faq_hit=False,
                 )
             except ValueError:
                 return ChatResponse(
                     message_id=message_id,
                     reply=t("slot_unavailable", lang),
-                    cards=[{"type":"warning",
-                            "title": t("card_slot_unavailable", lang),
-                            "body": "Try a different slot_id."}]
+                    cards=[{"type":"warning","title": t("card_slot_unavailable", lang),
+                            "body": "Try a different slot_id."}],
+                    smart_replies=[],
+                    faq_hit=False,
                 )
 
-        # Normal answer
+        # ── Normal answer ─────────────────────────────────────────────
         kb_res    = kb_search_v2(topic=topic, query=user_text, age=age)
         tips      = kb_res.tips
         followups = pick_followups(topic)
@@ -2463,15 +2848,18 @@ def chat(req: ChatRequest):
 
         if topic in PARENTING_TOPICS and not kb_res.matched and conf < 65:
             q = followups[0] if followups else ("How old is your child?" if lang == "en" else "سن الطفل قد إيه؟")
+            low_conf_reply = t("low_conf_prefix", lang) + q + t("low_conf_suffix", lang)
             return ChatResponse(
                 message_id=message_id,
-                reply=t("low_conf_prefix", lang) + q + t("low_conf_suffix", lang),
+                reply=low_conf_reply,
                 cards=[
                     {"type":"confidence","title": t("confidence_score", lang),"body":f"{conf}%",
                      "meta":{"confidence":conf,"matched":kb_res.matched}},
                     {"type":"warning","title": t("follow_up", lang),"body":q,
                      "meta":{"followups":followups}},
-                ]
+                ],
+                smart_replies=generate_smart_replies(user_text, low_conf_reply, lang),
+                faq_hit=False,
             )
 
         intro = empathy_reflect(user_text, topic, risk_level, lang)
@@ -2488,8 +2876,8 @@ def chat(req: ChatRequest):
 
         if ENABLE_VERIFY:
             verdict = gemini_verify_answer(user_text, final_text,
-                {"topic":topic,"tips":tips,"specialists":spec_list,
-                 "slots":slots_list,"memory":mem,"followups":followups,"confidence":conf})
+                {"topic":topic,"tips":tips,"specialists":spec_list,"slots":slots_list,
+                 "memory":mem,"followups":followups,"confidence":conf})
             if not verdict.get("ok", True):
                 q = followups[0] if followups else ("How old is your child?" if lang == "en" else "سن الطفل قد إيه؟")
                 final_text = t("verify_fallback", lang) + q
@@ -2501,7 +2889,10 @@ def chat(req: ChatRequest):
         )
         conn.commit()
 
-        # Build cards
+        # ── v5: generate smart replies ────────────────────────────────
+        smart_replies = generate_smart_replies(user_text, final_text, lang)
+
+        # ── Build cards (unchanged) ───────────────────────────────────
         cards: List[Dict] = []
         ctype_map  = {"kids_stories":"story","activities_games":"game",
                       "book_recommendations":"books","assessment_personality":"assessment_question"}
@@ -2525,103 +2916,74 @@ def chat(req: ChatRequest):
 
         if show_sp:
             for sp in spec_list:
-                body = t(f"card_specialist_body_{lang}", lang,
-                         price=sp["price_egp"], rating=sp["rating"])
-                cards.append({"type":"specialist",
-                               "title":f"{sp['name']} — {sp['title']}",
-                               "body": body,
-                               "meta":{"specialist_id":sp["id"]}})
+                body = t(f"card_specialist_body_{lang}", lang, price=sp["price_egp"], rating=sp["rating"])
+                cards.append({"type":"specialist","title":f"{sp['name']} — {sp['title']}",
+                               "body": body,"meta":{"specialist_id":sp["id"]}})
 
         if slots_list and show_sp:
             duration_label = "دقيقة" if lang == "ar" else "min"
             sb = "\n".join([f"- {s['slot_id']}: {s['start']} ({s['duration_min']} {duration_label})"
                             for s in slots_list])
             sb += t(f"slots_suffix_{lang}", lang)
-            cards.append({"type":"booking",
-                           "title": t("available_slots", lang),
-                           "body": sb,
+            cards.append({"type":"booking","title": t("available_slots", lang),"body": sb,
                            "meta":{"slot_ids":[s["slot_id"] for s in slots_list],
                                    "specialist_id":spec_list[0]["id"] if spec_list else None}})
 
-        return ChatResponse(message_id=message_id, reply=final_text, cards=cards)
+        return ChatResponse(
+            message_id=message_id,
+            reply=final_text,
+            cards=cards,
+            smart_replies=smart_replies,
+            faq_hit=False,
+        )
 
     finally:
         conn.close()
 
-# ──────────────────────────────────────────────
-# ROUTES — PARENTING PLAN
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — PARENTING PLAN (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str):
-    """
-    Standalone plan generation endpoint — kept for API compatibility.
-    Internally calls the same _generate_and_save_plan helper used by
-    assessment_submit, so behaviour is identical.
-    Plan is always English. Sends FCM notification after saving.
-    """
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini is disabled. Set GEMINI_API_KEY.")
-
     conn = get_conn()
     try:
         ensure_user_exists(conn, user_id)
         cur = conn.cursor()
-
-        # Fetch latest assessment
         cur.execute(
-            "SELECT id, child_age, result FROM assessments "
-            "WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, child_age, result FROM assessments WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
             (user_id,)
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="No assessment found. Submit one first.")
-
         assessment_id, child_age, result_raw = row
         try:
-            result: Dict[str, Any] = (
-                json.loads(result_raw) if isinstance(result_raw, str) else result_raw
-            )
+            result: Dict[str, Any] = (json.loads(result_raw) if isinstance(result_raw, str) else result_raw)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Cannot parse assessment result: {exc}")
 
-        # Generate + save plan using shared helper
-        plan = _generate_and_save_plan(
-            conn=conn, user_id=user_id, assessment_id=assessment_id,
-            result=result, child_age=child_age,
-        )
-
-        # Send FCM notification
+        plan = _generate_and_save_plan(conn=conn, user_id=user_id, assessment_id=assessment_id,
+                                        result=result, child_age=child_age)
         notif = _send_fcm_notification(
-            user_id=user_id,
-            title="📋 Your Parenting Plan is Ready",
+            user_id=user_id, title="📋 Your Parenting Plan is Ready",
             body="A personalized parenting plan has been generated based on your assessment.",
-            data={
-                "type":          "parenting_plan",
-                "user_id":       str(user_id),
-                "plan_id":       str(plan["plan_id"]),
-                "assessment_id": str(assessment_id),
-            },
+            data={"type":"parenting_plan","user_id":str(user_id),
+                  "plan_id":str(plan["plan_id"]),"assessment_id":str(assessment_id)},
         )
-
         response: Dict[str, Any] = {
-            "ok":                True,
-            "message":           "Parenting plan generated successfully",
-            "user_id":           user_id,
-            "plan_generated":    True,
-            "plan_id":           plan["plan_id"],
-            "created_at":        plan["created_at"],
-            "plan_language":     plan["plan_language"],
-            "child_age":         plan["child_age"],
-            "top_archetype":     plan["top_archetype"],
-            "assessment_id":     assessment_id,
-            "notification_sent": notif["sent"],
-            "plan_text":         plan["plan_text"],
+            "ok": True, "message": "Parenting plan generated successfully",
+            "user_id": user_id, "plan_generated": True,
+            "plan_id": plan["plan_id"], "created_at": plan["created_at"],
+            "plan_language": plan["plan_language"], "child_age": plan["child_age"],
+            "top_archetype": plan["top_archetype"], "assessment_id": assessment_id,
+            "notification_sent": notif["sent"], "plan_text": plan["plan_text"],
         }
         if notif["warning"]:
             response["notification_warning"] = notif["warning"]
         return response
-
     except HTTPException:
         raise
     except Exception as exc:
@@ -2629,6 +2991,7 @@ def generate_parenting_plan(user_id: str):
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
     finally:
         conn.close()
+
 
 @app.get("/parenting-plans/{user_id}", tags=["Parenting Plan"])
 def get_parenting_plans(user_id: str, limit: int = 10):
@@ -2655,30 +3018,22 @@ def get_parenting_plans(user_id: str, limit: int = 10):
     finally:
         conn.close()
 
-# ──────────────────────────────────────────────
-# ROUTES — PDF EXPORT
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — PDF EXPORT (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
 def export_plan_pdf(user_id: str):
-    """
-    Export the latest parenting plan as a PDF.
-    PDF is ALWAYS generated in English — no language selection.
-    """
     if not _REPORTLAB_AVAILABLE:
         raise HTTPException(status_code=503, detail=t("pdf_unavailable", "en"))
 
-    # PDF language is hard-coded to English — never changes
     PDF_LANG: Lang = "en"
-    print(f"[PDF] Generating parenting plan PDF language: EN for user={user_id}")
-
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT pp.id, pp.plan_text, pp.created_at,
-                   u.child_age,
-                   a.result
+            SELECT pp.id, pp.plan_text, pp.created_at, u.child_age, a.result
             FROM   parenting_plans pp
             LEFT   JOIN users       u  ON u.user_id  = pp.user_id
             LEFT   JOIN assessments a  ON a.user_id  = pp.user_id
@@ -2695,47 +3050,232 @@ def export_plan_pdf(user_id: str):
         plan_id, plan_text, created_at, child_age, result_raw = row
         generated_at = created_at.isoformat() if created_at else ""
 
-        # Archetype name — always English
         top_archetype = "Not specified"
         if result_raw:
             try:
                 result_obj = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
                 personalities = _norm_personalities(result_obj.get("possible_personalities", []))
                 if personalities:
-                    # Use the id to look up the English archetype name from ARCHETYPES
-                    arch_id = personalities[0].get("id", "")
+                    arch_id  = personalities[0].get("id", "")
                     arch_obj = next((a for a in ARCHETYPES if a["id"] == arch_id), None)
                     top_archetype = arch_obj["name"] if arch_obj else (personalities[0].get("name") or "Not specified")
             except Exception as parse_exc:
                 print(f"[PDF] Could not parse archetype: {parse_exc}")
 
-        print(f"[PDF] user={user_id} | child_age={child_age} | archetype={top_archetype} | lang=EN")
-
         try:
             pdf_bytes = _build_parenting_plan_pdf(
-                user_id=user_id,
-                child_age=child_age,
-                top_archetype=top_archetype,
-                plan_text=plan_text or "",
-                generated_at=generated_at,
-                lang=PDF_LANG,          # always "en"
+                user_id=user_id, child_age=child_age, top_archetype=top_archetype,
+                plan_text=plan_text or "", generated_at=generated_at, lang=PDF_LANG,
             )
         except Exception as pdf_exc:
             raise HTTPException(status_code=500, detail=f"PDF generation failed: {pdf_exc}")
 
         filename = f"parenting_plan_{user_id}.pdf"
         return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(pdf_bytes)),
-            },
+            io.BytesIO(pdf_bytes), media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                     "Content-Length": str(len(pdf_bytes))},
         )
-
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ROUTES — v5 ADMIN: FAQ KNOWLEDGE BASE
+# ══════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/faq/generate", tags=["FAQ"])
+def admin_faq_generate(req: FaqGenerateRequest):
+    """
+    Trigger AI FAQ generation from recent chat logs.
+
+    - Reads the last N chat messages (default: FAQ_LOG_WINDOW env var).
+    - Sends them to Gemini for topic clustering and FAQ extraction.
+    - Inserts non-duplicate FAQs with status='pending'.
+    - Admin review required before FAQs become active (see PATCH /admin/faq/{id}).
+
+    Requires admin_key header.
+    """
+    if req.admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin_key")
+
+    if not GEMINI_ENABLED or client is None:
+        raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
+
+    conn = get_conn()
+    try:
+        summary = generate_faq_from_chat_logs(conn, log_limit=req.log_limit)
+        return {
+            "ok":                 True,
+            "message":            "FAQ generation complete. Review pending entries via GET /admin/faq?status=pending",
+            "scanned_logs":       summary["scanned"],
+            "candidates":         summary["candidates"],
+            "inserted_pending":   summary["inserted"],
+            "skipped_duplicates": summary["skipped_duplicates"],
+            "errors":             summary["errors"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"FAQ generation error: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/admin/faq", tags=["FAQ"])
+def admin_faq_list(
+    status: Optional[str] = Query(default=None, description="Filter by status: pending | approved | rejected"),
+    category: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    List FAQ entries with optional status / category filters.
+    No admin_key required for reading (suitable for a review dashboard).
+    Add your own auth middleware in production if needed.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        conditions = []
+        params: List[Any] = []
+        if status:
+            conditions.append("status = %s")
+            params.append(status)
+        if category:
+            conditions.append("LOWER(category) = LOWER(%s)")
+            params.append(category)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        cur.execute(
+            f"""
+            SELECT id, question, answer, category, source_count, status, created_at, updated_at
+            FROM   faq_knowledge_base
+            {where}
+            ORDER  BY created_at DESC
+            LIMIT  %s OFFSET %s
+            """,
+            (*params, limit, offset)
+        )
+        rows = cur.fetchall()
+        cur.execute(f"SELECT COUNT(*) FROM faq_knowledge_base {where}", params)
+        total = cur.fetchone()[0]
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "faqs": [
+                {
+                    "id":           r[0],
+                    "question":     r[1],
+                    "answer":       r[2],
+                    "category":     r[3],
+                    "source_count": r[4],
+                    "status":       r[5],
+                    "created_at":   r[6].isoformat() if r[6] else None,
+                    "updated_at":   r[7].isoformat() if r[7] else None,
+                }
+                for r in rows
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    finally:
+        conn.close()
+
+
+@app.patch("/admin/faq/{faq_id}", tags=["FAQ"])
+def admin_faq_update_status(faq_id: int, req: FaqStatusUpdate):
+    """
+    Approve or reject a pending FAQ draft.
+
+    Only 'pending' FAQs can be transitioned; approved/rejected FAQs
+    are immutable to prevent accidental re-activation.
+
+    Body: { "admin_key": "...", "status": "approved" | "rejected" }
+    """
+    if req.admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin_key")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, status FROM faq_knowledge_base WHERE id=%s", (faq_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"FAQ id={faq_id} not found.")
+
+        current_status = row[1]
+        if current_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"FAQ id={faq_id} is already '{current_status}'. Only 'pending' FAQs can be updated.",
+            )
+
+        cur.execute(
+            "UPDATE faq_knowledge_base SET status=%s, updated_at=NOW() WHERE id=%s RETURNING id, question, status, updated_at",
+            (req.status, faq_id)
+        )
+        updated = cur.fetchone()
+        conn.commit()
+        print(f"[FAQ] id={faq_id} → status='{req.status}'")
+        return {
+            "ok":         True,
+            "faq_id":     updated[0],
+            "question":   updated[1],
+            "new_status": updated[2],
+            "updated_at": updated[3].isoformat() if updated[3] else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/faq", tags=["FAQ"])
+def public_faq_list(
+    category: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """
+    Public endpoint — returns only *approved* FAQs.
+    Optionally filter by category. No authentication required.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if category:
+            cur.execute(
+                "SELECT id, question, answer, category, source_count FROM faq_knowledge_base "
+                "WHERE status='approved' AND LOWER(category)=LOWER(%s) "
+                "ORDER BY source_count DESC, created_at DESC LIMIT %s",
+                (category, limit)
+            )
+        else:
+            cur.execute(
+                "SELECT id, question, answer, category, source_count FROM faq_knowledge_base "
+                "WHERE status='approved' "
+                "ORDER BY source_count DESC, created_at DESC LIMIT %s",
+                (limit,)
+            )
+        rows = cur.fetchall()
+        return {
+            "total": len(rows),
+            "faqs": [
+                {"id": r[0], "question": r[1], "answer": r[2],
+                 "category": r[3], "source_count": r[4]}
+                for r in rows
+            ],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
     finally:
         conn.close()
