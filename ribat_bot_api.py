@@ -391,37 +391,94 @@ FIREBASE_ENABLED = False
 _FIREBASE_CREDS_JSON = os.getenv("FIREBASE_CREDENTIALS", "").strip()
 if _FIREBASE_AVAILABLE and _FIREBASE_CREDS_JSON:
     try:
-        _fb_cred_dict = json.loads(_FIREBASE_CREDS_JSON)
-        _fb_cred      = fb_credentials.Certificate(_fb_cred_dict)
+        # Support both: inline JSON string OR absolute file path to credentials JSON
+        if _FIREBASE_CREDS_JSON.startswith("{"):
+            _fb_cred_dict = json.loads(_FIREBASE_CREDS_JSON)
+            _fb_cred = fb_credentials.Certificate(_fb_cred_dict)
+        elif os.path.exists(_FIREBASE_CREDS_JSON):
+            _fb_cred = fb_credentials.Certificate(_FIREBASE_CREDS_JSON)
+        else:
+            raise ValueError(
+                f"FIREBASE_CREDENTIALS is neither a valid JSON string "
+                f"nor an existing file path: {_FIREBASE_CREDS_JSON[:80]}"
+            )
         firebase_admin.initialize_app(_fb_cred)
         FIREBASE_ENABLED = True
         print("Firebase initialized ✔")
     except Exception as _fb_exc:
-        print(f"Firebase init failed: {_fb_exc}")
+        print(f"Firebase init FAILED — {_fb_exc}")
+        print("  Fix: set FIREBASE_CREDENTIALS to full JSON or absolute file path.")
 
 # ── Register PDF fonts ─────────────────────────────────────────────────
 _FONT_ARABIC_REGISTERED = False
 _FONT_LATIN_REGISTERED  = False
 
+# ── Font download URLs (DejaVu — always full Unicode, freely redistributable) ──
+_DEJAVU_REGULAR_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
+_DEJAVU_BOLD_URL    = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+_FONT_CACHE_DIR     = os.getenv("RAFIQ_FONT_CACHE", "/tmp/rafiq_fonts")
+
+def _download_font(url: str, dest: str) -> bool:
+    """Download a font file if it does not already exist. Returns True on success."""
+    if os.path.exists(dest):
+        return True
+    try:
+        import urllib.request
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        urllib.request.urlretrieve(url, dest)
+        return True
+    except Exception as exc:
+        print(f"[FONT] Could not download {url}: {exc}")
+        return False
+
 def _register_fonts() -> None:
     global _FONT_ARABIC_REGISTERED, _FONT_LATIN_REGISTERED
     if not _REPORTLAB_AVAILABLE:
         return
-    try:
-        if os.path.exists(FONT_NOTO_ARABIC):
-            pdfmetrics.registerFont(TTFont("NotoArabic",     FONT_NOTO_ARABIC))
+
+    # Priority 1: user-supplied Noto fonts (best Arabic rendering)
+    if os.path.exists(FONT_NOTO_ARABIC):
+        try:
+            pdfmetrics.registerFont(TTFont("RafiqRegular", FONT_NOTO_ARABIC))
+            if os.path.exists(FONT_NOTO_BOLD):
+                pdfmetrics.registerFont(TTFont("RafiqBold", FONT_NOTO_BOLD))
+            else:
+                pdfmetrics.registerFont(TTFont("RafiqBold", FONT_NOTO_ARABIC))
             _FONT_ARABIC_REGISTERED = True
-        if os.path.exists(FONT_NOTO_BOLD):
-            pdfmetrics.registerFont(TTFont("NotoArabicBold", FONT_NOTO_BOLD))
-        if os.path.exists(FONT_NOTO_LATIN):
-            pdfmetrics.registerFont(TTFont("NotoLatin",      FONT_NOTO_LATIN))
+            _FONT_LATIN_REGISTERED  = True
+            print("PDF fonts: NotoSansArabic registered ✔")
+            return
+        except Exception as exc:
+            print(f"[FONT] Noto registration failed: {exc}")
+
+    # Priority 2: user-supplied Noto Latin
+    if os.path.exists(FONT_NOTO_LATIN):
+        try:
+            pdfmetrics.registerFont(TTFont("RafiqRegular", FONT_NOTO_LATIN))
+            pdfmetrics.registerFont(TTFont("RafiqBold",    FONT_NOTO_LATIN))
             _FONT_LATIN_REGISTERED = True
-        if _FONT_ARABIC_REGISTERED:
-            print("PDF Arabic fonts registered ✔")
-        else:
-            print("PDF Arabic fonts NOT found — falling back to Helvetica (Arabic may be unreadable).")
-    except Exception as exc:
-        print(f"Font registration warning: {exc}")
+            print("PDF fonts: NotoSans (Latin) registered ✔")
+            return
+        except Exception as exc:
+            print(f"[FONT] NotoLatin registration failed: {exc}")
+
+    # Priority 3: Download DejaVu (full Unicode, free, no Arabic shaping needed for EN)
+    reg_path  = os.path.join(_FONT_CACHE_DIR, "DejaVuSans.ttf")
+    bold_path = os.path.join(_FONT_CACHE_DIR, "DejaVuSans-Bold.ttf")
+    reg_ok    = _download_font(_DEJAVU_REGULAR_URL, reg_path)
+    bold_ok   = _download_font(_DEJAVU_BOLD_URL,    bold_path)
+    if reg_ok:
+        try:
+            pdfmetrics.registerFont(TTFont("RafiqRegular", reg_path))
+            pdfmetrics.registerFont(TTFont("RafiqBold",    bold_path if bold_ok else reg_path))
+            _FONT_LATIN_REGISTERED = True
+            print("PDF fonts: DejaVuSans (downloaded) registered ✔")
+            return
+        except Exception as exc:
+            print(f"[FONT] DejaVu registration failed: {exc}")
+
+    # Fallback: Helvetica (ASCII only — non-ASCII becomes squares)
+    print("[FONT] WARNING: falling back to Helvetica — non-ASCII chars will be squares.")
 
 # ──────────────────────────────────────────────
 # APP
@@ -1409,11 +1466,10 @@ def _pdf_text(text: str, lang: Lang) -> str:
         return _shape_arabic(text)
     return text
 
-def _pick_font(bold: bool, lang: Lang) -> str:
-    if lang == "ar" and _FONT_ARABIC_REGISTERED:
-        return "NotoArabicBold" if bold else "NotoArabic"
-    if lang == "en" and _FONT_LATIN_REGISTERED:
-        return "NotoLatin"
+def _pick_font(bold: bool, lang: Lang = "en") -> str:
+    """Return the registered font name, falling back to Helvetica."""
+    if _FONT_ARABIC_REGISTERED or _FONT_LATIN_REGISTERED:
+        return "RafiqBold" if bold else "RafiqRegular"
     return "Helvetica-Bold" if bold else "Helvetica"
 
 def _build_parenting_plan_pdf(
@@ -1498,8 +1554,9 @@ def _build_parenting_plan_pdf(
         [Paragraph(lbl("pdf_label_archetype"), lbl_style), Paragraph(_pdf_text(top_archetype, lang), val_style),
          Paragraph(lbl("pdf_label_generated"), lbl_style), Paragraph(date_display, val_style)],
     ]
-    cw = (W-4*cm) / 4
-    meta_table = Table(meta_data, colWidths=[cw*0.22, cw*0.78*0.6, cw*0.22, cw*0.78*0.6])
+    # Column widths: label=18%, value=32%, label=18%, value=32%  (totals 100%)
+    full_w = W - 4*cm
+    meta_table = Table(meta_data, colWidths=[full_w*0.18, full_w*0.32, full_w*0.18, full_w*0.32])
     meta_table.setStyle(TableStyle([
         ("BACKGROUND",     (0,0),(-1,-1), brand_light),
         ("BACKGROUND",     (0,0),(0,-1),  colors.HexColor("#D0EAD8")),
@@ -1587,6 +1644,178 @@ def _norm_scores(raw: Any) -> Dict[str, int]:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             out[str(item[0])] = int(item[1])
     return out
+
+# ──────────────────────────────────────────────
+# FCM HELPER  (shared by assessment + plan)
+# ──────────────────────────────────────────────
+def _send_fcm_notification(
+    user_id: str,
+    title: str,
+    body: str,
+    data: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Send a Firebase Cloud Messaging push notification.
+    Returns {"sent": bool, "warning": str|None}.
+    Uses its own isolated DB connection — safe to call after any commit.
+    """
+    print(f"[FCM] Attempting notification for user={user_id} | title='{title}'")
+
+    if not _FIREBASE_AVAILABLE:
+        msg = "firebase-admin package not installed. Run: pip install firebase-admin"
+        print(f"[FCM] SKIPPED — {msg}")
+        return {"sent": False, "warning": msg}
+
+    if not _FIREBASE_CREDS_JSON:
+        msg = "FIREBASE_CREDENTIALS env var is not set."
+        print(f"[FCM] SKIPPED — {msg}")
+        return {"sent": False, "warning": msg}
+
+    if not FIREBASE_ENABLED:
+        msg = "Firebase failed to initialise at startup — check server logs."
+        print(f"[FCM] SKIPPED — {msg}")
+        return {"sent": False, "warning": msg}
+
+    notif_conn = None
+    try:
+        notif_conn = get_conn()
+        nc = notif_conn.cursor()
+        nc.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
+        row = nc.fetchone()
+        token: Optional[str] = row[0] if row else None
+
+        print(f"[FCM] user={user_id} | token_exists={bool(token)} "
+              f"| preview={token[:10] + '...' if token else 'None'}")
+
+        if not token:
+            msg = "No FCM token registered. Call POST /register-token first."
+            print(f"[FCM] SKIPPED — {msg}")
+            return {"sent": False, "warning": msg}
+
+        message = fb_messaging.Message(
+            notification=fb_messaging.Notification(title=title, body=body),
+            token=token,
+            data=data,
+        )
+        fb_messaging.send(message)
+        print(f"[FCM] ✅ Sent to user={user_id}")
+        return {"sent": True, "warning": None}
+
+    except AttributeError as ae:
+        msg = f"Firebase messaging object is None: {ae}"
+        print(f"[FCM] ERROR — {msg}")
+        return {"sent": False, "warning": msg}
+
+    except Exception as exc:
+        err = str(exc)
+        if "UNREGISTERED" in err.upper() or "registration-token-not-registered" in err:
+            if notif_conn:
+                try:
+                    notif_conn.cursor().execute(
+                        "UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,)
+                    )
+                    notif_conn.commit()
+                    print(f"[FCM] Expired token cleared for user={user_id}")
+                except Exception:
+                    pass
+            msg = "FCM token expired/unregistered — cleared. User must re-register."
+        else:
+            msg = f"Firebase send error: {err}"
+        print(f"[FCM] ERROR — {msg}")
+        return {"sent": False, "warning": msg}
+
+    finally:
+        if notif_conn:
+            try:
+                notif_conn.close()
+            except Exception:
+                pass
+
+
+# ──────────────────────────────────────────────
+# PARENTING PLAN CORE  (shared by assessment + standalone endpoint)
+# ──────────────────────────────────────────────
+def _generate_and_save_plan(
+    conn,
+    user_id: str,
+    assessment_id: int,
+    result: Dict[str, Any],
+    child_age: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Build plan text via Gemini, persist to parenting_plans, return plan dict.
+    Always generates in English.
+    Raises HTTPException on Gemini or DB failure.
+    """
+    PLAN_LANG: Lang = "en"
+
+    top_traits             = _norm_traits(result.get("top_traits", []))
+    possible_personalities = _norm_personalities(result.get("possible_personalities", []))
+    trait_scores           = _norm_scores(result.get("trait_scores", {}))
+
+    top_arch_entry  = possible_personalities[0] if possible_personalities else {}
+    top_archetype   = top_arch_entry.get("name", "Not specified")
+    archetype_desc  = top_arch_entry.get("description", "")
+    archetype_needs = top_arch_entry.get("needs", "")
+
+    traits_text = (
+        "\n".join(f"  - {t_['trait'].replace('_',' ').title()}: {t_['score']}%" for t_ in top_traits)
+        or "  - No data"
+    )
+    scores_text = (
+        "\n".join(f"  - {k.replace('_',' ').title()}: {v}%" for k, v in trait_scores.items())
+        or "  - No data"
+    )
+
+    print(f"[PLAN] Generating English plan for user={user_id}, assessment_id={assessment_id}")
+
+    try:
+        plan_text = gemini_generate_parenting_plan(
+            child_age=child_age,
+            top_archetype=top_archetype,
+            archetype_desc=archetype_desc,
+            archetype_needs=archetype_needs,
+            traits_text=traits_text,
+            scores_text=scores_text,
+            lang=PLAN_LANG,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini plan generation error: {exc}")
+
+    if not plan_text:
+        raise HTTPException(status_code=502, detail="Gemini returned an empty plan.")
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO parenting_plans (user_id, plan_text, plan_language, created_at) "
+            "VALUES (%s, %s, %s, NOW()) RETURNING id, created_at",
+            (user_id, plan_text, PLAN_LANG),
+        )
+        plan_row = cur.fetchone()
+        conn.commit()
+        plan_id         = plan_row[0]
+        plan_created_at = plan_row[1].isoformat() if plan_row[1] else None
+        print(f"[PLAN] Saved plan_id={plan_id} for user={user_id}")
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error saving plan: {exc}")
+
+    log_event(conn, user_id, "parenting_plan_generated",
+              value=f"plan_id={plan_id}, assessment_id={assessment_id}")
+
+    return {
+        "plan_id":       plan_id,
+        "created_at":    plan_created_at,
+        "plan_language": PLAN_LANG,
+        "plan_text":     plan_text,
+        "top_archetype": top_archetype,
+        "child_age":     child_age,
+        "assessment_id": assessment_id,
+    }
+
 
 # ──────────────────────────────────────────────
 # ROUTES — SYSTEM
@@ -1803,42 +2032,101 @@ def assessment_questions(age: Optional[int] = None):
 
 @app.post("/assessment/submit", tags=["Assessment"])
 def assessment_submit(req: AssessmentSubmitReq):
+    """
+    Unified workflow:
+      1. Save assessment
+      2. Compute trait scores
+      3. Generate parenting plan immediately (Gemini, English)
+      4. Save parenting plan
+      5. Send FCM notification
+      6. Return combined result
+    """
     conn = get_conn()
-    lang: Lang = req.preferred_language if req.preferred_language in ("ar","en") else "ar"  # type: ignore[assignment]
+    # Response language can be ar/en; plan is always English
+    lang: Lang = req.preferred_language if req.preferred_language in ("ar", "en") else "ar"  # type: ignore[assignment]
     try:
         ensure_user_exists(conn, req.user_id)
 
-        # Fetch stored lang preference if not provided
         if req.preferred_language is None:
             cur = conn.cursor()
             cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (req.user_id,))
             row = cur.fetchone()
-            if row and row[0]: lang = row[0]
+            if row and row[0]:
+                lang = row[0]
 
         if DEBUG:
-            print(f"[ASSESSMENT] user={req.user_id}, child_age={req.child_age}, answers_count={len(req.answers)}")
-            for a in req.answers:
-                print(f"  answer: {a}")
+            print(f"[ASSESSMENT] user={req.user_id}, child_age={req.child_age}, "
+                  f"answers_count={len(req.answers)}")
 
+        # ── Step 1 & 2: compute scores ─────────────────────────────────
         profile     = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
         assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
         recommended = recommend_specialist_for_profile(profile)
-
-        # Remove internal debug key before storing
         profile_to_store = {k: v for k, v in profile.items() if k != "_debug"}
 
+        # ── Step 1 (cont): save assessment ─────────────────────────────
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO assessments (user_id, child_age, assessment_confidence, result, created_at) VALUES (%s,%s,%s,%s,NOW())",
-            (req.user_id, req.child_age, assess_conf["confidence"], json.dumps(profile_to_store))
+            "INSERT INTO assessments "
+            "(user_id, child_age, assessment_confidence, result, created_at) "
+            "VALUES (%s, %s, %s, %s, NOW()) RETURNING id",
+            (req.user_id, req.child_age,
+             assess_conf["confidence"], json.dumps(profile_to_store))
         )
+        assessment_id = cur.fetchone()[0]
         conn.commit()
-        update_memory(conn, req.user_id, "assessment_personality", req.child_age, note="Assessment submitted")
-        log_event(conn, req.user_id, "assessment_submit", value=f"confidence={assess_conf['confidence']}")
+        update_memory(conn, req.user_id, "assessment_personality",
+                      req.child_age, note="Assessment submitted")
+        log_event(conn, req.user_id, "assessment_submit",
+                  value=f"confidence={assess_conf['confidence']}")
+        print(f"[ASSESSMENT] Saved assessment_id={assessment_id} for user={req.user_id}")
 
-        return {
+        # ── Step 3 & 4: generate + save parenting plan immediately ─────
+        plan_result:      Dict[str, Any] = {}
+        plan_generated    = False
+        plan_warning:     Optional[str]  = None
+
+        if not GEMINI_ENABLED or client is None:
+            plan_warning = "Gemini disabled — plan not generated. Set GEMINI_API_KEY."
+            print(f"[PLAN] SKIPPED — Gemini not available")
+        else:
+            try:
+                plan_result   = _generate_and_save_plan(
+                    conn          = conn,
+                    user_id       = req.user_id,
+                    assessment_id = assessment_id,
+                    result        = profile_to_store,
+                    child_age     = req.child_age,
+                )
+                plan_generated = True
+            except HTTPException as he:
+                plan_warning = f"Plan generation failed: {he.detail}"
+                print(f"[PLAN] ERROR — {plan_warning}")
+            except Exception as exc:
+                plan_warning = f"Plan generation error: {exc}"
+                print(f"[PLAN] ERROR — {plan_warning}")
+
+        # ── Step 5: FCM notification ────────────────────────────────────
+        # Notification is sent after plan is ready (or if plan failed, after assessment)
+        notif_result = _send_fcm_notification(
+            user_id = req.user_id,
+            title   = "📋 Your Parenting Plan is Ready",
+            body    = "A personalized parenting plan has been generated based on your assessment.",
+            data    = {
+                "type":          "parenting_plan",
+                "user_id":       str(req.user_id),
+                "plan_id":       str(plan_result.get("plan_id", "")),
+                "assessment_id": str(assessment_id),
+            },
+        )
+
+        # ── Step 6: return combined response ───────────────────────────
+        response: Dict[str, Any] = {
             "ok":                     True,
             "message":                t("ok", lang),
+            # Assessment fields
+            "assessment_saved":       True,
+            "assessment_id":          assessment_id,
             "trait_scores":           profile["trait_scores"],
             "top_traits":             profile["top_traits"],
             "low_traits":             profile["low_traits"],
@@ -1849,7 +2137,24 @@ def assessment_submit(req: AssessmentSubmitReq):
             "recommended_specialist": recommended,
             "note":                   t("assessment_note", lang),
             "debug":                  profile.get("_debug", {}),
+            # Plan fields
+            "plan_generated":         plan_generated,
+            "plan_id":                plan_result.get("plan_id"),
+            "plan_created_at":        plan_result.get("created_at"),
+            "plan_language":          plan_result.get("plan_language", "en"),
+            "top_archetype":          plan_result.get("top_archetype"),
+            # Notification fields
+            "notification_sent":      notif_result["sent"],
         }
+        if plan_warning:
+            response["plan_warning"] = plan_warning
+        if notif_result["warning"]:
+            response["notification_warning"] = notif_result["warning"]
+
+        return response
+
+    except HTTPException:
+        raise
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
@@ -2249,15 +2554,13 @@ def chat(req: ChatRequest):
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str):
     """
-    Generate a personalised 30-day parenting plan.
-    Plan is ALWAYS generated in English — no language parameter.
+    Standalone plan generation endpoint — kept for API compatibility.
+    Internally calls the same _generate_and_save_plan helper used by
+    assessment_submit, so behaviour is identical.
+    Plan is always English. Sends FCM notification after saving.
     """
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini is disabled. Set GEMINI_API_KEY.")
-
-    # Language is hard-coded — always English
-    lang: Lang = "en"
-    print(f"[PLAN] Generating parenting plan for user={user_id}, language=EN")
 
     conn = get_conn()
     try:
@@ -2266,199 +2569,57 @@ def generate_parenting_plan(user_id: str):
 
         # Fetch latest assessment
         cur.execute(
-            "SELECT id, child_age, assessment_confidence, result, created_at FROM assessments WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, child_age, result FROM assessments "
+            "WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
             (user_id,)
         )
         row = cur.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail=t("no_assessment_found", lang))
+            raise HTTPException(status_code=404, detail="No assessment found. Submit one first.")
 
-        assessment_id, child_age, assessment_confidence, result_raw, assessed_at = row
-
+        assessment_id, child_age, result_raw = row
         try:
-            result: Dict[str, Any] = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to parse assessment result: {exc}")
-
-        if DEBUG:
-            print(f"[PLAN] assessment result for user={user_id}: {json.dumps(result, ensure_ascii=False)[:400]}")
-
-        top_traits             = _norm_traits(result.get("top_traits", []))
-        low_traits_data        = _norm_traits(result.get("low_traits", []))
-        possible_personalities = _norm_personalities(result.get("possible_personalities", []))
-        trait_scores           = _norm_scores(result.get("trait_scores", {}))
-
-        top_arch_entry  = possible_personalities[0] if possible_personalities else {}
-        top_archetype   = top_arch_entry.get("name", "غير محدد" if lang == "ar" else "Not specified")
-        archetype_desc  = top_arch_entry.get("description", "")
-        archetype_needs = top_arch_entry.get("needs", "")
-
-        if lang == "ar":
-            traits_text = "\n".join(f"  - {t_['trait']}: {t_['score']}%" for t_ in top_traits) or "  - لا توجد بيانات"
-            scores_text = "\n".join(f"  - {k}: {v}%" for k, v in trait_scores.items()) or "  - لا توجد بيانات"
-        else:
-            traits_text = "\n".join(f"  - {t_['trait'].replace('_',' ').title()}: {t_['score']}%" for t_ in top_traits) or "  - No data"
-            scores_text = "\n".join(f"  - {k.replace('_',' ').title()}: {v}%" for k, v in trait_scores.items()) or "  - No data"
-
-        try:
-            plan_text = gemini_generate_parenting_plan(
-                child_age=child_age,
-                top_archetype=top_archetype,
-                archetype_desc=archetype_desc,
-                archetype_needs=archetype_needs,
-                traits_text=traits_text,
-                scores_text=scores_text,
-                lang=lang,
+            result: Dict[str, Any] = (
+                json.loads(result_raw) if isinstance(result_raw, str) else result_raw
             )
-        except HTTPException:
-            raise
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
+            raise HTTPException(status_code=500, detail=f"Cannot parse assessment result: {exc}")
 
-        if not plan_text:
-            raise HTTPException(status_code=502, detail="Gemini returned an empty plan.")
+        # Generate + save plan using shared helper
+        plan = _generate_and_save_plan(
+            conn=conn, user_id=user_id, assessment_id=assessment_id,
+            result=result, child_age=child_age,
+        )
 
-        # Persist
-        try:
-            cur.execute(
-                "INSERT INTO parenting_plans (user_id, plan_text, plan_language, created_at) VALUES (%s,%s,%s,NOW()) RETURNING id, created_at",
-                (user_id, plan_text, lang)
-            )
-            plan_row        = cur.fetchone()
-            conn.commit()
-            plan_id         = plan_row[0]
-            plan_created_at = plan_row[1].isoformat() if plan_row[1] else None
-        except Exception as exc:
-            conn.rollback()
-            raise HTTPException(status_code=500, detail=f"DB error saving plan: {exc}")
-
-        # Log the plan generation event (uses same conn, which is clean after commit above)
-        log_event(conn, user_id, "parenting_plan_generated",
-                  value=f"plan_id={plan_id}, lang={lang}, assessment_id={assessment_id}")
-
-        # ── Firebase push notification ─────────────────────────────────
-        # Uses a SEPARATE connection so the notification step is fully
-        # isolated from the plan-save transaction.
-        notification_sent    = False
-        notification_warning = None
-
-        print(f"[FCM] Starting parenting plan notification for user={user_id}, plan_id={plan_id}")
-
-        if not _FIREBASE_AVAILABLE:
-            notification_warning = (
-                "firebase-admin package is not installed. "
-                "Run: pip install firebase-admin"
-            )
-            print(f"[FCM] SKIPPED — firebase-admin not installed")
-
-        elif not _FIREBASE_CREDS_JSON:
-            notification_warning = (
-                "FIREBASE_CREDENTIALS environment variable is not set. "
-                "Push notifications are disabled."
-            )
-            print(f"[FCM] SKIPPED — FIREBASE_CREDENTIALS env var missing")
-
-        elif not FIREBASE_ENABLED:
-            notification_warning = (
-                "Firebase failed to initialise at startup. "
-                "Check server logs for the exact credential error."
-            )
-            print(f"[FCM] SKIPPED — Firebase not initialised (startup error)")
-
-        else:
-            # Separate DB connection so no cursor/transaction state is shared
-            notif_conn = None
-            try:
-                notif_conn = get_conn()
-                notif_cur  = notif_conn.cursor()
-                notif_cur.execute(
-                    "SELECT fcm_token FROM users WHERE user_id=%s", (user_id,)
-                )
-                token_row = notif_cur.fetchone()
-                fcm_token: Optional[str] = token_row[0] if token_row else None
-
-                print(f"[FCM] user={user_id} | token_exists={bool(fcm_token)} "
-                      f"| token_preview={fcm_token[:10] + '...' if fcm_token else 'None'}")
-
-                if not fcm_token:
-                    notification_warning = (
-                        "User has no registered FCM token. "
-                        "Call POST /register-token first."
-                    )
-                    print(f"[FCM] SKIPPED — no FCM token for user={user_id}")
-                else:
-                    payload = {
-                        "token": fcm_token,
-                        "notification": {
-                            "title": "📋 Your parenting plan is ready",
-                            "body":  "Your personalized 30-day plan has been generated.",
-                        },
-                        "data": {
-                            "type":    "parenting_plan",
-                            "user_id": str(user_id),
-                            "plan_id": str(plan_id),
-                        },
-                    }
-                    print(f"[FCM] Sending to user={user_id} | "
-                          f"title='{payload['notification']['title']}'")
-
-                    message = fb_messaging.Message(
-                        notification=fb_messaging.Notification(
-                            title=payload["notification"]["title"],
-                            body=payload["notification"]["body"],
-                        ),
-                        token=fcm_token,
-                        data=payload["data"],
-                    )
-                    fb_messaging.send(message)
-                    notification_sent = True
-                    print(f"[FCM] ✅ Sent successfully to user={user_id}, plan_id={plan_id}")
-
-            except AttributeError as ae:
-                # fb_messaging is None (Firebase not properly imported)
-                notification_warning = f"Firebase messaging object is None: {ae}"
-                print(f"[FCM] ERROR — messaging object invalid: {ae}")
-
-            except Exception as fb_exc:
-                err_str = str(fb_exc)
-                # Detect expired/invalid token
-                if "UNREGISTERED" in err_str.upper() or "registration-token-not-registered" in err_str:
-                    if notif_conn:
-                        fix_cur = notif_conn.cursor()
-                        fix_cur.execute(
-                            "UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,)
-                        )
-                        notif_conn.commit()
-                    notification_warning = (
-                        "FCM token is expired/unregistered — token cleared. "
-                        "User must call POST /register-token again."
-                    )
-                    print(f"[FCM] Token expired for user={user_id} — cleared from DB")
-                else:
-                    notification_warning = f"Firebase send error: {err_str}"
-                    print(f"[FCM] ERROR sending to user={user_id}: {err_str}")
-            finally:
-                if notif_conn:
-                    try:
-                        notif_conn.close()
-                    except Exception:
-                        pass
+        # Send FCM notification
+        notif = _send_fcm_notification(
+            user_id=user_id,
+            title="📋 Your Parenting Plan is Ready",
+            body="A personalized parenting plan has been generated based on your assessment.",
+            data={
+                "type":          "parenting_plan",
+                "user_id":       str(user_id),
+                "plan_id":       str(plan["plan_id"]),
+                "assessment_id": str(assessment_id),
+            },
+        )
 
         response: Dict[str, Any] = {
             "ok":                True,
-            "message":           t("plan_created_title", lang),
+            "message":           "Parenting plan generated successfully",
             "user_id":           user_id,
-            "plan_id":           plan_id,
-            "created_at":        plan_created_at,
-            "plan_language":     lang,
-            "child_age":         child_age,
-            "top_archetype":     top_archetype,
+            "plan_generated":    True,
+            "plan_id":           plan["plan_id"],
+            "created_at":        plan["created_at"],
+            "plan_language":     plan["plan_language"],
+            "child_age":         plan["child_age"],
+            "top_archetype":     plan["top_archetype"],
             "assessment_id":     assessment_id,
-            "notification_sent": notification_sent,
-            "plan_text":         plan_text,
+            "notification_sent": notif["sent"],
+            "plan_text":         plan["plan_text"],
         }
-        if notification_warning:
-            response["notification_warning"] = notification_warning
+        if notif["warning"]:
+            response["notification_warning"] = notif["warning"]
         return response
 
     except HTTPException:
