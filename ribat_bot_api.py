@@ -1036,14 +1036,12 @@ def gemini_generate_parenting_plan(
 # ---------------------------------------------------------------------------
 # RAG SERVICES
 # ---------------------------------------------------------------------------
-EMBEDDING_MODEL = "textembedding-gecko@003"
+EMBEDDING_MODEL = "models/text-embedding-004"
 EMBEDDING_DIM = 768
 from typing import List
 from fastapi import HTTPException
 
 def generate_embedding(text: str) -> List[float]:
-    """Generate embedding using Gemini/Vertex embedding model."""
-
     if not text:
         raise HTTPException(status_code=400, detail="Empty text")
 
@@ -1058,9 +1056,8 @@ def generate_embedding(text: str) -> List[float]:
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Embedding generation failed: {str(exc)}"
+            detail=f"Embedding generation failed: {exc}"
         )
-
 
 def ensure_faq_kb_table(conn) -> None:
     """Ensure the faq_knowledge_base table and pgvector extension exist."""
