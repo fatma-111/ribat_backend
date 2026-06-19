@@ -1054,14 +1054,9 @@ def generate_embedding(text: str) -> List[float]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Embedding generation failed: {exc}")
 
-
--- 1. امسح الجدول القديم بالكامل
 DROP TABLE IF EXISTS faq_knowledge_base;
 
--- 2. امسح الـ extension وعيد تفعيله (احتياطي)
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- 3. عمل الجدول من أول بـ 3072 dimension
 CREATE TABLE faq_knowledge_base (
     id         SERIAL PRIMARY KEY,
     question   TEXT NOT NULL,
@@ -1070,7 +1065,6 @@ CREATE TABLE faq_knowledge_base (
     embedding  VECTOR(3072),
     created_at TIMESTAMPTZ DEFAULT NOW()
 )
-        """
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx "
