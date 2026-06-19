@@ -1033,10 +1033,17 @@ def gemini_generate_parenting_plan(
     return (resp.text or "").strip()
 
 # ---------------------------------------------------------------------------
-# RAG SERVICES
+# RAG SERVICES  (drop-in replacement for the broken section in main.py)
 # ---------------------------------------------------------------------------
+# This patch replaces everything from:
+#     EMBEDDING_MODEL = "gemini-embedding-exp-03-07"
+# down to (but not including):
+#     def rag_insert_entry(...)
+# ---------------------------------------------------------------------------
+
 EMBEDDING_MODEL = "gemini-embedding-exp-03-07"
 EMBEDDING_DIM = 3072
+
 
 def generate_embedding(text: str) -> List[float]:
     if not text:
@@ -1045,7 +1052,7 @@ def generate_embedding(text: str) -> List[float]:
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(
             status_code=503,
-            detail="Gemini disabled: set GEMINI_API_KEY"
+            detail="Gemini disabled: set GEMINI_API_KEY",
         )
 
     try:
@@ -1053,7 +1060,6 @@ def generate_embedding(text: str) -> List[float]:
             model=EMBEDDING_MODEL,
             contents=[text],
         )
-
         return result.embeddings[0].values
 
     except HTTPException:
@@ -1062,21 +1068,52 @@ def generate_embedding(text: str) -> List[float]:
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Embedding generation failed: {exc}"
+            detail=f"Embedding generation failed: {exc}",
         )
-     def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
 
-    cur.execute("""
+
+def ensure_faq_kb_table(conn) -> None:
+    """
+    Create the faq_knowledge_base table and its ivfflat index if they do not
+    already exist.  Safe to call on every request (all statements are
+    idempotent).
+    """
+    cur = conn.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS faq_knowledge_base (
+            id        SERIAL PRIMARY KEY,
+            question  TEXT        NOT NULL,
+            answer    TEXT        NOT NULL,
+            category  TEXT        NOT NULL DEFAULT '',
+            embedding vector({EMBEDDING_DIM}),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    # ivfflat index — requires at least one row to build, so we use
+    # CREATE INDEX IF NOT EXISTS which is a no-op when it already exists.
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx
         ON faq_knowledge_base
         USING ivfflat (embedding vector_cosine_ops)
-    """)
-
+        """
+    )
     conn.commit()
-    cur.close()
-    conn.close()
+
+
+def init_db() -> None:
+    """
+    One-time initialisation helper (optional – call from a startup event or
+    a management script, not on every request).
+    """
+    conn = get_conn()
+    try:
+        ensure_faq_kb_table(conn)
+    finally:
+        conn.close()
 
 def rag_insert_entry(conn, question: str, answer: str, category: str, embedding: List[float]) -> int:
     """Insert a FAQ entry with its embedding into the database."""
