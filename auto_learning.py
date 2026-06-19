@@ -226,6 +226,9 @@ def maybe_learn_from_interaction(
     child_age: Optional[int],
     conn_factory: Callable[[], Any],
 ) -> None:
+
+    print("AUTO LEARNING CALLED")
+
     """
     Entry point called after every successful /chat Gemini response.
 
