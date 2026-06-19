@@ -1036,41 +1036,41 @@ def gemini_generate_parenting_plan(
 # RAG SERVICES
 # ---------------------------------------------------------------------------
 EMBEDDING_MODEL = "gemini-embedding-exp-03-07"
-EMBEDDING_DIM   = 3072   # هذا الموديل بيرجع 3072 dimension
+EMBEDDING_DIM = 3072
 
 def generate_embedding(text: str) -> List[float]:
     if not text:
         raise HTTPException(status_code=400, detail="Empty text")
+
     if not GEMINI_ENABLED or client is None:
-        raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini disabled: set GEMINI_API_KEY"
+        )
+
     try:
         result = client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=[text],
         )
+
         return result.embeddings[0].values
+
     except HTTPException:
         raise
+
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Embedding generation failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Embedding generation failed: {exc}"
+        )
+        cur.execute("""
+    CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx
+    ON faq_knowledge_base
+    USING ivfflat (embedding vector_cosine_ops)
+""")
 
-DROP TABLE IF EXISTS faq_knowledge_base;
-
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE faq_knowledge_base (
-    id         SERIAL PRIMARY KEY,
-    question   TEXT NOT NULL,
-    answer     TEXT NOT NULL,
-    category   TEXT NOT NULL DEFAULT '',
-    embedding  VECTOR(3072),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-)
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx "
-        "ON faq_knowledge_base USING ivfflat (embedding vector_cosine_ops)"
-    )
-    conn.commit()
-
+conn.commit()
 
 def rag_insert_entry(conn, question: str, answer: str, category: str, embedding: List[float]) -> int:
     """Insert a FAQ entry with its embedding into the database."""
