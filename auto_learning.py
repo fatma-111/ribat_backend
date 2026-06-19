@@ -217,7 +217,6 @@ def _insert_learned_pair(
 # ──────────────────────────────────────────────
 # PUBLIC API — call this from /chat
 # ──────────────────────────────────────────────
-
 def maybe_learn_from_interaction(
     user_message: str,
     reply_text: str,
@@ -229,57 +228,48 @@ def maybe_learn_from_interaction(
 
     print("AUTO LEARNING CALLED")
 
-    """
-    Entry point called after every successful /chat Gemini response.
-
-    This function is entirely non-blocking from the caller's perspective:
-    all failures are caught and logged — the /chat response is never affected.
-
-    Args:
-        user_message:  The raw user question.
-        reply_text:    The Gemini-generated answer.
-        topic:         Detected topic (from RouteDecision).
-        lang:          'ar' or 'en'.
-        child_age:     Child age if known.
-        conn_factory:  Callable that returns a psycopg2 connection (i.e. get_conn).
-    """
     try:
-        # ── 1. Quality gate ──────────────────────────────────────────
-        should_store, reason = _passes_quality_gate(user_message, reply_text, topic)
+        # ── 1. Quality Gate ─────────────────────────────
+        should_store, reason = _passes_quality_gate(
+            user_message, reply_text, topic
+        )
+
         if not should_store:
-            logger.debug("[autolearn] skipped — %s", reason)
+            logger.debug(f"[autolearn] skipped (quality gate): {reason}")
             return
 
-        # ── 2. Get a DB connection ───────────────────────────────────
+        # ── 2. DB Connection ────────────────────────────
         conn = conn_factory()
 
         try:
-            # ── 3. Deduplication ────────────────────────────────────
+            # ── 3. Duplicate Check ───────────────────────
             if _is_duplicate(conn, user_message, topic, lang):
-                logger.debug("[autolearn] skipped — duplicate detected")
+                logger.debug("[autolearn] skipped (duplicate)")
                 return
 
-            # ── 4. Persist ───────────────────────────────────────────
-            new_id = _insert_learned_pair(
-                conn=conn,
-                question=user_message,
-                answer=reply_text,
-                topic=topic,
-                lang=lang,
-                child_age=child_age,
-            )
+            # ── 4. Insert ────────────────────────────────
+            cur = conn.cursor()
 
-            if new_id:
+            cur.execute("""
+                INSERT INTO faq_knowledge_base (question, answer, category)
+                VALUES (%s, %s, %s)
+                RETURNING id
+            """, (user_message, reply_text, topic))
+
+            row = cur.fetchone()
+
+            conn.commit()
+
+            if row and row[0]:
+                new_id = row[0]
                 logger.info(
-                    "[autolearn] ✅ learned id=%s | topic=%s | lang=%s | q_len=%d | a_len=%d",
-                    new_id, topic, lang, len(user_message), len(reply_text),
+                    f"[autolearn] saved id={new_id} | topic={topic} | lang={lang}"
                 )
             else:
-                logger.warning("[autolearn] insert returned no id (possible silent failure)")
+                logger.warning("[autolearn] insert failed: no id returned")
 
         finally:
             conn.close()
 
     except Exception as exc:
-        # Absolute safety net — learning must NEVER break the chat response
-        logger.error("[autolearn] unexpected error (non-fatal): %s", exc)
+        logger.error(f"[autolearn] unexpected error: {exc}")
