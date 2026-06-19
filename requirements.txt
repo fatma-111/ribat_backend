@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-google-genai
-pydantic
+google-genai==1.20.0pydantic
 python-dotenv
 requests
 psycopg2-binary
