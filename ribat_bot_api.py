@@ -89,15 +89,14 @@ if ADMIN_KEY == "change-me":
 # ---------------------------------------------------------------------------
 # GEMINI CLIENT
 # ---------------------------------------------------------------------------
-
 client = None
+
 if GEMINI_ENABLED:
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini initialized successfully.")
     except Exception as exc:
         print(f"Gemini init failed: {exc}")
-
 # ---------------------------------------------------------------------------
 # FIREBASE CLIENT
 # ---------------------------------------------------------------------------
