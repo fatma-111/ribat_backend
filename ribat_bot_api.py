@@ -1035,8 +1035,8 @@ def gemini_generate_parenting_plan(
 # ---------------------------------------------------------------------------
 # RAG SERVICES
 # ---------------------------------------------------------------------------
-EMBEDDING_MODEL = "text-embedding-004"   # ← remove "models/" prefix
-EMBEDDING_DIM   = 768
+EMBEDDING_MODEL = "gemini-embedding-exp-03-07"
+EMBEDDING_DIM   = 3072   # هذا الموديل بيرجع 3072 dimension
 
 def generate_embedding(text: str) -> List[float]:
     if not text:
@@ -1046,33 +1046,30 @@ def generate_embedding(text: str) -> List[float]:
     try:
         result = client.models.embed_content(
             model=EMBEDDING_MODEL,
-            contents=text,
+            contents=[text],
         )
-        # google-genai SDK ≥ 0.8 returns EmbedContentResponse
-        # .embeddings is a list of ContentEmbedding; each has .values
-        embedding = result.embeddings[0].values
-        return embedding
+        return result.embeddings[0].values
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Embedding generation failed: {exc}",
-        )
-def ensure_faq_kb_table(conn) -> None:
-    """Ensure the faq_knowledge_base table and pgvector extension exist."""
-    cur = conn.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    cur.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS faq_knowledge_base (
-            id        SERIAL PRIMARY KEY,
-            question  TEXT NOT NULL,
-            answer    TEXT NOT NULL,
-            category  TEXT NOT NULL DEFAULT '',
-            embedding VECTOR({EMBEDDING_DIM}),
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        )
+        raise HTTPException(status_code=502, detail=f"Embedding generation failed: {exc}")
+
+
+-- 1. امسح الجدول القديم بالكامل
+DROP TABLE IF EXISTS faq_knowledge_base;
+
+-- 2. امسح الـ extension وعيد تفعيله (احتياطي)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 3. عمل الجدول من أول بـ 3072 dimension
+CREATE TABLE faq_knowledge_base (
+    id         SERIAL PRIMARY KEY,
+    question   TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT '',
+    embedding  VECTOR(3072),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+)
         """
     )
     cur.execute(
