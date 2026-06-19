@@ -12,7 +12,7 @@ Changes in v4.2 vs v4.1:
   * Returns clean {"reply": response.text}
 - All other endpoints unchanged
 """
-
+from auto_learning import maybe_learn_from_interaction
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -1968,7 +1968,14 @@ Now generate only the final answer."""
             if lang == "ar"
             else "Sorry, I couldn't generate a response. Please try again."
         )
-
+    maybe_learn_from_interaction(
+        user_message=user_message,
+        reply_text=reply_text,
+        topic=topic,
+        lang=lang,
+        child_age=age,
+        conn_factory=get_conn,
+    )
     # ── 11. Persist to DB ─────────────────────────────────────────────
     message_id = "msg_" + uuid.uuid4().hex[:10]
     try:
