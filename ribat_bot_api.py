@@ -1036,10 +1036,8 @@ def gemini_generate_parenting_plan(
 # ---------------------------------------------------------------------------
 # RAG SERVICES
 # ---------------------------------------------------------------------------
-
-EMBEDDING_MODEL = "models/text-embedding-004"
-EMBEDDING_DIM   = 768
-
+EMBEDDING_MODEL = "textembedding-gecko@003"
+EMBEDDING_DIM = 768
 def generate_embedding(text: str) -> List[float]:
     """Generate a text embedding using Gemini embedding model."""
     _require_gemini()
