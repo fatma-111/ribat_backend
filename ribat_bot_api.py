@@ -1064,13 +1064,19 @@ def generate_embedding(text: str) -> List[float]:
             status_code=502,
             detail=f"Embedding generation failed: {exc}"
         )
-        cur.execute("""
-    CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx
-    ON faq_knowledge_base
-    USING ivfflat (embedding vector_cosine_ops)
-""")
+     def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-conn.commit()
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx
+        ON faq_knowledge_base
+        USING ivfflat (embedding vector_cosine_ops)
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def rag_insert_entry(conn, question: str, answer: str, category: str, embedding: List[float]) -> int:
     """Insert a FAQ entry with its embedding into the database."""
