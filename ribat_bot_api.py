@@ -1038,17 +1038,28 @@ def gemini_generate_parenting_plan(
 # ---------------------------------------------------------------------------
 EMBEDDING_MODEL = "textembedding-gecko@003"
 EMBEDDING_DIM = 768
+from typing import List
+from fastapi import HTTPException
+
 def generate_embedding(text: str) -> List[float]:
-    """Generate a text embedding using Gemini embedding model."""
-    _require_gemini()
+    """Generate embedding using Gemini/Vertex embedding model."""
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
     try:
         result = client.models.embed_content(
             model=EMBEDDING_MODEL,
-            contents=text,
+            contents=text
         )
+
         return result.embeddings[0].values
+
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Embedding generation failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Embedding generation failed: {str(exc)}"
+        )
 
 
 def ensure_faq_kb_table(conn) -> None:
