@@ -1065,7 +1065,6 @@ CREATE TABLE faq_knowledge_base (
     embedding  VECTOR(3072),
     created_at TIMESTAMPTZ DEFAULT NOW()
 )
-    )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS faq_kb_embedding_idx "
         "ON faq_knowledge_base USING ivfflat (embedding vector_cosine_ops)"
