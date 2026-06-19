@@ -219,7 +219,7 @@ def _insert_learned_pair(
 # ──────────────────────────────────────────────
 
 def maybe_learn_from_interaction(
-    print("AUTO LEARNING CALLED")
+    print("AUTO LEARNING CALLED"),
     user_message: str,
     reply_text: str,
     topic: str,
