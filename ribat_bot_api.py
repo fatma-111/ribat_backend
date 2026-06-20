@@ -1,24 +1,19 @@
 """
-Rafiq Bot API — PRODUCTION v4.2
+Rafiq Bot API — PRODUCTION v4.3
 ================================
-Changes in v4.2 vs v4.1:
-- REMOVED appointments system (routes, models, logic)
-- REMOVED specialists system (routes, models, logic)
-- REMOVED slots system (routes, models, logic)
-- FIXED /chat endpoint:
-  * Safe extraction of user_message from messages[-1]["content"]
-  * Correct Gemini prompt construction
-  * Guaranteed non-empty input to Gemini
-  * Returns clean {"reply": response.text}
-- All other endpoints unchanged
+Changes in v4.3 vs v4.2:
+- MERGED auto_learning.py directly into main.py (no separate file/import)
+- ADDED strip_markdown() to remove bold/italic markers from all AI responses
+- REMOVED unused imports
+- CLEANED UP duplicate helpers and organised into clear sections
 """
-from auto_learning import maybe_learn_from_interaction
+
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, json, uuid, re, io
+import os, json, uuid, re, io, logging
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +21,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import psycopg2
 
-# ── Translations ──────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+# TRANSLATIONS
+# ══════════════════════════════════════════════
+
 Lang = Literal["ar", "en"]
 
 _T: dict[str, dict[str, str]] = {
@@ -122,7 +121,59 @@ def user_lang(preferred_language: Optional[str], fallback_text: str = "") -> Lan
     return detect_lang(fallback_text)
 
 
-# ── reportlab ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# MARKDOWN STRIPPING
+# ══════════════════════════════════════════════
+
+# Pre-compiled patterns for performance
+_MD_BOLD_ITALIC = re.compile(r'\*{1,3}(.+?)\*{1,3}', re.DOTALL)
+_MD_BOLD_UNDER  = re.compile(r'_{2}(.+?)_{2}',        re.DOTALL)
+_MD_ITALIC_UNDER= re.compile(r'_(.+?)_',              re.DOTALL)
+_MD_HEADING     = re.compile(r'^#{1,6}\s+', re.MULTILINE)
+_MD_HR          = re.compile(r'^[-*_]{3,}\s*$', re.MULTILINE)
+_MD_BACKTICK    = re.compile(r'`{1,3}(.+?)`{1,3}', re.DOTALL)
+
+
+def strip_markdown(text: str) -> str:
+    """
+    Remove common Markdown formatting symbols from AI-generated text,
+    returning clean plain text suitable for display in chat UIs.
+
+    Handles:
+      - **bold**, *italic*, ***bold-italic***
+      - __bold__, _italic_
+      - # Headings (removes the # prefix only)
+      - Horizontal rules (---, ***, ___)
+      - `inline code` and ```code blocks```
+    """
+    if not text:
+        return text
+
+    # Remove bold/italic markers (keep inner text)
+    text = _MD_BOLD_ITALIC.sub(r'\1', text)
+    text = _MD_BOLD_UNDER.sub(r'\1',  text)
+    text = _MD_ITALIC_UNDER.sub(r'\1', text)
+
+    # Remove heading markers (#, ##, …)
+    text = _MD_HEADING.sub('', text)
+
+    # Remove horizontal rules
+    text = _MD_HR.sub('', text)
+
+    # Remove backtick code markers (keep inner text)
+    text = _MD_BACKTICK.sub(r'\1', text)
+
+    # Collapse any double blank lines left behind
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
+
+
+# ══════════════════════════════════════════════
+# OPTIONAL DEPENDENCIES
+# ══════════════════════════════════════════════
+
+# ── reportlab ─────────────────────────────────
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -139,7 +190,7 @@ except ImportError:
     _REPORTLAB_AVAILABLE = False
     print("WARNING: reportlab not installed — PDF export disabled.")
 
-# ── Arabic text shaping / bidi ─────────────────────────────────────────
+# ── Arabic text shaping / bidi ────────────────
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display as bidi_display
@@ -148,7 +199,7 @@ except ImportError:
     _ARABIC_SHAPING = False
     print("WARNING: arabic-reshaper / python-bidi not installed — Arabic PDF text may not render correctly.")
 
-# ── Gemini (generation only — NO embeddings) ───────────────────────────
+# ── Gemini ────────────────────────────────────
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -156,7 +207,7 @@ except Exception:
     genai = None
     genai_types = None
 
-# ── Firebase ───────────────────────────────────────────────────────────
+# ── Firebase ──────────────────────────────────
 try:
     import firebase_admin
     from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
@@ -165,9 +216,11 @@ except ImportError:
     firebase_admin = fb_credentials = fb_messaging = None
     _FIREBASE_AVAILABLE = False
 
-# ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
 # CONFIG
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 DEBUG          = os.getenv("RAFIQ_DEBUG", "0") == "1"
 DATABASE_URL   = os.getenv("DATABASE_URL", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -204,7 +257,7 @@ if _FIREBASE_AVAILABLE and _FIREBASE_CREDS_JSON:
     except Exception as _fb_exc:
         print(f"Firebase init failed: {_fb_exc}")
 
-# ── Register PDF fonts ─────────────────────────────────────────────────
+# ── PDF font registration ──────────────────────
 _FONT_ARABIC_REGISTERED = False
 _FONT_LATIN_REGISTERED  = False
 
@@ -230,12 +283,13 @@ def _register_fonts() -> None:
         print(f"Font registration warning: {exc}")
 
 
-# ──────────────────────────────────────────────
-# APP
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# FASTAPI APP
+# ══════════════════════════════════════════════
+
 app = FastAPI(
     title="Rafiq Bot API",
-    version="4.2.0",
+    version="4.3.0",
     description="Family support & parenting assistant API — bilingual (ar/en) | FTS-based retrieval",
 )
 app.add_middleware(
@@ -251,9 +305,10 @@ def on_startup():
     _register_fonts()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # DATABASE
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 def get_conn():
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
@@ -261,12 +316,7 @@ def get_conn():
 
 
 def _run_schema_migrations() -> None:
-    """
-    Apply all schema migrations idempotently.
-    NOTE: No pgvector extension, no vector columns, no embedding indexes.
-    faq_knowledge_base uses tsvector for full-text search.
-    Appointments / specialists / slots tables are NOT created here.
-    """
+    """Apply all schema migrations idempotently (no pgvector, FTS only)."""
     if not DATABASE_URL:
         print("Skipping DB migrations — DATABASE_URL not set")
         return
@@ -274,7 +324,6 @@ def _run_schema_migrations() -> None:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur  = conn.cursor()
 
-        # ── Core tables ────────────────────────────────────────────────
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) DEFAULT 'ar';")
 
@@ -303,7 +352,6 @@ def _run_schema_migrations() -> None:
             "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_language VARCHAR(5) DEFAULT 'ar';"
         )
 
-        # ── faq_knowledge_base — NO vector column ──────────────────────
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS faq_knowledge_base (
@@ -321,12 +369,8 @@ def _run_schema_migrations() -> None:
             );
             """
         )
-
         cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_faq_kb_fts
-            ON faq_knowledge_base USING GIN (search_vector);
-            """
+            "CREATE INDEX IF NOT EXISTS idx_faq_kb_fts   ON faq_knowledge_base USING GIN (search_vector);"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_faq_kb_topic ON faq_knowledge_base (topic);"
@@ -334,7 +378,6 @@ def _run_schema_migrations() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_faq_kb_lang  ON faq_knowledge_base (lang);"
         )
-
         cur.execute(
             """
             CREATE OR REPLACE FUNCTION faq_kb_search_vector_update()
@@ -350,9 +393,7 @@ def _run_schema_migrations() -> None:
             $$ LANGUAGE plpgsql;
             """
         )
-        cur.execute(
-            "DROP TRIGGER IF EXISTS trig_faq_kb_fts ON faq_knowledge_base;"
-        )
+        cur.execute("DROP TRIGGER IF EXISTS trig_faq_kb_fts ON faq_knowledge_base;")
         cur.execute(
             """
             CREATE TRIGGER trig_faq_kb_fts
@@ -360,7 +401,6 @@ def _run_schema_migrations() -> None:
             FOR EACH ROW EXECUTE FUNCTION faq_kb_search_vector_update();
             """
         )
-
         cur.execute(
             """
             UPDATE faq_knowledge_base
@@ -371,7 +411,6 @@ def _run_schema_migrations() -> None:
             WHERE search_vector IS NULL;
             """
         )
-
         conn.commit()
         conn.close()
         print("DB migrations applied ✔ (no pgvector, FTS ready)")
@@ -379,9 +418,9 @@ def _run_schema_migrations() -> None:
         print(f"DB migration warning: {exc}")
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # FULL-TEXT SEARCH
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 
 def fts_knowledge_base(
     query: str,
@@ -389,10 +428,7 @@ def fts_knowledge_base(
     lang: Optional[str] = None,
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
-    """
-    Retrieve relevant KB entries using PostgreSQL full-text search.
-    Strategy: tsvector/tsquery first, ILIKE fallback.
-    """
+    """Retrieve KB entries using PostgreSQL FTS with ILIKE fallback."""
     if not query or not query.strip():
         return []
 
@@ -426,80 +462,50 @@ def fts_knowledge_base(
 
         if tokens:
             tsquery_str = " | ".join(tokens)
-
             fts_sql = f"""
-                SELECT
-                    topic,
-                    question,
-                    answer,
-                    tags,
-                    ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank
-                FROM faq_knowledge_base
-                WHERE search_vector @@ to_tsquery('simple', %s)
+                SELECT topic, question, answer, tags,
+                       ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank
+                FROM   faq_knowledge_base
+                WHERE  search_vector @@ to_tsquery('simple', %s)
                 {where_extra}
-                ORDER BY rank DESC
-                LIMIT %s;
+                ORDER  BY rank DESC
+                LIMIT  %s;
             """
-            fts_params = [tsquery_str, tsquery_str] + params_fts + [limit]
-
-            cur.execute(fts_sql, fts_params)
+            cur.execute(fts_sql, [tsquery_str, tsquery_str] + params_fts + [limit])
             rows = cur.fetchall()
-
             if DEBUG:
                 print(f"[FTS] tsquery='{tsquery_str}' | rows={len(rows)}")
-
             for row in rows:
                 results.append({
-                    "topic":    row[0],
-                    "question": row[1],
-                    "answer":   row[2],
-                    "tags":     row[3] or [],
-                    "rank":     float(row[4]),
-                    "method":   "fts",
+                    "topic": row[0], "question": row[1], "answer": row[2],
+                    "tags": row[3] or [], "rank": float(row[4]), "method": "fts",
                 })
 
         if not results:
-            search_term = tokens[0] if tokens else query.strip()
+            search_term  = tokens[0] if tokens else query.strip()
             like_pattern = f"%{search_term}%"
-
             ilike_sql = f"""
-                SELECT
-                    topic,
-                    question,
-                    answer,
-                    tags,
-                    1.0 AS rank
-                FROM faq_knowledge_base
-                WHERE (
-                    question ILIKE %s
-                    OR answer   ILIKE %s
-                    OR array_to_string(tags, ' ') ILIKE %s
-                )
+                SELECT topic, question, answer, tags, 1.0 AS rank
+                FROM   faq_knowledge_base
+                WHERE  (question ILIKE %s OR answer ILIKE %s
+                        OR array_to_string(tags, ' ') ILIKE %s)
                 {where_extra}
-                ORDER BY
-                    CASE WHEN question ILIKE %s THEN 0 ELSE 1 END,
-                    updated_at DESC
-                LIMIT %s;
+                ORDER  BY CASE WHEN question ILIKE %s THEN 0 ELSE 1 END,
+                          updated_at DESC
+                LIMIT  %s;
             """
-            ilike_params = [
-                like_pattern, like_pattern, like_pattern,
-                like_pattern,
-            ] + params_ilike + [limit]
-
-            cur.execute(ilike_sql, ilike_params)
+            cur.execute(
+                ilike_sql,
+                [like_pattern, like_pattern, like_pattern, like_pattern]
+                + params_ilike + [limit],
+            )
             rows = cur.fetchall()
-
             if DEBUG:
                 print(f"[FTS] ILIKE fallback pattern='{like_pattern}' | rows={len(rows)}")
-
             for row in rows:
                 results.append({
-                    "topic":    row[0],
-                    "question": row[1],
-                    "answer":   row[2],
-                    "tags":     row[3] or [],
-                    "rank":     float(row[4]),
-                    "method":   "ilike",
+                    "topic": row[0], "question": row[1], "answer": row[2],
+                    "tags": row[3] or [], "rank": float(row[4]), "method": "ilike",
                 })
 
         conn.close()
@@ -518,10 +524,7 @@ def fts_or_kb_fallback(
     lang: Optional[str] = None,
     limit: int = 3,
 ) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Try FTS first; if DB returns nothing, fall back to in-memory KB.
-    Returns (results, from_db: bool).
-    """
+    """Try FTS first; fall back to in-memory KB. Returns (results, from_db)."""
     db_results = fts_knowledge_base(query=query, topic=topic, lang=lang, limit=limit)
     if db_results:
         return db_results, True
@@ -541,9 +544,10 @@ def fts_or_kb_fallback(
     return tips, False
 
 
-# ──────────────────────────────────────────────
-# KNOWLEDGE BASE (in-memory — fallback)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# IN-MEMORY KNOWLEDGE BASE (fallback)
+# ══════════════════════════════════════════════
+
 KB: List[Dict[str, Any]] = [
     {"id": "kb_001", "topic": "teen_communication", "age_min": 12, "age_max": 18,
      "tags": ["مراهق", "مراهقة", "مش بيرد", "ساكت", "قافل"],
@@ -596,9 +600,10 @@ KB: List[Dict[str, Any]] = [
 ]
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # PYDANTIC MODELS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -684,9 +689,7 @@ AllowedTopic = Literal[
     "kids_stories", "activities_games", "book_recommendations",
     "assessment_personality", "out_of_scope"
 ]
-AllowedAction = Literal[
-    "answer_with_tips", "refuse_out_of_scope"
-]
+AllowedAction = Literal["answer_with_tips", "refuse_out_of_scope"]
 
 
 class RouteDecision(BaseModel):
@@ -697,9 +700,10 @@ class RouteDecision(BaseModel):
     reason: str           = Field(description="Short reason")
 
 
-# ──────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# CONSTANTS & GUARDS
+# ══════════════════════════════════════════════
+
 PARENTING_TOPICS    = {"teen_communication", "anger", "screen_addiction", "bullying",
                         "study_focus", "siblings_jealousy", "parents_conflict",
                         "lying", "general_parenting"}
@@ -716,9 +720,7 @@ RISK_HIGH_KW    = ["عايز أموت", "مش عايز أعيش", "هأذي نف
 RISK_MEDIUM_KW  = ["خوف شديد", "هلع", "نوبات", "قلق جامد", "اكتئاب",
                    "حزين طول الوقت", "مش قادر", "مخنوق طول الوقت"]
 
-# ──────────────────────────────────────────────
-# GUARDS & UTILS
-# ──────────────────────────────────────────────
+
 def hard_out_of_scope(text: str) -> bool:
     tl = text.lower()
     return any(k.lower() in tl for k in OUT_OF_SCOPE_KW)
@@ -741,9 +743,10 @@ def detect_risk_level(text: str) -> Literal["low", "medium", "high"]:
     return "low"
 
 
-# ──────────────────────────────────────────────
-# IN-MEMORY KB SEARCH (fallback)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# IN-MEMORY KB SEARCH
+# ══════════════════════════════════════════════
+
 _AR_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670]")
 _AR_PUNCT      = re.compile(r"[^\w\u0600-\u06FF]+", re.UNICODE)
 _AR_STOPWORDS  = {"في", "من", "على", "عن", "الى", "إلى", "هو", "هي", "ده", "دي", "دا",
@@ -799,9 +802,10 @@ def kb_search_v2(topic: str, query: str, age: Optional[int]) -> KbSearchResult:
     return KbSearchResult(tips=defaults, matched=False, match_count=0, used_default=True)
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # USER / MEMORY
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 def ensure_user_exists(conn, user_id: str) -> None:
     cur = conn.cursor()
     cur.execute(
@@ -845,9 +849,10 @@ def update_memory(conn, user_id: str, topic: str,
     conn.commit()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ANALYTICS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
     cur = conn.cursor()
     cur.execute(
@@ -857,9 +862,191 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
     conn.commit()
 
 
-# ──────────────────────────────────────────────
-# ASSESSMENT ENGINE (unchanged)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# AUTO-LEARNING  (merged from auto_learning.py)
+# ══════════════════════════════════════════════
+
+_autolearn_logger = logging.getLogger("rafiq.autolearn")
+
+# Quality thresholds
+_AL_MIN_QUESTION_LEN = 15
+_AL_MIN_ANSWER_LEN   = 60
+_AL_MAX_ANSWER_LEN   = 3000
+_AL_SIMILARITY_THRESHOLD = 0.75
+
+_AL_LEARNABLE_TOPICS = {
+    "teen_communication", "anger", "screen_addiction", "bullying",
+    "study_focus", "siblings_jealousy", "parents_conflict", "lying",
+    "general_parenting", "kids_stories", "activities_games",
+    "book_recommendations", "assessment_personality",
+}
+
+_AL_CLARIFICATION_RE = re.compile(
+    "|".join([
+        r"هل يمكنك.*؟", r"هل تقصد.*؟", r"ما هو.*؟", r"ما هي.*؟",
+        r"هل.*عمر.*الطفل",
+        r"could you (clarify|tell me|share|provide)",
+        r"can you (tell|give|share|provide|clarify)",
+        r"what (is|are|do you mean)",
+        r"please (clarify|share|tell me|provide)",
+        r"i need (more|a bit more) (context|information|detail)",
+        r"could you elaborate",
+    ]),
+    re.IGNORECASE,
+)
+
+_AL_GENERIC_RE = re.compile(
+    "|".join([
+        r"^(sorry|عذرًا|عذرا)[،,.]?\s*(i|لم|لا)",
+        r"^(i'm not sure|لست متأكد)",
+        r"^(i don't know|لا أعرف)",
+    ]),
+    re.IGNORECASE,
+)
+
+# Shared normaliser (reuses _AR_DIACRITICS already defined above)
+def _al_normalize_text(text: str) -> str:
+    t_ = _AR_DIACRITICS.sub("", text.lower())
+    for a, b in [("أ","ا"),("إ","ا"),("آ","ا"),("ى","ي"),("ة","ه"),("ؤ","و"),("ئ","ي")]:
+        t_ = t_.replace(a, b)
+    return re.sub(r"[^\w\u0600-\u06FF]+", " ", t_).strip()
+
+
+def _al_token_overlap(a: str, b: str) -> float:
+    """Jaccard similarity between token sets."""
+    ta = set(_al_normalize_text(a).split())
+    tb = set(_al_normalize_text(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _al_passes_quality_gate(
+    question: str,
+    answer: str,
+    topic: str,
+) -> Tuple[bool, str]:
+    q, a = question.strip(), answer.strip()
+    if len(q) < _AL_MIN_QUESTION_LEN:
+        return False, f"question too short ({len(q)} chars)"
+    if len(a) < _AL_MIN_ANSWER_LEN:
+        return False, f"answer too short ({len(a)} chars)"
+    if len(a) > _AL_MAX_ANSWER_LEN:
+        return False, f"answer too long ({len(a)} chars)"
+    if topic not in _AL_LEARNABLE_TOPICS:
+        return False, f"topic '{topic}' not learnable"
+    if _AL_CLARIFICATION_RE.search(a):
+        return False, "answer contains clarifying question"
+    if _AL_GENERIC_RE.match(a):
+        return False, "answer is a generic/error response"
+    if len(q.split()) < 4:
+        return False, f"question too fragmented ({len(q.split())} words)"
+    return True, "ok"
+
+
+def _al_is_duplicate(conn: Any, question: str, topic: str, lang: str) -> bool:
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT question FROM faq_knowledge_base WHERE topic=%s AND lang=%s "
+            "ORDER BY created_at DESC LIMIT 200",
+            (topic, lang),
+        )
+        rows = cur.fetchall()
+        for (stored_q,) in rows:
+            if _al_token_overlap(question, stored_q) >= _AL_SIMILARITY_THRESHOLD:
+                return True
+        return False
+    except Exception as exc:
+        _autolearn_logger.warning("[autolearn] dedup check failed (non-fatal): %s", exc)
+        return False
+
+
+def _al_insert_learned_pair(
+    conn: Any,
+    question: str,
+    answer: str,
+    topic: str,
+    lang: str,
+    child_age: Optional[int],
+) -> Optional[int]:
+    tags: List[str] = [topic]
+    if child_age is not None:
+        tags.append(f"age_{child_age}")
+    tags.append("auto_learned")
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO faq_knowledge_base
+                (topic, question, answer, tags, lang, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            RETURNING id
+            """,
+            (topic, question, answer, tags, lang),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id
+    except Exception as exc:
+        conn.rollback()
+        _autolearn_logger.error("[autolearn] DB insert failed: %s", exc)
+        return None
+
+
+def maybe_learn_from_interaction(
+    user_message: str,
+    reply_text: str,
+    topic: str,
+    lang: str,
+    child_age: Optional[int],
+    conn_factory: Callable[[], Any],
+) -> None:
+    """
+    Called after every successful /chat Gemini response.
+    Evaluates quality, deduplicates, and persists high-value Q/A pairs
+    into faq_knowledge_base for future FTS retrieval.
+    All failures are caught — the /chat response is never affected.
+    """
+    try:
+        should_store, reason = _al_passes_quality_gate(user_message, reply_text, topic)
+        if not should_store:
+            _autolearn_logger.debug("[autolearn] skipped — %s", reason)
+            return
+
+        conn = conn_factory()
+        try:
+            if _al_is_duplicate(conn, user_message, topic, lang):
+                _autolearn_logger.debug("[autolearn] skipped — duplicate detected")
+                return
+
+            new_id = _al_insert_learned_pair(
+                conn=conn,
+                question=user_message,
+                answer=reply_text,
+                topic=topic,
+                lang=lang,
+                child_age=child_age,
+            )
+            if new_id:
+                _autolearn_logger.info(
+                    "[autolearn] learned id=%s | topic=%s | lang=%s | q_len=%d | a_len=%d",
+                    new_id, topic, lang, len(user_message), len(reply_text),
+                )
+            else:
+                _autolearn_logger.warning("[autolearn] insert returned no id")
+        finally:
+            conn.close()
+
+    except Exception as exc:
+        _autolearn_logger.error("[autolearn] unexpected error (non-fatal): %s", exc)
+
+
+# ══════════════════════════════════════════════
+# ASSESSMENT ENGINE
+# ══════════════════════════════════════════════
+
 ASSESSMENT_OPTIONS = ["Never", "Rarely", "Sometimes", "Often", "Always"]
 
 ASSESSMENT_QUESTIONS: List[Dict[str, Any]] = [
@@ -1123,9 +1310,10 @@ def compute_assessment_confidence(
     }
 
 
-# ──────────────────────────────────────────────
-# PDF HELPERS (unchanged)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# PDF HELPERS
+# ══════════════════════════════════════════════
+
 def _safe_xml(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -1276,9 +1464,10 @@ def _build_parenting_plan_pdf(
     return buf.read()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # PROFILE NORMALISATION HELPERS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 def _norm_traits(raw: Any) -> List[Dict[str, Any]]:
     out = []
     for item in (raw or []):
@@ -1315,15 +1504,20 @@ def _norm_scores(raw: Any) -> Dict[str, int]:
     return out
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # GEMINI HELPERS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 def _require_gemini() -> None:
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
 
 
-def gemini_route_decision(user_text: str, history: List[ChatMessage], fallback_age: Optional[int]) -> RouteDecision:
+def gemini_route_decision(
+    user_text: str,
+    history: List[ChatMessage],
+    fallback_age: Optional[int],
+) -> RouteDecision:
     _require_gemini()
     system = (
         "You are the router for Rafiq, a family support assistant. "
@@ -1356,8 +1550,10 @@ def gemini_route_decision(user_text: str, history: List[ChatMessage], fallback_a
     try:
         return RouteDecision.model_validate_json(resp.text)
     except Exception:
-        return RouteDecision(in_scope=False, topic="out_of_scope", action="refuse_out_of_scope",
-                             reason=f"Router parse failed. raw={resp.text[:100]}")
+        return RouteDecision(
+            in_scope=False, topic="out_of_scope", action="refuse_out_of_scope",
+            reason=f"Router parse failed. raw={resp.text[:100]}",
+        )
 
 
 def gemini_generate_parenting_plan(
@@ -1387,6 +1583,7 @@ def gemini_generate_parenting_plan(
             "3. أساليب التعزيز الإيجابي\n4. توصيات خاصة بالوالدين\n"
             "5. ملاحظة ختامية للمتابعة\n\n"
             "الأسلوب: دافئ، واضح، وعملي. تجنب المصطلحات الطبية.\n"
+            "لا تستخدم رموز Markdown مثل ** أو * أو # في الرد.\n"
             "أعد الخطة كاملةً باللغة العربية."
         )
     else:
@@ -1405,6 +1602,7 @@ def gemini_generate_parenting_plan(
             "4. Specific recommendations for parents to support the child\n"
             "5. A closing note for follow-up after the plan ends\n\n"
             "Style: warm, clear, practical. Avoid medical/diagnostic terminology.\n"
+            "Do NOT use Markdown formatting symbols such as **, *, or # in your response.\n"
             "Write the entire plan in English."
         )
 
@@ -1412,15 +1610,16 @@ def gemini_generate_parenting_plan(
         model=GEMINI_MODEL, contents=prompt,
         config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=2000),
     )
-    return (resp.text or "").strip()
+    return strip_markdown((resp.text or "").strip())
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — SYSTEM
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "4.2.0",
+    return {"status": "Rafiq running 🚀", "version": "4.3.0",
             "retrieval": "PostgreSQL FTS (tsvector/tsquery) — no pgvector"}
 
 
@@ -1447,9 +1646,10 @@ def test_gemini():
     return {"text": r.text}
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — USERS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.post("/users", tags=["Users"])
 def upsert_user(req: UserUpsertReq):
     conn = get_conn()
@@ -1503,9 +1703,10 @@ def memory_get(user_id: str):
     return {"user_id": user_id, "memory": data}
 
 
-# ──────────────────────────────────────────────
-# ROUTES — FCM / PUSH
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ROUTES — FCM / PUSH NOTIFICATIONS
+# ══════════════════════════════════════════════
+
 @app.post("/register-token", tags=["Notifications"])
 def register_token(req: RegisterTokenReq):
     conn = get_conn()
@@ -1610,9 +1811,10 @@ def get_daily_tips(user_id: str, limit: int = 50):
         conn.close()
 
 
-# ──────────────────────────────────────────────
-# ROUTES — KB (in-memory) + FTS KB (DB)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ROUTES — KNOWLEDGE BASE
+# ══════════════════════════════════════════════
+
 @app.get("/kb/topics", tags=["KB"])
 def kb_topics():
     topics = sorted({x["topic"] for x in KB})
@@ -1621,21 +1823,19 @@ def kb_topics():
 
 @app.get("/kb/search", tags=["KB"])
 def kb_search_api(topic: str, q: str = "", age: Optional[int] = None, lang: Optional[str] = None):
-    """Search knowledge base. Tries PostgreSQL FTS first; falls back to in-memory KB."""
+    """Search knowledge base: tries PostgreSQL FTS first, falls back to in-memory KB."""
     db_results = fts_knowledge_base(query=q, topic=topic, lang=lang, limit=3)
     if db_results:
         return {"topic": topic, "age": age, "matched": True, "source": "postgres_fts",
                 "match_count": len(db_results), "used_default": False, "tips": db_results}
-
     res = kb_search_v2(topic=topic, query=q, age=age)
     return {"topic": topic, "age": age, "matched": res.matched, "source": "in_memory_kb",
-            "match_count": res.match_count, "used_default": res.used_default,
-            "tips": res.tips}
+            "match_count": res.match_count, "used_default": res.used_default, "tips": res.tips}
 
 
 @app.post("/kb/add", tags=["KB"])
 def kb_add(req: KbAddRequest):
-    """Add to in-memory KB (legacy endpoint — use /kb/faq/add for DB persistence)."""
+    """Add to in-memory KB (legacy — use /kb/faq/add for DB persistence)."""
     if req.admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin_key")
     new_id = "kb_" + uuid.uuid4().hex[:6]
@@ -1677,17 +1877,18 @@ def faq_kb_search_api(q: str, topic: Optional[str] = None, lang: Optional[str] =
     return {"query": q, "topic": topic, "lang": lang, "count": len(results), "results": results}
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — ASSESSMENT
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.get("/assessment/questions", tags=["Assessment"])
 def assessment_questions(age: Optional[int] = None):
     qs = get_assessment_questions(age)
     return {
         "child_age":       age,
         "total_questions": len(qs),
-        "scale":           {"min": 1, "max": 5, "labels": {"1": "Never", "2": "Rarely", "3": "Sometimes", "4": "Often", "5": "Always"}},
-        "questions":       _format_questions_for_api(qs),
+        "scale": {"min": 1, "max": 5, "labels": {"1": "Never", "2": "Rarely", "3": "Sometimes", "4": "Often", "5": "Always"}},
+        "questions": _format_questions_for_api(qs),
     }
 
 
@@ -1706,8 +1907,6 @@ def assessment_submit(req: AssessmentSubmitReq):
 
         if DEBUG:
             print(f"[ASSESSMENT] user={req.user_id}, child_age={req.child_age}, answers_count={len(req.answers)}")
-            for a in req.answers:
-                print(f"  answer: {a}")
 
         profile     = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
         assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
@@ -1762,9 +1961,10 @@ def get_assessments(user_id: str):
     }
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — ANALYTICS
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.post("/analytics/event", tags=["Analytics"])
 def analytics_event(req: AppEventRequest):
     conn = get_conn()
@@ -1803,9 +2003,10 @@ def analytics_user(user_id: str):
     }
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — FEEDBACK
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.post("/feedback", tags=["Feedback"])
 def feedback(req: FeedbackReq):
     conn = get_conn()
@@ -1826,9 +2027,10 @@ def feedback(req: FeedbackReq):
         conn.close()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — CHAT HISTORY
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.get("/chat/{user_id}", tags=["Chat"])
 def get_chat_history(user_id: str, limit: int = 50):
     conn = get_conn()
@@ -1845,22 +2047,23 @@ def get_chat_history(user_id: str, limit: int = 50):
     }
 
 
-# ──────────────────────────────────────────────
-# ROUTES — CHAT (main) — FIXED
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ROUTES — CHAT (main)
+# ══════════════════════════════════════════════
+
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(req: ChatRequest):
-    # ── 1. Safe extraction of user message ────────────────────────────
+    # ── 1. Safe extraction ────────────────────────────────────────────
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
 
-    last_msg = req.messages[-1]
+    last_msg     = req.messages[-1]
     user_message = (last_msg.content or "").strip()
 
     if not user_message:
         raise HTTPException(status_code=400, detail="User message content is empty")
 
-    # ── 2. Gemini availability check ──────────────────────────────────
+    # ── 2. Gemini availability ────────────────────────────────────────
     if not GEMINI_ENABLED or client is None:
         return ChatResponse(reply=t("gemini_disabled", detect_lang(user_message)))
 
@@ -1871,7 +2074,7 @@ def chat(req: ChatRequest):
         else detect_lang(user_message)
     )
 
-    # ── 4. Hard guards (out-of-scope / medical) ───────────────────────
+    # ── 4. Hard guards ────────────────────────────────────────────────
     if hard_out_of_scope(user_message) or hard_medical(user_message):
         return ChatResponse(reply=t("out_of_scope_reply", lang))
 
@@ -1886,12 +2089,11 @@ def chat(req: ChatRequest):
             conn.close()
         return ChatResponse(reply=t("risk_high", lang))
 
-    # ── 6. Kids content safety guard ─────────────────────────────────
+    # ── 6. Kids content safety ────────────────────────────────────────
     if kids_safety_guard(user_message):
         return ChatResponse(reply=t("kids_safety", lang))
 
-    # ── 7. Retrieve KB context via FTS ───────────────────────────────
-    # Attempt to route for topic (best-effort; falls back to general)
+    # ── 7. Route & retrieve KB context ───────────────────────────────
     topic = "general_parenting"
     age   = req.child_age
 
@@ -1906,11 +2108,7 @@ def chat(req: ChatRequest):
             print(f"[CHAT] Router error (non-fatal, using general_parenting): {exc}")
 
     retrieved_context, from_db = fts_or_kb_fallback(
-        query=user_message,
-        topic=topic,
-        age=age,
-        lang=lang,
-        limit=3,
+        query=user_message, topic=topic, age=age, lang=lang, limit=3,
     )
 
     if DEBUG:
@@ -1924,7 +2122,9 @@ def chat(req: ChatRequest):
             q_text = item.get("question", "").strip()
             a_text = item.get("answer", item.get("tip", "")).strip()
             if a_text:
-                context_lines.append(f"[{i}] Q: {q_text}\n    A: {a_text}" if q_text else f"[{i}] {a_text}")
+                context_lines.append(
+                    f"[{i}] Q: {q_text}\n    A: {a_text}" if q_text else f"[{i}] {a_text}"
+                )
         context_block = "\n\n".join(context_lines) if context_lines else "No specific context found."
     else:
         context_block = "No specific context found."
@@ -1938,7 +2138,8 @@ Rules:
 - NEVER request more information from the user.
 - Use the Knowledge Base Context below if it is relevant; otherwise rely on your general parenting knowledge.
 - Respond in the same language as the User Question.
-- Output ONLY the final answer — no preamble, no metadata.
+- Do NOT use Markdown formatting symbols such as **, *, or # anywhere in your response.
+- Output ONLY the final plain-text answer — no preamble, no metadata, no formatting markers.
 
 Knowledge Base Context:
 {context_block}
@@ -1953,12 +2154,9 @@ Now generate only the final answer."""
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.4,
-                max_output_tokens=600,
-            ),
+            config=genai_types.GenerateContentConfig(temperature=0.4, max_output_tokens=600),
         )
-        reply_text = (response.text or "").strip()
+        reply_text = strip_markdown((response.text or "").strip())
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
 
@@ -1968,6 +2166,8 @@ Now generate only the final answer."""
             if lang == "ar"
             else "Sorry, I couldn't generate a response. Please try again."
         )
+
+    # ── 11. Auto-learn ────────────────────────────────────────────────
     maybe_learn_from_interaction(
         user_message=user_message,
         reply_text=reply_text,
@@ -1976,7 +2176,8 @@ Now generate only the final answer."""
         child_age=age,
         conn_factory=get_conn,
     )
-    # ── 11. Persist to DB ─────────────────────────────────────────────
+
+    # ── 12. Persist to DB ─────────────────────────────────────────────
     message_id = "msg_" + uuid.uuid4().hex[:10]
     try:
         conn = get_conn()
@@ -1993,19 +2194,19 @@ Now generate only the final answer."""
         finally:
             conn.close()
     except Exception as db_exc:
-        # DB persistence failure should not block the reply
         print(f"[CHAT] DB persistence error (non-fatal): {db_exc}")
 
-    # ── 12. Return clean response ─────────────────────────────────────
+    # ── 13. Return ────────────────────────────────────────────────────
     return ChatResponse(reply=reply_text)
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — PARENTING PLAN
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str):
-    """Generate a personalised 30-day parenting plan (always in English)."""
+    """Generate a personalised 30-day parenting plan (English)."""
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini is disabled. Set GEMINI_API_KEY.")
 
@@ -2044,7 +2245,7 @@ def generate_parenting_plan(user_id: str):
         archetype_desc  = top_arch_entry.get("description", "")
         archetype_needs = top_arch_entry.get("needs",       "")
 
-        traits_text = "\n".join(f"  - {t_['trait'].replace('_', ' ').title()}: {t_['score']}%" for t_ in top_traits) or "  - No data"
+        traits_text = "\n".join(f"  - {tr['trait'].replace('_', ' ').title()}: {tr['score']}%" for tr in top_traits) or "  - No data"
         scores_text = "\n".join(f"  - {k.replace('_', ' ').title()}: {v}%" for k, v in trait_scores.items()) or "  - No data"
 
         try:
@@ -2128,7 +2329,7 @@ def generate_parenting_plan(user_id: str):
                     except Exception:
                         pass
 
-        response: Dict[str, Any] = {
+        response_payload: Dict[str, Any] = {
             "ok":                True,
             "message":           t("plan_created_title", lang),
             "user_id":           user_id,
@@ -2142,8 +2343,8 @@ def generate_parenting_plan(user_id: str):
             "plan_text":         plan_text,
         }
         if notification_warning:
-            response["notification_warning"] = notification_warning
-        return response
+            response_payload["notification_warning"] = notification_warning
+        return response_payload
 
     except HTTPException:
         raise
@@ -2180,12 +2381,13 @@ def get_parenting_plans(user_id: str, limit: int = 10):
         conn.close()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
 # ROUTES — PDF EXPORT
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
 def export_plan_pdf(user_id: str):
-    """Export the latest parenting plan as a PDF (always English)."""
+    """Export the latest parenting plan as a PDF (English)."""
     if not _REPORTLAB_AVAILABLE:
         raise HTTPException(status_code=503, detail=t("pdf_unavailable", "en"))
 
