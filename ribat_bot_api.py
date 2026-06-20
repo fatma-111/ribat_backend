@@ -1,11 +1,17 @@
 """
-Rafiq Bot API — PRODUCTION v4.3
+Rafiq Bot API — PRODUCTION v4.4
 ================================
-Changes in v4.3 vs v4.2:
-- MERGED auto_learning.py directly into main.py (no separate file/import)
-- ADDED strip_markdown() to remove bold/italic markers from all AI responses
-- REMOVED unused imports
-- CLEANED UP duplicate helpers and organised into clear sections
+Changes in v4.4 vs v4.3:
+- FIXED auto-learning subsystem (5 bugs — see AUTO-LEARNING section comments)
+  1. Logger level raised to INFO so rejections appear in Railway logs
+  2. _al_passes_quality_gate now logs at INFO (was DEBUG, invisible in prod)
+  3. _al_is_duplicate no longer swallows exceptions silently; raises so caller
+     can detect a broken psycopg2 connection before attempting the INSERT
+  4. maybe_learn_from_interaction now uses TWO separate DB connections:
+     one read-only for dedup, one fresh write connection for INSERT — prevents
+     psycopg2 InFailedSqlTransaction from silently aborting the insert
+  5. _al_insert_learned_pair guards fetchone() returning None and logs
+     every step (pre-commit, commit, rollback) at INFO/ERROR level
 """
 
 from dotenv import load_dotenv
@@ -289,7 +295,7 @@ def _register_fonts() -> None:
 
 app = FastAPI(
     title="Rafiq Bot API",
-    version="4.3.0",
+    version="4.4.0",
     description="Family support & parenting assistant API — bilingual (ar/en) | FTS-based retrieval",
 )
 app.add_middleware(
@@ -865,14 +871,49 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
 # ══════════════════════════════════════════════
 # AUTO-LEARNING  (merged from auto_learning.py)
 # ══════════════════════════════════════════════
+#
+# FIX SUMMARY (v4.4):
+#
+# BUG 1 — Logger was inheriting root level (WARNING), so all debug/info
+#          calls were invisible in Railway. Fixed: set level to INFO and
+#          attach a StreamHandler so every gate decision is always visible.
+#
+# BUG 2 — _al_passes_quality_gate logged rejections at DEBUG level only.
+#          Fixed: now logs at INFO so every rejection appears in Railway.
+#
+# BUG 3 — _al_is_duplicate swallowed DB exceptions and returned False.
+#          This left the psycopg2 connection in aborted-transaction state
+#          (InFailedSqlTransaction). The subsequent INSERT on the SAME
+#          connection then silently failed. Fixed: exceptions now propagate
+#          so the caller can detect and handle a broken connection.
+#
+# BUG 4 — maybe_learn_from_interaction shared one connection between the
+#          dedup SELECT and the INSERT. A failed SELECT aborted the tx,
+#          making the INSERT fail with "insert returned no id".
+#          Fixed: two separate short-lived connections — one read-only for
+#          dedup, one fresh write connection for INSERT + COMMIT.
+#
+# BUG 5 — _al_insert_learned_pair did not guard fetchone() returning None
+#          (possible if a trigger/constraint silently rejected the row).
+#          Fixed: explicit None check, rollback, and ERROR log.
+# ══════════════════════════════════════════════
 
 _autolearn_logger = logging.getLogger("rafiq.autolearn")
 
+# FIX 1 — ensure INFO messages are always visible regardless of root logger config
+if not _autolearn_logger.handlers:
+    _al_handler = logging.StreamHandler()
+    _al_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    _autolearn_logger.addHandler(_al_handler)
+_autolearn_logger.setLevel(logging.INFO)
+
 # Quality thresholds
-_AL_MIN_QUESTION_LEN = 15
-_AL_MIN_ANSWER_LEN   = 60
-_AL_MAX_ANSWER_LEN   = 3000
-_AL_SIMILARITY_THRESHOLD = 0.75
+_AL_MIN_QUESTION_LEN      = 15
+_AL_MIN_ANSWER_LEN        = 60
+_AL_MAX_ANSWER_LEN        = 3000
+_AL_SIMILARITY_THRESHOLD  = 0.75
 
 _AL_LEARNABLE_TOPICS = {
     "teen_communication", "anger", "screen_addiction", "bullying",
@@ -921,47 +962,88 @@ def _al_token_overlap(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# ── FIX 2: every rejection path now logs at INFO (was DEBUG) ──────────
 def _al_passes_quality_gate(
     question: str,
     answer: str,
     topic: str,
 ) -> Tuple[bool, str]:
     q, a = question.strip(), answer.strip()
+
     if len(q) < _AL_MIN_QUESTION_LEN:
-        return False, f"question too short ({len(q)} chars)"
+        reason = f"question too short ({len(q)} chars, min={_AL_MIN_QUESTION_LEN})"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if len(a) < _AL_MIN_ANSWER_LEN:
-        return False, f"answer too short ({len(a)} chars)"
+        reason = f"answer too short ({len(a)} chars, min={_AL_MIN_ANSWER_LEN})"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if len(a) > _AL_MAX_ANSWER_LEN:
-        return False, f"answer too long ({len(a)} chars)"
+        reason = f"answer too long ({len(a)} chars, max={_AL_MAX_ANSWER_LEN})"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if topic not in _AL_LEARNABLE_TOPICS:
-        return False, f"topic '{topic}' not learnable"
+        reason = f"topic '{topic}' not learnable"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if _AL_CLARIFICATION_RE.search(a):
-        return False, "answer contains clarifying question"
+        reason = "answer contains clarifying question (matched _AL_CLARIFICATION_RE)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if _AL_GENERIC_RE.match(a):
-        return False, "answer is a generic/error response"
+        reason = "answer is a generic/error response (matched _AL_GENERIC_RE)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
     if len(q.split()) < 4:
-        return False, f"question too fragmented ({len(q.split())} words)"
+        reason = f"question too fragmented ({len(q.split())} words, min=4)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
+        return False, reason
+
+    _autolearn_logger.info(
+        "[autolearn] quality-gate PASS — topic=%s q_len=%d a_len=%d",
+        topic, len(q), len(a),
+    )
     return True, "ok"
 
 
+# ── FIX 3: no longer swallows exceptions — raises so the caller knows ─
+#    the connection is broken and must NOT be reused for the INSERT      ─
 def _al_is_duplicate(conn: Any, question: str, topic: str, lang: str) -> bool:
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT question FROM faq_knowledge_base WHERE topic=%s AND lang=%s "
-            "ORDER BY created_at DESC LIMIT 200",
-            (topic, lang),
-        )
-        rows = cur.fetchall()
-        for (stored_q,) in rows:
-            if _al_token_overlap(question, stored_q) >= _AL_SIMILARITY_THRESHOLD:
-                return True
-        return False
-    except Exception as exc:
-        _autolearn_logger.warning("[autolearn] dedup check failed (non-fatal): %s", exc)
-        return False
+    """
+    Returns True if a sufficiently similar question already exists in the DB.
+    Raises on any DB error so the caller can handle a broken connection
+    rather than proceeding with an INSERT on an aborted transaction.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT question FROM faq_knowledge_base WHERE topic=%s AND lang=%s "
+        "ORDER BY created_at DESC LIMIT 200",
+        (topic, lang),
+    )
+    rows = cur.fetchall()
+    _autolearn_logger.info(
+        "[autolearn] dedup check — topic=%s lang=%s candidates=%d",
+        topic, lang, len(rows),
+    )
+    for (stored_q,) in rows:
+        similarity = _al_token_overlap(question, stored_q)
+        if similarity >= _AL_SIMILARITY_THRESHOLD:
+            _autolearn_logger.info(
+                "[autolearn] duplicate detected — similarity=%.2f stored_q_preview='%s'",
+                similarity, stored_q[:60],
+            )
+            return True
+    _autolearn_logger.info("[autolearn] no duplicate found")
+    return False
 
 
+# ── FIX 5: guard fetchone() returning None; log every step explicitly ─
 def _al_insert_learned_pair(
     conn: Any,
     question: str,
@@ -975,6 +1057,11 @@ def _al_insert_learned_pair(
         tags.append(f"age_{child_age}")
     tags.append("auto_learned")
 
+    _autolearn_logger.info(
+        "[autolearn] attempting INSERT — topic=%s lang=%s tags=%s q_len=%d a_len=%d",
+        topic, lang, tags, len(question), len(answer),
+    )
+
     try:
         cur = conn.cursor()
         cur.execute(
@@ -986,15 +1073,44 @@ def _al_insert_learned_pair(
             """,
             (topic, question, answer, tags, lang),
         )
-        new_id = cur.fetchone()[0]
+
+        # FIX 5 — fetchone() can return None if a trigger or constraint
+        # silently rejected the row without raising an exception.
+        row = cur.fetchone()
+        if row is None:
+            _autolearn_logger.error(
+                "[autolearn] INSERT executed but RETURNING id returned None — "
+                "possible trigger/constraint rejection. Rolling back."
+            )
+            conn.rollback()
+            return None
+
+        new_id = row[0]
+        _autolearn_logger.info(
+            "[autolearn] INSERT successful id=%s (pre-commit)", new_id
+        )
+
         conn.commit()
+        _autolearn_logger.info(
+            "[autolearn] COMMIT successful — id=%s is now persisted in DB", new_id
+        )
         return new_id
+
     except Exception as exc:
-        conn.rollback()
-        _autolearn_logger.error("[autolearn] DB insert failed: %s", exc)
+        _autolearn_logger.error(
+            "[autolearn] INSERT/COMMIT failed — error=%s", exc, exc_info=True
+        )
+        try:
+            conn.rollback()
+            _autolearn_logger.info("[autolearn] rollback completed after insert failure")
+        except Exception as rb_exc:
+            _autolearn_logger.error(
+                "[autolearn] rollback itself failed: %s", rb_exc
+            )
         return None
 
 
+# ── FIX 4: two separate connections — dedup on its own, INSERT on a fresh one ─
 def maybe_learn_from_interaction(
     user_message: str,
     reply_text: str,
@@ -1008,39 +1124,118 @@ def maybe_learn_from_interaction(
     Evaluates quality, deduplicates, and persists high-value Q/A pairs
     into faq_knowledge_base for future FTS retrieval.
     All failures are caught — the /chat response is never affected.
+
+    Two separate DB connections are used:
+      1. dedup_conn  — read-only SELECT for duplicate detection, closed immediately.
+      2. write_conn  — fresh connection for INSERT + COMMIT.
+    This prevents a failed SELECT from leaving the psycopg2 connection in
+    an aborted-transaction state (InFailedSqlTransaction) that would
+    silently kill the subsequent INSERT.
     """
+    _autolearn_logger.info(
+        "[autolearn] maybe_learn_from_interaction called — "
+        "topic=%s lang=%s child_age=%s q_len=%d a_len=%d",
+        topic, lang, child_age, len(user_message), len(reply_text),
+    )
+
     try:
+        # ── Step 1: Quality gate ──────────────────────────────────────
         should_store, reason = _al_passes_quality_gate(user_message, reply_text, topic)
         if not should_store:
-            _autolearn_logger.debug("[autolearn] skipped — %s", reason)
+            # Rejection already logged inside _al_passes_quality_gate
             return
 
-        conn = conn_factory()
+        # ── Step 2: Duplicate check on its own dedicated connection ──
+        # If this connection or query fails for any reason, we skip the
+        # insert entirely (safer than risking a duplicate).
         try:
-            if _al_is_duplicate(conn, user_message, topic, lang):
-                _autolearn_logger.debug("[autolearn] skipped — duplicate detected")
-                return
+            dedup_conn = conn_factory()
+        except Exception as conn_exc:
+            _autolearn_logger.error(
+                "[autolearn] could not open dedup DB connection — skipping. error=%s",
+                conn_exc, exc_info=True,
+            )
+            return
 
+        try:
+            is_dup = _al_is_duplicate(dedup_conn, user_message, topic, lang)
+        except Exception as dedup_exc:
+            # _al_is_duplicate raised — the connection may be in a broken
+            # state; we skip the insert to avoid writing a duplicate.
+            _autolearn_logger.error(
+                "[autolearn] dedup check raised an exception — skipping insert "
+                "to avoid duplicates. error=%s", dedup_exc, exc_info=True,
+            )
+            try:
+                dedup_conn.rollback()
+            except Exception:
+                pass
+            try:
+                dedup_conn.close()
+            except Exception:
+                pass
+            return
+        finally:
+            # Always close the dedup connection whether or not an exception occurred
+            try:
+                dedup_conn.close()
+                _autolearn_logger.info("[autolearn] dedup connection closed")
+            except Exception as close_exc:
+                _autolearn_logger.warning(
+                    "[autolearn] could not close dedup connection: %s", close_exc
+                )
+
+        if is_dup:
+            _autolearn_logger.info("[autolearn] skipped — duplicate detected")
+            return
+
+        # ── Step 3: INSERT on a brand-new connection ─────────────────
+        # A fresh connection guarantees a clean transaction state,
+        # completely independent of anything that happened during dedup.
+        try:
+            write_conn = conn_factory()
+        except Exception as conn_exc:
+            _autolearn_logger.error(
+                "[autolearn] could not open write DB connection — skipping. error=%s",
+                conn_exc, exc_info=True,
+            )
+            return
+
+        try:
             new_id = _al_insert_learned_pair(
-                conn=conn,
+                conn=write_conn,
                 question=user_message,
                 answer=reply_text,
                 topic=topic,
                 lang=lang,
                 child_age=child_age,
             )
-            if new_id:
+            if new_id is not None:
                 _autolearn_logger.info(
-                    "[autolearn] learned id=%s | topic=%s | lang=%s | q_len=%d | a_len=%d",
+                    "[autolearn] SUCCESS — learned id=%s | topic=%s | lang=%s | "
+                    "q_len=%d | a_len=%d",
                     new_id, topic, lang, len(user_message), len(reply_text),
                 )
             else:
-                _autolearn_logger.warning("[autolearn] insert returned no id")
+                _autolearn_logger.error(
+                    "[autolearn] FAILED — insert returned None "
+                    "(see errors above) | topic=%s lang=%s",
+                    topic, lang,
+                )
         finally:
-            conn.close()
+            try:
+                write_conn.close()
+                _autolearn_logger.info("[autolearn] write connection closed")
+            except Exception as close_exc:
+                _autolearn_logger.warning(
+                    "[autolearn] could not close write connection: %s", close_exc
+                )
 
     except Exception as exc:
-        _autolearn_logger.error("[autolearn] unexpected error (non-fatal): %s", exc)
+        _autolearn_logger.error(
+            "[autolearn] unexpected top-level error (non-fatal): %s",
+            exc, exc_info=True,
+        )
 
 
 # ══════════════════════════════════════════════
@@ -1619,7 +1814,7 @@ def gemini_generate_parenting_plan(
 
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "4.3.0",
+    return {"status": "Rafiq running 🚀", "version": "4.4.0",
             "retrieval": "PostgreSQL FTS (tsvector/tsquery) — no pgvector"}
 
 
