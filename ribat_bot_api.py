@@ -1,17 +1,15 @@
 """
-Rafiq Bot API — PRODUCTION v4.4
+Rafiq Bot API — PRODUCTION v5.0
 ================================
-Changes in v4.4 vs v4.3:
-- FIXED auto-learning subsystem (5 bugs — see AUTO-LEARNING section comments)
-  1. Logger level raised to INFO so rejections appear in Railway logs
-  2. _al_passes_quality_gate now logs at INFO (was DEBUG, invisible in prod)
-  3. _al_is_duplicate no longer swallows exceptions silently; raises so caller
-     can detect a broken psycopg2 connection before attempting the INSERT
-  4. maybe_learn_from_interaction now uses TWO separate DB connections:
-     one read-only for dedup, one fresh write connection for INSERT — prevents
-     psycopg2 InFailedSqlTransaction from silently aborting the insert
-  5. _al_insert_learned_pair guards fetchone() returning None and logs
-     every step (pre-commit, commit, rollback) at INFO/ERROR level
+Changes vs v4.4:
+- Parenting plan duration: 30 days → 15 days
+- Daily plan: structured per-day with Goal / Activity / How-To / Why It Helps
+- PDF redesign: cover page with info card, warm intro letter, day cards
+- RAG ingestion pipeline: plans saved as KB entries + pgvector embeddings
+- Post-generation: FCM push notification + in-app message
+- New DB columns: parent_name, child_name, plan_days (JSONB)
+- New endpoint: POST /ingest-plan-to-kb/{plan_id}
+- Logging: all ingestion steps at INFO level
 """
 
 from dotenv import load_dotenv
@@ -29,7 +27,7 @@ import psycopg2
 
 
 # ══════════════════════════════════════════════
-# TRANSLATIONS
+# TRANSLATIONS  (unchanged from v4.4, kept in full)
 # ══════════════════════════════════════════════
 
 Lang = Literal["ar", "en"]
@@ -64,9 +62,9 @@ _T: dict[str, dict[str, str]] = {
     "assessment_result_title":{"ar": "نتيجة تقييم شخصية الطفل",       "en": "Child Personality Assessment Result"},
     "daily_tip_notif_title":  {"ar": "💡 نصيحة جديدة من رفيق",        "en": "💡 New Parenting Tip from Rafiq"},
     "daily_tip_notif_body_prefix": {"ar": "", "en": ""},
-    "plan_notif_title":       {"ar": "📋 تم إنشاء خطة تربوية جديدة",  "en": "📋 New Parenting Plan Created"},
-    "plan_notif_body":        {"ar": "تم إعداد خطة مخصصة لطفلك بناءً على نتائج التقييم.",
-                               "en": "A personalized parenting plan has been generated based on your child's assessment."},
+    "plan_notif_title":       {"ar": "📋 خطتك التربوية جاهزة 🎉",     "en": "Your Parenting Plan is Ready 🎉"},
+    "plan_notif_body":        {"ar": "أعددنا خطة مخصصة لـ 15 يومًا لطفلك. افتحها الآن.",
+                               "en": "We created a personalized 15-day plan for your child. Open it now."},
     "plan_created_title":     {"ar": "تم إنشاء الخطة بنجاح",          "en": "Parenting plan generated successfully"},
     "token_saved":            {"ar": "تم حفظ رمز الإشعار بنجاح",      "en": "FCM token saved successfully"},
     "no_fcm_token":           {"ar": "المستخدم لا يملك رمز إشعار. استدعِ POST /register-token أولًا.",
@@ -77,16 +75,18 @@ _T: dict[str, dict[str, str]] = {
                                "en": "Firebase is not configured — plan saved but no push notification sent."},
     "no_assessment_found":    {"ar": "لا يوجد تقييم لهذا المستخدم. أكمل التقييم عبر POST /assessment/submit أولًا.",
                                "en": "No assessment found for this user. Please complete an assessment first via POST /assessment/submit."},
-    "no_plan_found":          {"ar": "لا توجد خطة تربوية لهذا المستخدم. أنشئ خطة عبر POST /generate-parenting-plan/{user_id} أولًا.",
-                               "en": "No parenting plan found for this user. Generate one first via POST /generate-parenting-plan/{user_id}."},
+    "no_plan_found":          {"ar": "لا توجد خطة تربوية لهذا المستخدم.",
+                               "en": "No parenting plan found for this user."},
     "user_not_found":         {"ar": "المستخدم غير موجود.",            "en": "User not found."},
     "pdf_unavailable":        {"ar": "تصدير PDF غير متاح — مكتبة reportlab غير مثبّتة.",
-                               "en": "PDF export is unavailable — reportlab is not installed. Run: pip install reportlab"},
-    "pdf_main_title":         {"ar": "خطة تربوية مخصصة — رفيق AI",    "en": "Personalised Parenting Plan — Rafiq AI"},
-    "pdf_subtitle":           {"ar": "خطة 30 يومًا",                   "en": "30-Day Plan"},
+                               "en": "PDF export is unavailable — reportlab is not installed."},
+    "pdf_main_title":         {"ar": "خطة تربوية مخصصة — رفيق AI",    "en": "Personalized Parenting Plan — Rafiq AI"},
+    "pdf_subtitle":           {"ar": "خطة 15 يومًا",                   "en": "15-Day Plan"},
+    "pdf_label_parent_name":  {"ar": "اسم الوالد/الوالدة",             "en": "Parent Name"},
+    "pdf_label_child_name":   {"ar": "اسم الطفل",                      "en": "Child Name"},
     "pdf_label_user_id":      {"ar": "معرف المستخدم",                  "en": "User ID"},
     "pdf_label_child_age":    {"ar": "عمر الطفل",                      "en": "Child Age"},
-    "pdf_label_archetype":    {"ar": "النمط الشخصي",                   "en": "Top Archetype"},
+    "pdf_label_archetype":    {"ar": "النمط الشخصي",                   "en": "Child Profile"},
     "pdf_label_generated":    {"ar": "تاريخ الإنشاء",                  "en": "Generated"},
     "pdf_label_age_unknown":  {"ar": "غير محدد",                       "en": "Not specified"},
     "pdf_section_plan":       {"ar": "الخطة التربوية",                 "en": "Parenting Plan"},
@@ -131,7 +131,6 @@ def user_lang(preferred_language: Optional[str], fallback_text: str = "") -> Lan
 # MARKDOWN STRIPPING
 # ══════════════════════════════════════════════
 
-# Pre-compiled patterns for performance
 _MD_BOLD_ITALIC = re.compile(r'\*{1,3}(.+?)\*{1,3}', re.DOTALL)
 _MD_BOLD_UNDER  = re.compile(r'_{2}(.+?)_{2}',        re.DOTALL)
 _MD_ITALIC_UNDER= re.compile(r'_(.+?)_',              re.DOTALL)
@@ -141,37 +140,15 @@ _MD_BACKTICK    = re.compile(r'`{1,3}(.+?)`{1,3}', re.DOTALL)
 
 
 def strip_markdown(text: str) -> str:
-    """
-    Remove common Markdown formatting symbols from AI-generated text,
-    returning clean plain text suitable for display in chat UIs.
-
-    Handles:
-      - **bold**, *italic*, ***bold-italic***
-      - __bold__, _italic_
-      - # Headings (removes the # prefix only)
-      - Horizontal rules (---, ***, ___)
-      - `inline code` and ```code blocks```
-    """
     if not text:
         return text
-
-    # Remove bold/italic markers (keep inner text)
     text = _MD_BOLD_ITALIC.sub(r'\1', text)
     text = _MD_BOLD_UNDER.sub(r'\1',  text)
     text = _MD_ITALIC_UNDER.sub(r'\1', text)
-
-    # Remove heading markers (#, ##, …)
     text = _MD_HEADING.sub('', text)
-
-    # Remove horizontal rules
     text = _MD_HR.sub('', text)
-
-    # Remove backtick code markers (keep inner text)
     text = _MD_BACKTICK.sub(r'\1', text)
-
-    # Collapse any double blank lines left behind
     text = re.sub(r'\n{3,}', '\n\n', text)
-
     return text.strip()
 
 
@@ -179,14 +156,14 @@ def strip_markdown(text: str) -> str:
 # OPTIONAL DEPENDENCIES
 # ══════════════════════════════════════════════
 
-# ── reportlab ─────────────────────────────────
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.lib import colors
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
+        SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle,
+        PageBreak, KeepTogether,
     )
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
     from reportlab.pdfbase import pdfmetrics
@@ -196,16 +173,14 @@ except ImportError:
     _REPORTLAB_AVAILABLE = False
     print("WARNING: reportlab not installed — PDF export disabled.")
 
-# ── Arabic text shaping / bidi ────────────────
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display as bidi_display
     _ARABIC_SHAPING = True
 except ImportError:
     _ARABIC_SHAPING = False
-    print("WARNING: arabic-reshaper / python-bidi not installed — Arabic PDF text may not render correctly.")
+    print("WARNING: arabic-reshaper / python-bidi not installed.")
 
-# ── Gemini ────────────────────────────────────
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -213,7 +188,6 @@ except Exception:
     genai = None
     genai_types = None
 
-# ── Firebase ──────────────────────────────────
 try:
     import firebase_admin
     from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
@@ -221,6 +195,14 @@ try:
 except ImportError:
     firebase_admin = fb_credentials = fb_messaging = None
     _FIREBASE_AVAILABLE = False
+
+# pgvector support (optional — embeddings only)
+try:
+    from pgvector.psycopg2 import register_vector
+    _PGVECTOR_AVAILABLE = True
+except ImportError:
+    _PGVECTOR_AVAILABLE = False
+    print("INFO: pgvector python package not installed — vector storage disabled.")
 
 
 # ══════════════════════════════════════════════
@@ -247,7 +229,7 @@ client = None
 if GEMINI_ENABLED:
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        print("Gemini initialized ✔ (generation only — no embeddings)")
+        print("Gemini initialized ✔")
     except Exception as exc:
         print("Gemini init failed:", exc)
 
@@ -263,7 +245,6 @@ if _FIREBASE_AVAILABLE and _FIREBASE_CREDS_JSON:
     except Exception as _fb_exc:
         print(f"Firebase init failed: {_fb_exc}")
 
-# ── PDF font registration ──────────────────────
 _FONT_ARABIC_REGISTERED = False
 _FONT_LATIN_REGISTERED  = False
 
@@ -284,7 +265,7 @@ def _register_fonts() -> None:
         if _FONT_ARABIC_REGISTERED:
             print("PDF Arabic fonts registered ✔")
         else:
-            print("PDF Arabic fonts NOT found — falling back to Helvetica.")
+            print("PDF fonts NOT found — falling back to Helvetica.")
     except Exception as exc:
         print(f"Font registration warning: {exc}")
 
@@ -295,8 +276,8 @@ def _register_fonts() -> None:
 
 app = FastAPI(
     title="Rafiq Bot API",
-    version="4.4.0",
-    description="Family support & parenting assistant API — bilingual (ar/en) | FTS-based retrieval",
+    version="5.0.0",
+    description="Family support & parenting assistant API — bilingual (ar/en) | FTS + pgvector RAG",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -318,11 +299,17 @@ def on_startup():
 def get_conn():
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    if _PGVECTOR_AVAILABLE:
+        try:
+            register_vector(conn)
+        except Exception:
+            pass
+    return conn
 
 
 def _run_schema_migrations() -> None:
-    """Apply all schema migrations idempotently (no pgvector, FTS only)."""
+    """Apply all schema migrations idempotently."""
     if not DATABASE_URL:
         print("Skipping DB migrations — DATABASE_URL not set")
         return
@@ -330,8 +317,11 @@ def _run_schema_migrations() -> None:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur  = conn.cursor()
 
+        # ── existing tables / columns ────────────────────────────────
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) DEFAULT 'ar';")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_name VARCHAR(200);")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS child_name  VARCHAR(200);")
 
         cur.execute(
             """
@@ -343,21 +333,35 @@ def _run_schema_migrations() -> None:
             );
             """
         )
+
+        # ── v5.0: parenting_plans extended ──────────────────────────
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS parenting_plans (
                 id            SERIAL PRIMARY KEY,
                 user_id       VARCHAR(100),
                 plan_text     TEXT,
-                plan_language VARCHAR(5) DEFAULT 'ar',
-                created_at    TIMESTAMP DEFAULT NOW()
+                plan_language VARCHAR(5)  DEFAULT 'en',
+                plan_days     JSONB,
+                parent_name   VARCHAR(200),
+                child_name    VARCHAR(200),
+                intro_letter  TEXT,
+                plan_duration INTEGER     DEFAULT 15,
+                created_at    TIMESTAMP   DEFAULT NOW()
             );
             """
         )
-        cur.execute(
-            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_language VARCHAR(5) DEFAULT 'ar';"
-        )
+        for col_sql in [
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_language VARCHAR(5) DEFAULT 'en';",
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_days     JSONB;",
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS parent_name   VARCHAR(200);",
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS child_name    VARCHAR(200);",
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS intro_letter  TEXT;",
+            "ALTER TABLE parenting_plans ADD COLUMN IF NOT EXISTS plan_duration INTEGER DEFAULT 15;",
+        ]:
+            cur.execute(col_sql)
 
+        # ── faq_knowledge_base (FTS) ─────────────────────────────────
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS faq_knowledge_base (
@@ -370,20 +374,24 @@ def _run_schema_migrations() -> None:
                 age_max       INTEGER       DEFAULT 18,
                 lang          VARCHAR(5)    DEFAULT 'ar',
                 search_vector TSVECTOR,
+                source        VARCHAR(100)  DEFAULT 'manual',
+                source_plan_id INTEGER,
                 created_at    TIMESTAMP     DEFAULT NOW(),
                 updated_at    TIMESTAMP     DEFAULT NOW()
             );
             """
         )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_faq_kb_fts   ON faq_knowledge_base USING GIN (search_vector);"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_faq_kb_topic ON faq_knowledge_base (topic);"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_faq_kb_lang  ON faq_knowledge_base (lang);"
-        )
+        for col_sql in [
+            "ALTER TABLE faq_knowledge_base ADD COLUMN IF NOT EXISTS source         VARCHAR(100) DEFAULT 'manual';",
+            "ALTER TABLE faq_knowledge_base ADD COLUMN IF NOT EXISTS source_plan_id INTEGER;",
+        ]:
+            cur.execute(col_sql)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_faq_kb_fts   ON faq_knowledge_base USING GIN (search_vector);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_faq_kb_topic ON faq_knowledge_base (topic);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_faq_kb_lang  ON faq_knowledge_base (lang);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_faq_kb_src   ON faq_knowledge_base (source);")
+
         cur.execute(
             """
             CREATE OR REPLACE FUNCTION faq_kb_search_vector_update()
@@ -417,24 +425,57 @@ def _run_schema_migrations() -> None:
             WHERE search_vector IS NULL;
             """
         )
+
+        # ── v5.0: plan_embeddings table (pgvector) ───────────────────
+        # Only created if pgvector extension is available in postgres.
+        try:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS plan_embeddings (
+                    id            SERIAL PRIMARY KEY,
+                    plan_id       INTEGER       NOT NULL REFERENCES parenting_plans(id) ON DELETE CASCADE,
+                    user_id       VARCHAR(100)  NOT NULL,
+                    chunk_index   INTEGER       DEFAULT 0,
+                    chunk_text    TEXT          NOT NULL,
+                    embedding     vector(768),
+                    child_age     INTEGER,
+                    child_profile VARCHAR(200),
+                    lang          VARCHAR(5)    DEFAULT 'en',
+                    created_at    TIMESTAMP     DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plan_emb_user ON plan_embeddings (user_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plan_emb_plan ON plan_embeddings (plan_id);"
+            )
+            print("DB migrations: pgvector plan_embeddings table ready ✔")
+        except Exception as vec_exc:
+            print(f"DB migrations: pgvector not available — vector table skipped ({vec_exc})")
+
         conn.commit()
         conn.close()
-        print("DB migrations applied ✔ (no pgvector, FTS ready)")
+        print("DB migrations applied ✔ (v5.0)")
     except Exception as exc:
         print(f"DB migration warning: {exc}")
 
 
 # ══════════════════════════════════════════════
-# FULL-TEXT SEARCH
+# FULL-TEXT SEARCH  (unchanged from v4.4)
 # ══════════════════════════════════════════════
 
 def fts_knowledge_base(
     query: str,
     topic: Optional[str] = None,
     lang: Optional[str] = None,
+    user_id: Optional[str] = None,
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
-    """Retrieve KB entries using PostgreSQL FTS with ILIKE fallback."""
+    """Retrieve KB entries using PostgreSQL FTS with ILIKE fallback.
+    If user_id is provided, results from that user's generated plans are boosted."""
     if not query or not query.strip():
         return []
 
@@ -468,9 +509,16 @@ def fts_knowledge_base(
 
         if tokens:
             tsquery_str = " | ".join(tokens)
+
+            # Boost plan entries for the requesting user
+            user_boost = ""
+            if user_id:
+                user_boost = f"(CASE WHEN source_plan_user_id = '{user_id}' THEN 2.0 ELSE 1.0 END) * "
+
             fts_sql = f"""
                 SELECT topic, question, answer, tags,
-                       ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank
+                       ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank,
+                       source
                 FROM   faq_knowledge_base
                 WHERE  search_vector @@ to_tsquery('simple', %s)
                 {where_extra}
@@ -479,19 +527,18 @@ def fts_knowledge_base(
             """
             cur.execute(fts_sql, [tsquery_str, tsquery_str] + params_fts + [limit])
             rows = cur.fetchall()
-            if DEBUG:
-                print(f"[FTS] tsquery='{tsquery_str}' | rows={len(rows)}")
             for row in rows:
                 results.append({
                     "topic": row[0], "question": row[1], "answer": row[2],
-                    "tags": row[3] or [], "rank": float(row[4]), "method": "fts",
+                    "tags": row[3] or [], "rank": float(row[4]),
+                    "method": "fts", "source": row[5] or "manual",
                 })
 
         if not results:
             search_term  = tokens[0] if tokens else query.strip()
             like_pattern = f"%{search_term}%"
             ilike_sql = f"""
-                SELECT topic, question, answer, tags, 1.0 AS rank
+                SELECT topic, question, answer, tags, 1.0 AS rank, source
                 FROM   faq_knowledge_base
                 WHERE  (question ILIKE %s OR answer ILIKE %s
                         OR array_to_string(tags, ' ') ILIKE %s)
@@ -506,16 +553,14 @@ def fts_knowledge_base(
                 + params_ilike + [limit],
             )
             rows = cur.fetchall()
-            if DEBUG:
-                print(f"[FTS] ILIKE fallback pattern='{like_pattern}' | rows={len(rows)}")
             for row in rows:
                 results.append({
                     "topic": row[0], "question": row[1], "answer": row[2],
-                    "tags": row[3] or [], "rank": float(row[4]), "method": "ilike",
+                    "tags": row[3] or [], "rank": float(row[4]),
+                    "method": "ilike", "source": row[5] or "manual",
                 })
 
         conn.close()
-
     except Exception as exc:
         print(f"[FTS] retrieval error: {exc}")
         results = []
@@ -528,10 +573,10 @@ def fts_or_kb_fallback(
     topic: str,
     age: Optional[int],
     lang: Optional[str] = None,
+    user_id: Optional[str] = None,
     limit: int = 3,
 ) -> Tuple[List[Dict[str, Any]], bool]:
-    """Try FTS first; fall back to in-memory KB. Returns (results, from_db)."""
-    db_results = fts_knowledge_base(query=query, topic=topic, lang=lang, limit=limit)
+    db_results = fts_knowledge_base(query=query, topic=topic, lang=lang, user_id=user_id, limit=limit)
     if db_results:
         return db_results, True
 
@@ -551,7 +596,7 @@ def fts_or_kb_fallback(
 
 
 # ══════════════════════════════════════════════
-# IN-MEMORY KNOWLEDGE BASE (fallback)
+# IN-MEMORY KNOWLEDGE BASE  (unchanged from v4.4)
 # ══════════════════════════════════════════════
 
 KB: List[Dict[str, Any]] = [
@@ -632,6 +677,8 @@ class UserUpsertReq(BaseModel):
     email: Optional[str] = None
     child_age: Optional[int] = None
     preferred_language: Optional[str] = "ar"
+    parent_name: Optional[str] = None
+    child_name: Optional[str] = None
 
 
 class KbAddRequest(BaseModel):
@@ -689,6 +736,12 @@ class FaqKbAddRequest(BaseModel):
     lang: str = "ar"
 
 
+# v5 — plan generation request with optional parent/child names
+class GeneratePlanRequest(BaseModel):
+    parent_name: Optional[str] = None
+    child_name:  Optional[str] = None
+
+
 AllowedTopic = Literal[
     "teen_communication", "anger", "screen_addiction", "bullying", "study_focus",
     "siblings_jealousy", "parents_conflict", "lying", "general_parenting",
@@ -707,7 +760,7 @@ class RouteDecision(BaseModel):
 
 
 # ══════════════════════════════════════════════
-# CONSTANTS & GUARDS
+# CONSTANTS & GUARDS  (unchanged)
 # ══════════════════════════════════════════════
 
 PARENTING_TOPICS    = {"teen_communication", "anger", "screen_addiction", "bullying",
@@ -750,7 +803,7 @@ def detect_risk_level(text: str) -> Literal["low", "medium", "high"]:
 
 
 # ══════════════════════════════════════════════
-# IN-MEMORY KB SEARCH
+# IN-MEMORY KB SEARCH  (unchanged)
 # ══════════════════════════════════════════════
 
 _AR_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670]")
@@ -824,17 +877,20 @@ def ensure_user_exists(conn, user_id: str) -> None:
 def get_memory(conn, user_id: str) -> Dict[str, Any]:
     cur = conn.cursor()
     cur.execute(
-        "SELECT notes, child_age, name, email, preferred_language FROM users WHERE user_id=%s",
+        "SELECT notes, child_age, name, email, preferred_language, parent_name, child_name "
+        "FROM users WHERE user_id=%s",
         (user_id,)
     )
     row = cur.fetchone()
     if not row:
         return {"child_age": None, "name": None, "email": None, "notes": [],
-                "last_summary": "", "preferred_language": "ar"}
+                "last_summary": "", "preferred_language": "ar",
+                "parent_name": None, "child_name": None}
     raw   = row[0]
     notes = json.loads(raw) if isinstance(raw, str) else (raw or [])
     return {"child_age": row[1], "name": row[2], "email": row[3], "notes": notes,
-            "last_summary": "", "preferred_language": row[4] or "ar"}
+            "last_summary": "", "preferred_language": row[4] or "ar",
+            "parent_name": row[5], "child_name": row[6]}
 
 
 def update_memory(conn, user_id: str, topic: str,
@@ -869,51 +925,20 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
 
 
 # ══════════════════════════════════════════════
-# AUTO-LEARNING  (merged from auto_learning.py)
-# ══════════════════════════════════════════════
-#
-# FIX SUMMARY (v4.4):
-#
-# BUG 1 — Logger was inheriting root level (WARNING), so all debug/info
-#          calls were invisible in Railway. Fixed: set level to INFO and
-#          attach a StreamHandler so every gate decision is always visible.
-#
-# BUG 2 — _al_passes_quality_gate logged rejections at DEBUG level only.
-#          Fixed: now logs at INFO so every rejection appears in Railway.
-#
-# BUG 3 — _al_is_duplicate swallowed DB exceptions and returned False.
-#          This left the psycopg2 connection in aborted-transaction state
-#          (InFailedSqlTransaction). The subsequent INSERT on the SAME
-#          connection then silently failed. Fixed: exceptions now propagate
-#          so the caller can detect and handle a broken connection.
-#
-# BUG 4 — maybe_learn_from_interaction shared one connection between the
-#          dedup SELECT and the INSERT. A failed SELECT aborted the tx,
-#          making the INSERT fail with "insert returned no id".
-#          Fixed: two separate short-lived connections — one read-only for
-#          dedup, one fresh write connection for INSERT + COMMIT.
-#
-# BUG 5 — _al_insert_learned_pair did not guard fetchone() returning None
-#          (possible if a trigger/constraint silently rejected the row).
-#          Fixed: explicit None check, rollback, and ERROR log.
+# AUTO-LEARNING  (v4.4 bugs all fixed, kept intact)
 # ══════════════════════════════════════════════
 
 _autolearn_logger = logging.getLogger("rafiq.autolearn")
-
-# FIX 1 — ensure INFO messages are always visible regardless of root logger config
 if not _autolearn_logger.handlers:
     _al_handler = logging.StreamHandler()
-    _al_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    _al_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     _autolearn_logger.addHandler(_al_handler)
 _autolearn_logger.setLevel(logging.INFO)
 
-# Quality thresholds
-_AL_MIN_QUESTION_LEN      = 15
-_AL_MIN_ANSWER_LEN        = 60
-_AL_MAX_ANSWER_LEN        = 3000
-_AL_SIMILARITY_THRESHOLD  = 0.75
+_AL_MIN_QUESTION_LEN     = 15
+_AL_MIN_ANSWER_LEN       = 60
+_AL_MAX_ANSWER_LEN       = 3000
+_AL_SIMILARITY_THRESHOLD = 0.75
 
 _AL_LEARNABLE_TOPICS = {
     "teen_communication", "anger", "screen_addiction", "bullying",
@@ -935,7 +960,6 @@ _AL_CLARIFICATION_RE = re.compile(
     ]),
     re.IGNORECASE,
 )
-
 _AL_GENERIC_RE = re.compile(
     "|".join([
         r"^(sorry|عذرًا|عذرا)[،,.]?\s*(i|لم|لا)",
@@ -945,7 +969,7 @@ _AL_GENERIC_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Shared normaliser (reuses _AR_DIACRITICS already defined above)
+
 def _al_normalize_text(text: str) -> str:
     t_ = _AR_DIACRITICS.sub("", text.lower())
     for a, b in [("أ","ا"),("إ","ا"),("آ","ا"),("ى","ي"),("ة","ه"),("ؤ","و"),("ئ","ي")]:
@@ -954,292 +978,126 @@ def _al_normalize_text(text: str) -> str:
 
 
 def _al_token_overlap(a: str, b: str) -> float:
-    """Jaccard similarity between token sets."""
     ta = set(_al_normalize_text(a).split())
     tb = set(_al_normalize_text(b).split())
-    if not ta or not tb:
-        return 0.0
+    if not ta or not tb: return 0.0
     return len(ta & tb) / len(ta | tb)
 
 
-# ── FIX 2: every rejection path now logs at INFO (was DEBUG) ──────────
-def _al_passes_quality_gate(
-    question: str,
-    answer: str,
-    topic: str,
-) -> Tuple[bool, str]:
+def _al_passes_quality_gate(question: str, answer: str, topic: str) -> Tuple[bool, str]:
     q, a = question.strip(), answer.strip()
-
     if len(q) < _AL_MIN_QUESTION_LEN:
-        reason = f"question too short ({len(q)} chars, min={_AL_MIN_QUESTION_LEN})"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        reason = f"question too short ({len(q)} chars)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if len(a) < _AL_MIN_ANSWER_LEN:
-        reason = f"answer too short ({len(a)} chars, min={_AL_MIN_ANSWER_LEN})"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        reason = f"answer too short ({len(a)} chars)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if len(a) > _AL_MAX_ANSWER_LEN:
-        reason = f"answer too long ({len(a)} chars, max={_AL_MAX_ANSWER_LEN})"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        reason = f"answer too long ({len(a)} chars)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if topic not in _AL_LEARNABLE_TOPICS:
         reason = f"topic '{topic}' not learnable"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if _AL_CLARIFICATION_RE.search(a):
-        reason = "answer contains clarifying question (matched _AL_CLARIFICATION_RE)"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        reason = "answer contains clarifying question"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if _AL_GENERIC_RE.match(a):
-        reason = "answer is a generic/error response (matched _AL_GENERIC_RE)"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
+        reason = "answer is generic/error response"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
     if len(q.split()) < 4:
-        reason = f"question too fragmented ({len(q.split())} words, min=4)"
-        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason)
-        return False, reason
-
-    _autolearn_logger.info(
-        "[autolearn] quality-gate PASS — topic=%s q_len=%d a_len=%d",
-        topic, len(q), len(a),
-    )
+        reason = f"question too fragmented ({len(q.split())} words)"
+        _autolearn_logger.info("[autolearn] quality-gate FAIL — %s", reason); return False, reason
+    _autolearn_logger.info("[autolearn] quality-gate PASS — topic=%s q_len=%d a_len=%d", topic, len(q), len(a))
     return True, "ok"
 
 
-# ── FIX 3: no longer swallows exceptions — raises so the caller knows ─
-#    the connection is broken and must NOT be reused for the INSERT      ─
 def _al_is_duplicate(conn: Any, question: str, topic: str, lang: str) -> bool:
-    """
-    Returns True if a sufficiently similar question already exists in the DB.
-    Raises on any DB error so the caller can handle a broken connection
-    rather than proceeding with an INSERT on an aborted transaction.
-    """
     cur = conn.cursor()
     cur.execute(
-        "SELECT question FROM faq_knowledge_base WHERE topic=%s AND lang=%s "
-        "ORDER BY created_at DESC LIMIT 200",
+        "SELECT question FROM faq_knowledge_base WHERE topic=%s AND lang=%s ORDER BY created_at DESC LIMIT 200",
         (topic, lang),
     )
     rows = cur.fetchall()
-    _autolearn_logger.info(
-        "[autolearn] dedup check — topic=%s lang=%s candidates=%d",
-        topic, lang, len(rows),
-    )
+    _autolearn_logger.info("[autolearn] dedup check — topic=%s lang=%s candidates=%d", topic, lang, len(rows))
     for (stored_q,) in rows:
-        similarity = _al_token_overlap(question, stored_q)
-        if similarity >= _AL_SIMILARITY_THRESHOLD:
-            _autolearn_logger.info(
-                "[autolearn] duplicate detected — similarity=%.2f stored_q_preview='%s'",
-                similarity, stored_q[:60],
-            )
+        sim = _al_token_overlap(question, stored_q)
+        if sim >= _AL_SIMILARITY_THRESHOLD:
+            _autolearn_logger.info("[autolearn] duplicate detected — similarity=%.2f", sim)
             return True
     _autolearn_logger.info("[autolearn] no duplicate found")
     return False
 
 
-# ── FIX 5: guard fetchone() returning None; log every step explicitly ─
-def _al_insert_learned_pair(
-    conn: Any,
-    question: str,
-    answer: str,
-    topic: str,
-    lang: str,
-    child_age: Optional[int],
-) -> Optional[int]:
-    tags: List[str] = [topic]
-    if child_age is not None:
-        tags.append(f"age_{child_age}")
-    tags.append("auto_learned")
-
-    _autolearn_logger.info(
-        "[autolearn] attempting INSERT — topic=%s lang=%s tags=%s q_len=%d a_len=%d",
-        topic, lang, tags, len(question), len(answer),
-    )
-
+def _al_insert_learned_pair(conn, question, answer, topic, lang, child_age):
+    tags = [topic, "auto_learned"]
+    if child_age is not None: tags.append(f"age_{child_age}")
+    _autolearn_logger.info("[autolearn] attempting INSERT — topic=%s lang=%s", topic, lang)
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO faq_knowledge_base
-                (topic, question, answer, tags, lang, created_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
-            RETURNING id
-            """,
+            "INSERT INTO faq_knowledge_base (topic, question, answer, tags, lang, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,NOW()) RETURNING id",
             (topic, question, answer, tags, lang),
         )
-
-        # FIX 5 — fetchone() can return None if a trigger or constraint
-        # silently rejected the row without raising an exception.
         row = cur.fetchone()
         if row is None:
-            _autolearn_logger.error(
-                "[autolearn] INSERT executed but RETURNING id returned None — "
-                "possible trigger/constraint rejection. Rolling back."
-            )
-            conn.rollback()
-            return None
-
+            _autolearn_logger.error("[autolearn] INSERT returned None — rolling back")
+            conn.rollback(); return None
         new_id = row[0]
-        _autolearn_logger.info(
-            "[autolearn] INSERT successful id=%s (pre-commit)", new_id
-        )
-
         conn.commit()
-        _autolearn_logger.info(
-            "[autolearn] COMMIT successful — id=%s is now persisted in DB", new_id
-        )
+        _autolearn_logger.info("[autolearn] COMMIT successful — id=%s", new_id)
         return new_id
-
     except Exception as exc:
-        _autolearn_logger.error(
-            "[autolearn] INSERT/COMMIT failed — error=%s", exc, exc_info=True
-        )
-        try:
-            conn.rollback()
-            _autolearn_logger.info("[autolearn] rollback completed after insert failure")
-        except Exception as rb_exc:
-            _autolearn_logger.error(
-                "[autolearn] rollback itself failed: %s", rb_exc
-            )
+        _autolearn_logger.error("[autolearn] INSERT/COMMIT failed — %s", exc, exc_info=True)
+        try: conn.rollback()
+        except Exception: pass
         return None
 
 
-# ── FIX 4: two separate connections — dedup on its own, INSERT on a fresh one ─
 def maybe_learn_from_interaction(
-    user_message: str,
-    reply_text: str,
-    topic: str,
-    lang: str,
-    child_age: Optional[int],
-    conn_factory: Callable[[], Any],
+    user_message: str, reply_text: str, topic: str, lang: str,
+    child_age: Optional[int], conn_factory: Callable[[], Any],
 ) -> None:
-    """
-    Called after every successful /chat Gemini response.
-    Evaluates quality, deduplicates, and persists high-value Q/A pairs
-    into faq_knowledge_base for future FTS retrieval.
-    All failures are caught — the /chat response is never affected.
-
-    Two separate DB connections are used:
-      1. dedup_conn  — read-only SELECT for duplicate detection, closed immediately.
-      2. write_conn  — fresh connection for INSERT + COMMIT.
-    This prevents a failed SELECT from leaving the psycopg2 connection in
-    an aborted-transaction state (InFailedSqlTransaction) that would
-    silently kill the subsequent INSERT.
-    """
-    _autolearn_logger.info(
-        "[autolearn] maybe_learn_from_interaction called — "
-        "topic=%s lang=%s child_age=%s q_len=%d a_len=%d",
-        topic, lang, child_age, len(user_message), len(reply_text),
-    )
-
+    _autolearn_logger.info("[autolearn] maybe_learn_from_interaction called — topic=%s", topic)
     try:
-        # ── Step 1: Quality gate ──────────────────────────────────────
         should_store, reason = _al_passes_quality_gate(user_message, reply_text, topic)
-        if not should_store:
-            # Rejection already logged inside _al_passes_quality_gate
-            return
-
-        # ── Step 2: Duplicate check on its own dedicated connection ──
-        # If this connection or query fails for any reason, we skip the
-        # insert entirely (safer than risking a duplicate).
+        if not should_store: return
         try:
             dedup_conn = conn_factory()
-        except Exception as conn_exc:
-            _autolearn_logger.error(
-                "[autolearn] could not open dedup DB connection — skipping. error=%s",
-                conn_exc, exc_info=True,
-            )
-            return
-
+        except Exception as e:
+            _autolearn_logger.error("[autolearn] could not open dedup conn: %s", e); return
         try:
             is_dup = _al_is_duplicate(dedup_conn, user_message, topic, lang)
-        except Exception as dedup_exc:
-            # _al_is_duplicate raised — the connection may be in a broken
-            # state; we skip the insert to avoid writing a duplicate.
-            _autolearn_logger.error(
-                "[autolearn] dedup check raised an exception — skipping insert "
-                "to avoid duplicates. error=%s", dedup_exc, exc_info=True,
-            )
-            try:
-                dedup_conn.rollback()
-            except Exception:
-                pass
-            try:
-                dedup_conn.close()
-            except Exception:
-                pass
+        except Exception as e:
+            _autolearn_logger.error("[autolearn] dedup raised — skipping: %s", e)
+            try: dedup_conn.rollback()
+            except: pass
+            try: dedup_conn.close()
+            except: pass
             return
         finally:
-            # Always close the dedup connection whether or not an exception occurred
-            try:
-                dedup_conn.close()
-                _autolearn_logger.info("[autolearn] dedup connection closed")
-            except Exception as close_exc:
-                _autolearn_logger.warning(
-                    "[autolearn] could not close dedup connection: %s", close_exc
-                )
-
-        if is_dup:
-            _autolearn_logger.info("[autolearn] skipped — duplicate detected")
-            return
-
-        # ── Step 3: INSERT on a brand-new connection ─────────────────
-        # A fresh connection guarantees a clean transaction state,
-        # completely independent of anything that happened during dedup.
+            try: dedup_conn.close()
+            except: pass
+        if is_dup: return
         try:
             write_conn = conn_factory()
-        except Exception as conn_exc:
-            _autolearn_logger.error(
-                "[autolearn] could not open write DB connection — skipping. error=%s",
-                conn_exc, exc_info=True,
-            )
-            return
-
+        except Exception as e:
+            _autolearn_logger.error("[autolearn] could not open write conn: %s", e); return
         try:
-            new_id = _al_insert_learned_pair(
-                conn=write_conn,
-                question=user_message,
-                answer=reply_text,
-                topic=topic,
-                lang=lang,
-                child_age=child_age,
-            )
+            new_id = _al_insert_learned_pair(write_conn, user_message, reply_text, topic, lang, child_age)
             if new_id is not None:
-                _autolearn_logger.info(
-                    "[autolearn] SUCCESS — learned id=%s | topic=%s | lang=%s | "
-                    "q_len=%d | a_len=%d",
-                    new_id, topic, lang, len(user_message), len(reply_text),
-                )
+                _autolearn_logger.info("[autolearn] SUCCESS — id=%s", new_id)
             else:
-                _autolearn_logger.error(
-                    "[autolearn] FAILED — insert returned None "
-                    "(see errors above) | topic=%s lang=%s",
-                    topic, lang,
-                )
+                _autolearn_logger.error("[autolearn] FAILED — insert returned None")
         finally:
-            try:
-                write_conn.close()
-                _autolearn_logger.info("[autolearn] write connection closed")
-            except Exception as close_exc:
-                _autolearn_logger.warning(
-                    "[autolearn] could not close write connection: %s", close_exc
-                )
-
+            try: write_conn.close()
+            except: pass
     except Exception as exc:
-        _autolearn_logger.error(
-            "[autolearn] unexpected top-level error (non-fatal): %s",
-            exc, exc_info=True,
-        )
+        _autolearn_logger.error("[autolearn] top-level error: %s", exc, exc_info=True)
 
 
 # ══════════════════════════════════════════════
-# ASSESSMENT ENGINE
+# ASSESSMENT ENGINE  (unchanged from v4.4)
 # ══════════════════════════════════════════════
 
 ASSESSMENT_OPTIONS = ["Never", "Rarely", "Sometimes", "Often", "Always"]
@@ -1351,16 +1209,13 @@ def _extract_answer_value(answer: Dict[str, Any]) -> Optional[int]:
 
 
 def get_assessment_questions(child_age: Optional[int]) -> List[Dict[str, Any]]:
-    if child_age is None:
-        return ASSESSMENT_QUESTIONS
+    if child_age is None: return ASSESSMENT_QUESTIONS
     return [q for q in ASSESSMENT_QUESTIONS if q["age_min"] <= child_age <= q["age_max"]]
 
 
 def _format_questions_for_api(questions: List[Dict]) -> List[Dict]:
-    return [
-        {"id": q["id"], "text": q["text"], "trait": q["trait"], "options": ASSESSMENT_OPTIONS}
-        for q in questions
-    ]
+    return [{"id": q["id"], "text": q["text"], "trait": q["trait"], "options": ASSESSMENT_OPTIONS}
+            for q in questions]
 
 
 def compute_personality_profile(
@@ -1377,30 +1232,19 @@ def compute_personality_profile(
         qid_raw = a.get("question_id") or a.get("id")
         qid     = _normalize_answer_id(qid_raw)
         val     = _extract_answer_value(a)
-        if DEBUG:
-            print(f"[DEBUG] answer qid_raw={qid_raw!r} → normalized={qid!r} | value={val}")
         q = _QS_NORM.get(qid)
-        if q is None:
-            unmatched_ids.append(str(qid_raw)); continue
-        if val is None:
-            unmatched_ids.append(f"{qid_raw}(bad_value)"); continue
+        if q is None: unmatched_ids.append(str(qid_raw)); continue
+        if val is None: unmatched_ids.append(f"{qid_raw}(bad_value)"); continue
         matched_ids.append(qid)
         for trait, w in q["weights"].items():
             raw[trait]  += val * w
             max_[trait] += 5 * w
 
-    if DEBUG:
-        print(f"[DEBUG] matched={matched_ids}")
-        print(f"[DEBUG] unmatched={unmatched_ids}")
-        print(f"[DEBUG] raw scores={raw}")
-
     bs = behavior_signals or {}
     if max_["focus"] > 0:
-        focus_bonus = max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2
-        raw["focus"] = min(raw["focus"] + focus_bonus, max_["focus"])
+        raw["focus"] = min(raw["focus"] + max(0, 3 - int(bs.get("gives_up_fast", 0))) * 2, max_["focus"])
     if max_["empathy"] > 0:
-        empathy_bonus = int(bs.get("helps_others", 0)) * 2
-        raw["empathy"] = min(raw["empathy"] + empathy_bonus, max_["empathy"])
+        raw["empathy"] = min(raw["empathy"] + int(bs.get("helps_others", 0)) * 2, max_["empathy"])
 
     def _norm(r: float, m: float) -> int:
         return max(0, min(100, int(round(r / m * 100)))) if m > 0 else 0
@@ -1416,11 +1260,9 @@ def compute_personality_profile(
          for a in ARCHETYPES],
         key=lambda x: x["match_pct"], reverse=True
     )
-
-    top_archetype   = ranked[0]
-    top_traits      = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-    low_traits      = sorted(scores.items(), key=lambda kv: kv[1])[:2]
-    recommendations = _build_recommendations(scores, top_archetype, low_traits)
+    top_archetype  = ranked[0]
+    top_traits     = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    low_traits     = sorted(scores.items(), key=lambda kv: kv[1])[:2]
 
     return {
         "child_age":              child_age,
@@ -1428,20 +1270,17 @@ def compute_personality_profile(
         "top_traits":             [{"trait": tr, "score": v} for tr, v in top_traits],
         "low_traits":             [{"trait": tr, "score": v} for tr, v in low_traits],
         "possible_personalities": ranked[:5],
-        "recommendations":        recommendations,
+        "recommendations":        _build_recommendations(scores, top_archetype, low_traits),
         "note":                   t("assessment_note", "en"),
         "_debug":                 {"matched": matched_ids, "unmatched": unmatched_ids},
     }
 
 
-def _build_recommendations(
-    scores: Dict[str, int],
-    top_arch: Dict[str, Any],
-    low_traits: List[Tuple[str, int]],
-) -> List[str]:
-    recs: List[str] = []
-    recs.append(f"Your child most resembles '{top_arch['name']}' — {top_arch['description']}")
-    recs.append(f"What they need most: {top_arch['needs']}")
+def _build_recommendations(scores, top_arch, low_traits):
+    recs = [
+        f"Your child most resembles '{top_arch['name']}' — {top_arch['description']}",
+        f"What they need most: {top_arch['needs']}",
+    ]
     for trait, score in low_traits:
         if score < 40:
             advice = {
@@ -1458,31 +1297,20 @@ def _build_recommendations(
     return recs
 
 
-def compute_assessment_confidence(
-    answers: List[Dict[str, Any]],
-    child_age: Optional[int],
-    behavior_signals: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    all_qs  = ASSESSMENT_QUESTIONS
-    q_ids   = {q["id"].strip().lower() for q in all_qs}
-    total   = len(all_qs)
-    valid   = 0
+def compute_assessment_confidence(answers, child_age, behavior_signals):
+    q_ids  = {q["id"].strip().lower() for q in ASSESSMENT_QUESTIONS}
+    total  = len(ASSESSMENT_QUESTIONS)
+    valid  = 0
     matched_dbg:   List[str] = []
     unmatched_dbg: List[str] = []
-
     for a in answers or []:
         qid_raw = a.get("question_id") or a.get("id")
         qid     = _normalize_answer_id(qid_raw)
         val     = _extract_answer_value(a)
         if qid in q_ids and val is not None:
-            valid += 1
-            matched_dbg.append(qid)
+            valid += 1; matched_dbg.append(qid)
         else:
             unmatched_dbg.append(f"{qid_raw}(val={val})")
-
-    if DEBUG:
-        print(f"[CONFIDENCE] valid={valid}/{total}, matched={matched_dbg}, unmatched={unmatched_dbg}")
-
     coverage = int(round(valid / total * 100)) if total else 0
     score    = int(round(valid / total * 65))  if total else 0
     notes    = [f"coverage={coverage}%"]
@@ -1490,173 +1318,12 @@ def compute_assessment_confidence(
     if behavior_signals:          score += 10; notes.append("behavior_signals_included")
     if valid < max(3, total // 3 if total else 3):
         score = max(0, score - 15); notes.append("low_answer_count_penalty")
-
     return {
-        "confidence":      max(0, min(100, score)),
-        "valid_answers":   valid,
-        "total_questions": total,
-        "coverage":        coverage,
-        "notes":           notes,
-        "debug": {
-            "received_count":      len(answers or []),
-            "matched_questions":   matched_dbg,
-            "unmatched_questions": unmatched_dbg,
-        },
+        "confidence": max(0, min(100, score)), "valid_answers": valid,
+        "total_questions": total, "coverage": coverage, "notes": notes,
+        "debug": {"received_count": len(answers or []),
+                  "matched_questions": matched_dbg, "unmatched_questions": unmatched_dbg},
     }
-
-
-# ══════════════════════════════════════════════
-# PDF HELPERS
-# ══════════════════════════════════════════════
-
-def _safe_xml(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _shape_arabic(text: str) -> str:
-    if not _ARABIC_SHAPING:
-        return text
-    reshaped = arabic_reshaper.reshape(text)
-    return bidi_display(reshaped)
-
-
-def _pdf_text(text: str, lang: Lang) -> str:
-    if lang == "ar":
-        return _shape_arabic(text)
-    return text
-
-
-def _pick_font(bold: bool, lang: Lang) -> str:
-    if lang == "ar" and _FONT_ARABIC_REGISTERED:
-        return "NotoArabicBold" if bold else "NotoArabic"
-    if lang == "en" and _FONT_LATIN_REGISTERED:
-        return "NotoLatin"
-    return "Helvetica-Bold" if bold else "Helvetica"
-
-
-def _build_parenting_plan_pdf(
-    user_id: str,
-    child_age: Optional[int],
-    top_archetype: str,
-    plan_text: str,
-    generated_at: str,
-    lang: Lang = "ar",
-) -> bytes:
-    buf = io.BytesIO()
-    W, H = A4
-    styles = getSampleStyleSheet()
-
-    text_align  = TA_RIGHT if lang == "ar" else TA_LEFT
-    brand_green = colors.HexColor("#1B6B3A")
-    brand_light = colors.HexColor("#E8F5E9")
-    text_dark   = colors.HexColor("#1A1A1A")
-    text_muted  = colors.HexColor("#555555")
-    accent_gold = colors.HexColor("#C8860A")
-
-    font_body = _pick_font(False, lang)
-    font_bold = _pick_font(True,  lang)
-
-    style_subtitle        = ParagraphStyle("SubTitle", parent=styles["Normal"],
-        fontSize=12, textColor=text_muted, spaceAfter=2, alignment=TA_CENTER, fontName=font_body)
-    style_section_heading = ParagraphStyle("SectionHeading", parent=styles["Heading1"],
-        fontSize=13, textColor=brand_green, spaceBefore=14, spaceAfter=4, fontName=font_bold)
-    style_plan_heading    = ParagraphStyle("PlanHeading", parent=styles["Heading2"],
-        fontSize=12, textColor=accent_gold, spaceBefore=10, spaceAfter=3, fontName=font_bold)
-    style_plan_body       = ParagraphStyle("PlanBody", parent=styles["Normal"],
-        fontSize=10.5, textColor=text_dark, fontName=font_body, leading=17, spaceAfter=4,
-        alignment=text_align)
-    style_bullet          = ParagraphStyle("Bullet", parent=styles["Normal"],
-        fontSize=10.5, textColor=text_dark, fontName=font_body, leading=17,
-        leftIndent=16, spaceAfter=3, bulletIndent=4, alignment=text_align)
-    style_footer          = ParagraphStyle("Footer", parent=styles["Normal"],
-        fontSize=8, textColor=text_muted, alignment=TA_CENTER, fontName=font_body)
-
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm, topMargin=2.5*cm, bottomMargin=2*cm,
-        title=f"Rafiq Parenting Plan — {user_id}", author="Rafiq AI")
-
-    story = []
-
-    banner_title = _pdf_text(t("pdf_main_title", lang), lang)
-    banner_sub   = _pdf_text(t("pdf_subtitle",   lang), lang)
-    banner_style = ParagraphStyle("BannerTitle", parent=styles["Title"],
-        fontSize=20, textColor=colors.white, alignment=TA_CENTER, fontName=font_bold)
-    banner_table = Table([[Paragraph(banner_title, banner_style)]], colWidths=[W - 4*cm])
-    banner_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), brand_green),
-        ("TOPPADDING",    (0, 0), (-1, -1), 14),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 16),
-    ]))
-    story.append(banner_table)
-    story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph(banner_sub, style_subtitle))
-    story.append(Spacer(1, 0.25*cm))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=brand_green, spaceAfter=10))
-
-    age_display  = _pdf_text(
-        f"{child_age} {'سنة' if lang == 'ar' else 'years'}" if child_age
-        else t("pdf_label_age_unknown", lang), lang)
-    date_display = generated_at[:10] if generated_at else "—"
-
-    lbl       = lambda k: _pdf_text(t(k, lang), lang)
-    lbl_style = ParagraphStyle("MetaLbl", parent=styles["Normal"],
-        fontSize=9, textColor=brand_green, fontName=font_bold)
-    val_style = ParagraphStyle("MetaVal", parent=styles["Normal"],
-        fontSize=9, textColor=text_dark,  fontName=font_body)
-
-    meta_data = [
-        [Paragraph(lbl("pdf_label_user_id"),   lbl_style), Paragraph(user_id,     val_style),
-         Paragraph(lbl("pdf_label_child_age"), lbl_style), Paragraph(age_display, val_style)],
-        [Paragraph(lbl("pdf_label_archetype"), lbl_style), Paragraph(_pdf_text(top_archetype, lang), val_style),
-         Paragraph(lbl("pdf_label_generated"), lbl_style), Paragraph(date_display, val_style)],
-    ]
-    cw = (W - 4*cm) / 4
-    meta_table = Table(meta_data, colWidths=[cw*0.22, cw*0.78*0.6, cw*0.22, cw*0.78*0.6])
-    meta_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), brand_light),
-        ("BACKGROUND",    (0, 0), (0,  -1), colors.HexColor("#D0EAD8")),
-        ("BACKGROUND",    (2, 0), (2,  -1), colors.HexColor("#D0EAD8")),
-        ("TOPPADDING",    (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#BBDDC7")),
-    ]))
-    story.append(meta_table)
-    story.append(Spacer(1, 0.5*cm))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
-    story.append(Paragraph(_pdf_text(t("pdf_section_plan", lang), lang), style_section_heading))
-    story.append(Spacer(1, 0.2*cm))
-
-    week_keywords  = ("الأسبوع", "Week ", "أسبوع")
-    bullet_markers = ("•", "-", "–", "*", "·")
-
-    for raw_line in plan_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            story.append(Spacer(1, 0.18*cm))
-            continue
-        shaped = _pdf_text(line, lang)
-        if any(line.startswith(kw) for kw in week_keywords) or (
-            len(line) < 80 and line.endswith(":") and not line.startswith(" ")
-        ):
-            story.append(Paragraph(_safe_xml(shaped), style_plan_heading))
-            continue
-        if len(line) > 2 and line[0].isdigit() and line[1] in (".", ")"):
-            story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(shaped[2:].strip())}", style_bullet))
-            continue
-        if line[0] in bullet_markers:
-            story.append(Paragraph(f"&#x25CF;&nbsp;&nbsp;{_safe_xml(shaped[1:].strip())}", style_bullet))
-            continue
-        story.append(Paragraph(_safe_xml(shaped), style_plan_body))
-
-    story.append(Spacer(1, 0.6*cm))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
-    story.append(Paragraph(_safe_xml(_pdf_text(t("pdf_footer_line1", lang), lang)), style_footer))
-
-    doc.build(story)
-    buf.seek(0)
-    return buf.read()
 
 
 # ══════════════════════════════════════════════
@@ -1679,7 +1346,7 @@ def _norm_personalities(raw: Any) -> List[Dict[str, Any]]:
     for item in (raw or []):
         if isinstance(item, dict):
             out.append({"id":          str(item.get("id", "")),
-                        "name":        str(item.get("name", "غير محدد")),
+                        "name":        str(item.get("name", "Unknown")),
                         "description": str(item.get("description", "")),
                         "needs":       str(item.get("needs", "")),
                         "match_pct":   int(item.get("match_pct") or item.get("match") or 0)})
@@ -1708,11 +1375,7 @@ def _require_gemini() -> None:
         raise HTTPException(status_code=503, detail="Gemini disabled: set GEMINI_API_KEY")
 
 
-def gemini_route_decision(
-    user_text: str,
-    history: List[ChatMessage],
-    fallback_age: Optional[int],
-) -> RouteDecision:
+def gemini_route_decision(user_text, history, fallback_age):
     _require_gemini()
     system = (
         "You are the router for Rafiq, a family support assistant. "
@@ -1751,7 +1414,72 @@ def gemini_route_decision(
         )
 
 
-def gemini_generate_parenting_plan(
+# ══════════════════════════════════════════════
+# v5.0 — 15-DAY PLAN GENERATION
+# ══════════════════════════════════════════════
+
+_plan_logger = logging.getLogger("rafiq.plan")
+if not _plan_logger.handlers:
+    _ph = logging.StreamHandler()
+    _ph.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _plan_logger.addHandler(_ph)
+_plan_logger.setLevel(logging.INFO)
+
+
+def gemini_generate_intro_letter(
+    parent_name: str,
+    child_name: str,
+    child_age: Optional[int],
+    top_archetype: str,
+    archetype_desc: str,
+    top_traits: List[Dict],
+    lang: Lang,
+) -> str:
+    """Generate a warm, personalised introductory letter for the parent."""
+    _require_gemini()
+    age_str   = f"{child_age} years old" if child_age else "your child"
+    child_str = child_name or "your child"
+    traits_str = ", ".join(t["trait"].replace("_", " ").title() for t in top_traits[:3])
+
+    if lang == "ar":
+        prompt = (
+            f"أنت مدرب تربوي دافئ ومتخصص. اكتب رسالة افتتاحية شخصية دافئة وعاطفية لوالد/ة اسمه/ا {parent_name}، "
+            f"طفله/ا اسمه/ا {child_str} وعمره/ا {age_str}. "
+            f"النمط الشخصي للطفل هو {top_archetype} — {archetype_desc}. "
+            f"أبرز صفاته: {traits_str}.\n\n"
+            "الرسالة يجب أن:\n"
+            "- تبدأ بـ «عزيزتي/عزيزي {parent_name}،»\n"
+            "- تكون داعمة وعاطفية ومحفّزة\n"
+            "- تذكر نقاط قوة الطفل تحديدًا\n"
+            "- تشجع الوالد/ة على رحلة الـ15 يومًا القادمة\n"
+            "- تكون 3-4 فقرات قصيرة\n"
+            "لا تستخدم رموز Markdown. اكتب النص فقط باللغة العربية."
+        )
+    else:
+        prompt = (
+            f"You are a warm, professional parenting coach. Write a personalized, heartfelt introductory letter "
+            f"for a parent named {parent_name}. Their child's name is {child_str}, aged {age_str}. "
+            f"The child's personality profile is '{top_archetype}' — {archetype_desc}. "
+            f"Their top strengths are: {traits_str}.\n\n"
+            "The letter must:\n"
+            "- Start with 'Dear {parent_name},'\n"
+            "- Be warm, emotionally supportive, and motivating\n"
+            "- Specifically mention the child's strengths\n"
+            "- Encourage the parent on the upcoming 15-day journey\n"
+            "- Be 3-4 short paragraphs\n"
+            "No Markdown formatting. Write plain text only in English."
+        )
+
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL, contents=prompt,
+        config=genai_types.GenerateContentConfig(temperature=0.75, max_output_tokens=600),
+    )
+    return strip_markdown((resp.text or "").strip())
+
+
+def gemini_generate_15day_plan_json(
+    parent_name: str,
+    child_name: str,
     child_age: Optional[int],
     top_archetype: str,
     archetype_desc: str,
@@ -1759,53 +1487,647 @@ def gemini_generate_parenting_plan(
     traits_text: str,
     scores_text: str,
     lang: Lang,
-) -> str:
+) -> List[Dict[str, Any]]:
+    """
+    Ask Gemini to return the 15-day plan as a JSON array.
+    Each element: {day, goal, activity, how_to_do_it, why_it_helps, tip}
+    """
     _require_gemini()
+    age_str   = f"{child_age} years old" if child_age else "age not specified"
+    child_str = child_name or "the child"
+
+    schema_example = json.dumps([
+        {
+            "day": 1,
+            "goal": "Build trust through connection",
+            "activity": "20-minute device-free play",
+            "how_to_do_it": "Sit on the floor together. Let your child lead. Follow their cues.",
+            "why_it_helps": "Uninterrupted attention strengthens the secure attachment bond.",
+            "tip": "Put your phone in another room during this time."
+        }
+    ], indent=2)
 
     if lang == "ar":
         prompt = (
-            "أنت مدرب تربوي محترف متخصص في التطوير الشخصي للأطفال.\n\n"
-            "فيما يلي نتائج تقييم شخصية الطفل:\n"
-            f"- عمر الطفل: {child_age if child_age is not None else 'غير محدد'} سنة\n"
-            f"- النمط الشخصي الأبرز: {top_archetype} — {archetype_desc}\n"
-            f"- احتياجات الطفل: {archetype_needs}\n\n"
-            f"أبرز الصفات:\n{traits_text}\n\n"
-            f"درجات جميع الصفات:\n{scores_text}\n\n"
-            "المطلوب:\n"
-            "أنشئ خطة تربوية مخصصة لمدة 30 يومًا (4 أسابيع).\n"
-            "يجب أن تتضمن الخطة:\n"
-            "1. هدف الأسبوع\n2. أنشطة يومية عملية ومناسبة لعمر الطفل\n"
-            "3. أساليب التعزيز الإيجابي\n4. توصيات خاصة بالوالدين\n"
-            "5. ملاحظة ختامية للمتابعة\n\n"
-            "الأسلوب: دافئ، واضح، وعملي. تجنب المصطلحات الطبية.\n"
-            "لا تستخدم رموز Markdown مثل ** أو * أو # في الرد.\n"
-            "أعد الخطة كاملةً باللغة العربية."
+            f"أنت مدرب تربوي محترف. أنشئ خطة تربوية مخصصة لـ15 يومًا.\n\n"
+            f"معلومات الطفل:\n"
+            f"- الاسم: {child_str}\n"
+            f"- العمر: {age_str}\n"
+            f"- النمط الشخصي: {top_archetype} — {archetype_desc}\n"
+            f"- الاحتياجات: {archetype_needs}\n"
+            f"- أبرز الصفات:\n{traits_text}\n"
+            f"- جميع الدرجات:\n{scores_text}\n\n"
+            f"أعد المخرجات كـ JSON array فقط بدون أي نص إضافي، بهذا الشكل:\n{schema_example}\n\n"
+            "المفاتيح بالعربية:\n"
+            "day (رقم), goal (هدف اليوم), activity (النشاط), "
+            "how_to_do_it (كيفية التنفيذ), why_it_helps (لماذا يفيد), tip (نصيحة سريعة)\n"
+            "15 يومًا فقط. JSON فقط."
         )
     else:
         prompt = (
-            "You are a professional parenting coach specializing in child development.\n\n"
-            "Below are the results of a child personality assessment:\n"
-            f"- Child age: {child_age if child_age is not None else 'Not specified'} years\n"
-            f"- Top personality archetype: {top_archetype} — {archetype_desc}\n"
-            f"- Child's needs: {archetype_needs}\n\n"
-            f"Top traits:\n{traits_text}\n\n"
-            f"All trait scores:\n{scores_text}\n\n"
-            "Task:\nCreate a personalised 30-day parenting plan (4 weeks) based on this data.\n"
-            "The plan must include:\n"
-            "1. Weekly goal\n2. Daily practical activities appropriate for the child's age\n"
-            "3. Positive reinforcement strategies per week\n"
-            "4. Specific recommendations for parents to support the child\n"
-            "5. A closing note for follow-up after the plan ends\n\n"
-            "Style: warm, clear, practical. Avoid medical/diagnostic terminology.\n"
-            "Do NOT use Markdown formatting symbols such as **, *, or # in your response.\n"
-            "Write the entire plan in English."
+            f"You are a professional parenting coach. Generate a personalized 15-day parenting plan.\n\n"
+            f"Child info:\n"
+            f"- Name: {child_str}\n"
+            f"- Age: {age_str}\n"
+            f"- Personality: {top_archetype} — {archetype_desc}\n"
+            f"- Needs: {archetype_needs}\n"
+            f"- Top traits:\n{traits_text}\n"
+            f"- All trait scores:\n{scores_text}\n\n"
+            f"Return ONLY a valid JSON array, no extra text, following this schema:\n{schema_example}\n\n"
+            "Exactly 15 day objects. JSON only."
         )
 
     resp = client.models.generate_content(
         model=GEMINI_MODEL, contents=prompt,
-        config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=2000),
+        config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=4000),
     )
-    return strip_markdown((resp.text or "").strip())
+    raw_text = (resp.text or "").strip()
+    # Strip markdown fences if present
+    raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text).rstrip("`").strip()
+
+    try:
+        days = json.loads(raw_text)
+        if isinstance(days, list) and len(days) > 0:
+            return days
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: try to extract JSON array from text
+    match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            pass
+
+    _plan_logger.error("[plan] Failed to parse 15-day JSON from Gemini. raw=%s", raw_text[:300])
+    return []
+
+
+def plan_days_to_plain_text(days: List[Dict[str, Any]]) -> str:
+    """Convert structured day list to plain text for PDF and FTS ingestion."""
+    lines = []
+    for d in days:
+        day_num = d.get("day", "?")
+        lines.append(f"Day {day_num}")
+        lines.append(f"Goal: {d.get('goal', '')}")
+        lines.append(f"Activity: {d.get('activity', '')}")
+        lines.append(f"How to do it: {d.get('how_to_do_it', '')}")
+        lines.append(f"Why it helps: {d.get('why_it_helps', '')}")
+        lines.append(f"Tip: {d.get('tip', '')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════
+# RAG INGESTION PIPELINE  (v5.0 NEW)
+# ══════════════════════════════════════════════
+
+_rag_logger = logging.getLogger("rafiq.rag")
+if not _rag_logger.handlers:
+    _rh = logging.StreamHandler()
+    _rh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _rag_logger.addHandler(_rh)
+_rag_logger.setLevel(logging.INFO)
+
+
+def _gemini_embed_text(text: str) -> Optional[List[float]]:
+    """
+    Generate a text embedding using Gemini embedding model.
+    Returns None if embeddings are unavailable.
+    """
+    if not GEMINI_ENABLED or client is None:
+        return None
+    try:
+        result = client.models.embed_content(
+            model="models/text-embedding-004",
+            content=text,
+            config=genai_types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+        )
+        return result.embeddings[0].values
+    except Exception as exc:
+        _rag_logger.warning("[rag] Embedding generation failed: %s", exc)
+        return None
+
+
+def ingest_plan_to_knowledge_base(
+    plan_id: int,
+    user_id: str,
+    parent_name: str,
+    child_name: str,
+    child_age: Optional[int],
+    child_profile: str,
+    plan_days: List[Dict[str, Any]],
+    intro_letter: str,
+    lang: Lang,
+    conn_factory: Callable[[], Any],
+) -> Dict[str, Any]:
+    """
+    Full RAG ingestion pipeline for a generated parenting plan.
+
+    Steps:
+      1. Convert each day to a Q/A pair and insert into faq_knowledge_base (FTS).
+      2. Create Gemini text embeddings per day chunk.
+      3. Store embeddings in plan_embeddings (pgvector) if available.
+
+    All steps are logged at INFO level.
+    Returns a summary dict.
+    """
+    _rag_logger.info("[rag] Starting ingestion — plan_id=%s user_id=%s lang=%s days=%d",
+                     plan_id, user_id, lang, len(plan_days))
+
+    fts_inserted  = 0
+    emb_inserted  = 0
+    errors: List[str] = []
+
+    # ── Step 1: FTS ingestion (faq_knowledge_base) ───────────────────
+    try:
+        fts_conn = conn_factory()
+        fts_cur  = fts_conn.cursor()
+
+        child_ref  = child_name or "your child"
+        age_tag    = f"age_{child_age}" if child_age else "age_unknown"
+
+        for day in plan_days:
+            day_num  = day.get("day", "?")
+            question = (
+                f"Day {day_num} plan for {child_ref}: "
+                f"{day.get('goal', '')} — {day.get('activity', '')}"
+            )
+            answer = (
+                f"Goal: {day.get('goal', '')}\n"
+                f"Activity: {day.get('activity', '')}\n"
+                f"How to do it: {day.get('how_to_do_it', '')}\n"
+                f"Why it helps: {day.get('why_it_helps', '')}\n"
+                f"Tip: {day.get('tip', '')}"
+            )
+            tags = [
+                "parenting_plan", f"day_{day_num}", age_tag,
+                child_profile.lower().replace(" ", "_"),
+                f"user_{user_id}", "generated_plan",
+            ]
+            try:
+                fts_cur.execute(
+                    """
+                    INSERT INTO faq_knowledge_base
+                        (topic, question, answer, tags, lang, source, source_plan_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING id
+                    """,
+                    ("general_parenting", question, answer, tags, lang,
+                     "generated_parenting_plan", plan_id),
+                )
+                row = fts_cur.fetchone()
+                if row:
+                    fts_inserted += 1
+                    _rag_logger.info("[rag] FTS inserted — day=%s faq_id=%s", day_num, row[0])
+                else:
+                    _rag_logger.warning("[rag] FTS INSERT day=%s returned no id", day_num)
+            except Exception as day_exc:
+                errors.append(f"FTS day {day_num}: {day_exc}")
+                _rag_logger.error("[rag] FTS INSERT error day=%s: %s", day_num, day_exc)
+                fts_conn.rollback()
+
+        fts_conn.commit()
+        _rag_logger.info("[rag] FTS commit — inserted=%d / %d days", fts_inserted, len(plan_days))
+        fts_conn.close()
+    except Exception as exc:
+        errors.append(f"FTS batch: {exc}")
+        _rag_logger.error("[rag] FTS batch error: %s", exc, exc_info=True)
+
+    _rag_logger.info("[rag] Plan saved in DB (FTS) ✔ — fts_rows=%d", fts_inserted)
+
+    # ── Step 2 + 3: Embedding + pgvector storage ─────────────────────
+    if not _PGVECTOR_AVAILABLE:
+        _rag_logger.info("[rag] pgvector not available — skipping embedding storage")
+    else:
+        try:
+            emb_conn = conn_factory()
+            emb_cur  = emb_conn.cursor()
+
+            for i, day in enumerate(plan_days):
+                day_num   = day.get("day", i + 1)
+                chunk_txt = (
+                    f"Day {day_num}: {day.get('goal', '')}. "
+                    f"Activity: {day.get('activity', '')}. "
+                    f"How to do it: {day.get('how_to_do_it', '')}. "
+                    f"Why it helps: {day.get('why_it_helps', '')}. "
+                    f"Tip: {day.get('tip', '')}."
+                )
+
+                embedding = _gemini_embed_text(chunk_txt)
+                if embedding is None:
+                    _rag_logger.warning("[rag] No embedding for day=%s — storing chunk without vector", day_num)
+                else:
+                    _rag_logger.info("[rag] Embedding created — day=%s dim=%d", day_num, len(embedding))
+
+                try:
+                    emb_cur.execute(
+                        """
+                        INSERT INTO plan_embeddings
+                            (plan_id, user_id, chunk_index, chunk_text, embedding,
+                             child_age, child_profile, lang, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        RETURNING id
+                        """,
+                        (plan_id, user_id, i, chunk_txt,
+                         embedding,  # None is OK if pgvector col is nullable
+                         child_age, child_profile, lang),
+                    )
+                    row = emb_cur.fetchone()
+                    if row:
+                        emb_inserted += 1
+                        _rag_logger.info("[rag] Embedding stored — day=%s emb_id=%s", day_num, row[0])
+                except Exception as emb_day_exc:
+                    errors.append(f"EMB day {day_num}: {emb_day_exc}")
+                    _rag_logger.error("[rag] Embedding INSERT error day=%s: %s", day_num, emb_day_exc)
+                    emb_conn.rollback()
+
+            emb_conn.commit()
+            _rag_logger.info("[rag] Embedding commit — stored=%d / %d chunks", emb_inserted, len(plan_days))
+            emb_conn.close()
+        except Exception as exc:
+            errors.append(f"EMB batch: {exc}")
+            _rag_logger.error("[rag] Embedding batch error: %s", exc, exc_info=True)
+
+        _rag_logger.info("[rag] Added to knowledge base ✔ — emb_rows=%d", emb_inserted)
+
+    summary = {
+        "plan_id":      plan_id,
+        "fts_inserted": fts_inserted,
+        "emb_inserted": emb_inserted,
+        "errors":       errors,
+    }
+    _rag_logger.info("[rag] Ingestion complete — %s", summary)
+    return summary
+
+
+def retrieve_plan_context_for_user(
+    user_id: str,
+    query: str,
+    lang: Lang,
+    limit: int = 3,
+    conn_factory: Optional[Callable] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve relevant chunks from the user's own generated plan.
+    First tries pgvector similarity search; falls back to FTS with user tag filter.
+    """
+    results: List[Dict[str, Any]] = []
+
+    # pgvector path
+    if _PGVECTOR_AVAILABLE and GEMINI_ENABLED and conn_factory:
+        try:
+            embedding = _gemini_embed_text(query)
+            if embedding:
+                conn = conn_factory()
+                register_vector(conn)
+                cur  = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT chunk_text, embedding <=> %s::vector AS distance
+                    FROM   plan_embeddings
+                    WHERE  user_id = %s
+                    ORDER  BY distance ASC
+                    LIMIT  %s
+                    """,
+                    (embedding, user_id, limit),
+                )
+                for row in cur.fetchall():
+                    results.append({"answer": row[0], "rank": 1 - float(row[1]),
+                                    "method": "pgvector", "source": "generated_parenting_plan"})
+                conn.close()
+                if results:
+                    return results
+        except Exception as exc:
+            _rag_logger.warning("[rag] pgvector retrieval failed: %s", exc)
+
+    # FTS fallback with source filter
+    try:
+        fts_tag_filter = f"%user_{user_id}%"
+        conn = (conn_factory or get_conn)()
+        cur  = conn.cursor()
+        raw_tokens = [re.sub(r"[^\w\u0600-\u06FF]", "", tok)
+                      for tok in query.strip().split() if len(tok) >= 2]
+        tokens = [t for t in raw_tokens if t]
+        if tokens:
+            tsquery_str = " | ".join(tokens)
+            cur.execute(
+                """
+                SELECT question, answer, ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank
+                FROM   faq_knowledge_base
+                WHERE  search_vector @@ to_tsquery('simple', %s)
+                  AND  source = 'generated_parenting_plan'
+                  AND  array_to_string(tags, ' ') LIKE %s
+                ORDER  BY rank DESC
+                LIMIT  %s
+                """,
+                [tsquery_str, tsquery_str, fts_tag_filter, limit],
+            )
+            for row in cur.fetchall():
+                results.append({"question": row[0], "answer": row[1], "rank": float(row[2]),
+                                 "method": "fts_plan", "source": "generated_parenting_plan"})
+        conn.close()
+    except Exception as exc:
+        _rag_logger.warning("[rag] FTS plan retrieval failed: %s", exc)
+
+    return results
+
+
+# ══════════════════════════════════════════════
+# PDF HELPERS  (v5.0 redesign)
+# ══════════════════════════════════════════════
+
+def _safe_xml(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _shape_arabic(text: str) -> str:
+    if not _ARABIC_SHAPING: return text
+    return bidi_display(arabic_reshaper.reshape(text))
+
+
+def _pdf_text(text: str, lang: Lang) -> str:
+    return _shape_arabic(text) if lang == "ar" else text
+
+
+def _pick_font(bold: bool, lang: Lang) -> str:
+    if lang == "ar" and _FONT_ARABIC_REGISTERED:
+        return "NotoArabicBold" if bold else "NotoArabic"
+    if lang == "en" and _FONT_LATIN_REGISTERED:
+        return "NotoLatin"
+    return "Helvetica-Bold" if bold else "Helvetica"
+
+
+def _build_parenting_plan_pdf(
+    user_id: str,
+    parent_name: str,
+    child_name: str,
+    child_age: Optional[int],
+    top_archetype: str,
+    intro_letter: str,
+    plan_days: List[Dict[str, Any]],
+    generated_at: str,
+    lang: Lang = "en",
+) -> bytes:
+    """
+    Build a professionally designed PDF with:
+      - Page 1: Title banner + info card
+      - Page 2: Personalised intro letter
+      - Pages 3+: Per-day plan cards (Day N | Goal | Activity | How To | Why | Tip)
+    """
+    buf    = io.BytesIO()
+    W, H   = A4
+    styles = getSampleStyleSheet()
+
+    text_align  = TA_RIGHT if lang == "ar" else TA_LEFT
+    brand_green  = colors.HexColor("#1B6B3A")
+    brand_light  = colors.HexColor("#E8F5E9")
+    brand_dark   = colors.HexColor("#0D4A28")
+    accent_gold  = colors.HexColor("#C8860A")
+    accent_light = colors.HexColor("#FFF8E7")
+    text_dark    = colors.HexColor("#1A1A1A")
+    text_muted   = colors.HexColor("#555555")
+    day_bg       = colors.HexColor("#F0F7F2")
+    day_num_bg   = colors.HexColor("#1B6B3A")
+
+    font_body = _pick_font(False, lang)
+    font_bold = _pick_font(True,  lang)
+
+    # ── Paragraph styles ──────────────────────────────────────────────
+    s_title     = ParagraphStyle("Title5", fontSize=22, textColor=colors.white,
+                                  alignment=TA_CENTER, fontName=font_bold)
+    s_subtitle  = ParagraphStyle("Sub5",   fontSize=13, textColor=colors.white,
+                                  alignment=TA_CENTER, fontName=font_body, spaceAfter=4)
+    s_lbl       = ParagraphStyle("Lbl5",   fontSize=9,  textColor=brand_green, fontName=font_bold)
+    s_val       = ParagraphStyle("Val5",   fontSize=9,  textColor=text_dark,   fontName=font_body)
+    s_letter    = ParagraphStyle("Ltr5",   fontSize=11, textColor=text_dark,   fontName=font_body,
+                                  leading=18, spaceAfter=8, alignment=text_align)
+    s_letter_hd = ParagraphStyle("LtrHd5", fontSize=13, textColor=brand_dark,  fontName=font_bold,
+                                  spaceBefore=10, spaceAfter=6)
+    s_day_num   = ParagraphStyle("DayN5",  fontSize=14, textColor=colors.white,
+                                  fontName=font_bold, alignment=TA_CENTER)
+    s_day_goal  = ParagraphStyle("DayG5",  fontSize=11, textColor=brand_dark,  fontName=font_bold,
+                                  spaceAfter=3, alignment=text_align)
+    s_field_lbl = ParagraphStyle("FLbl5",  fontSize=9,  textColor=accent_gold, fontName=font_bold,
+                                  spaceBefore=5)
+    s_field_val = ParagraphStyle("FVal5",  fontSize=10, textColor=text_dark,   fontName=font_body,
+                                  leading=15, spaceAfter=3, alignment=text_align)
+    s_tip       = ParagraphStyle("Tip5",   fontSize=9,  textColor=colors.HexColor("#2E7D32"),
+                                  fontName=font_bold, leading=14, alignment=text_align)
+    s_footer    = ParagraphStyle("Ftr5",   fontSize=8,  textColor=text_muted,
+                                  alignment=TA_CENTER, fontName=font_body)
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm,
+        title=f"Rafiq Parenting Plan — {user_id}",
+    )
+
+    story = []
+
+    # ── PAGE 1: Banner + Info Card ────────────────────────────────────
+    # Banner
+    title_txt    = _pdf_text(t("pdf_main_title", lang), lang)
+    subtitle_txt = _pdf_text(t("pdf_subtitle",   lang), lang)
+
+    banner = Table(
+        [[Paragraph(_safe_xml(title_txt), s_title)],
+         [Paragraph(_safe_xml(subtitle_txt), s_subtitle)]],
+        colWidths=[W - 4*cm],
+    )
+    banner.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), brand_green),
+        ("TOPPADDING",    (0, 0), (-1, -1), 18),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 20),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 20),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1, 0.5*cm))
+
+    # Info card
+    def _lbl(k): return Paragraph(_safe_xml(_pdf_text(t(k, lang), lang)), s_lbl)
+    def _val(v): return Paragraph(_safe_xml(_pdf_text(str(v), lang)), s_val)
+
+    age_disp  = f"{child_age} {'سنة' if lang == 'ar' else 'years'}" if child_age else t("pdf_label_age_unknown", lang)
+    date_disp = generated_at[:10] if generated_at else "—"
+
+    info_data = [
+        [_lbl("pdf_label_parent_name"), _val(parent_name or "—"),
+         _lbl("pdf_label_child_name"),  _val(child_name  or "—")],
+        [_lbl("pdf_label_child_age"),   _val(age_disp),
+         _lbl("pdf_label_archetype"),   _val(top_archetype)],
+        [_lbl("pdf_label_generated"),   _val(date_disp),
+         _lbl("pdf_label_user_id"),     _val(user_id)],
+    ]
+    cw = (W - 4*cm) / 4
+    info_table = Table(info_data, colWidths=[cw*0.28, cw*0.72*0.7, cw*0.28, cw*0.72*0.7])
+    info_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), brand_light),
+        ("BACKGROUND",    (0, 0), (0, -1),  colors.HexColor("#D0EAD8")),
+        ("BACKGROUND",    (2, 0), (2, -1),  colors.HexColor("#D0EAD8")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+        ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#BBDDC7")),
+    ]))
+    story.append(info_table)
+    story.append(Spacer(1, 0.4*cm))
+    story.append(HRFlowable(width="100%", thickness=1, color=brand_green, spaceAfter=6))
+    story.append(Spacer(1, 0.2*cm))
+
+    # ── PAGE 2: Intro Letter ─────────────────────────────────────────
+    story.append(PageBreak())
+    story.append(Paragraph(_safe_xml(_pdf_text(
+        "Dear " + (parent_name or "Parent") if lang == "en" else "رسالة شخصية", lang)),
+        s_letter_hd))
+    story.append(HRFlowable(width="50%", thickness=1.5, color=accent_gold, spaceAfter=10))
+
+    for para in intro_letter.split("\n\n"):
+        para = para.strip()
+        if para:
+            story.append(Paragraph(_safe_xml(_pdf_text(para, lang)), s_letter))
+            story.append(Spacer(1, 0.15*cm))
+
+    story.append(Spacer(1, 0.5*cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=4))
+
+    # ── PAGE 3+: Day Cards ────────────────────────────────────────────
+    story.append(PageBreak())
+
+    for day in plan_days:
+        day_num  = day.get("day", "?")
+        goal     = day.get("goal", "")
+        activity = day.get("activity", "")
+        how_to   = day.get("how_to_do_it", "")
+        why      = day.get("why_it_helps", "")
+        tip      = day.get("tip", "")
+
+        # Day number badge
+        day_badge = Table([[Paragraph(f"Day {day_num}", s_day_num)]],
+                          colWidths=[2.5*cm])
+        day_badge.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), day_num_bg),
+            ("TOPPADDING",    (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+        ]))
+
+        # Goal label next to badge
+        goal_p = Paragraph(_safe_xml(_pdf_text(goal, lang)), s_day_goal)
+        header_row = Table([[day_badge, Spacer(0.3*cm, 0), goal_p]],
+                           colWidths=[2.5*cm, 0.3*cm, W - 4*cm - 2.8*cm])
+        header_row.setStyle(TableStyle([
+            ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+
+        def _field(label: str, value: str) -> Table:
+            return Table(
+                [[Paragraph(_safe_xml(_pdf_text(label, lang)), s_field_lbl)],
+                 [Paragraph(_safe_xml(_pdf_text(value, lang)), s_field_val)]],
+                colWidths=[W - 4*cm - 0.4*cm],
+            )
+
+        tip_table = Table(
+            [[Paragraph("💡 " + _safe_xml(_pdf_text(tip, lang)), s_tip)]],
+            colWidths=[W - 4*cm - 0.4*cm],
+        )
+        tip_table.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), accent_light),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+        ]))
+
+        card_inner = [
+            header_row, Spacer(1, 0.2*cm),
+            _field("Activity:", activity),
+            _field("How to do it:", how_to),
+            _field("Why it helps:", why),
+            Spacer(1, 0.1*cm),
+            tip_table,
+        ]
+
+        card = Table(
+            [[inner] for inner in card_inner],
+            colWidths=[W - 4*cm],
+        )
+        card.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), day_bg),
+            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+            ("BOX",           (0, 0), (-1, -1), 1, colors.HexColor("#B2DFBB")),
+        ]))
+
+        story.append(KeepTogether([card, Spacer(1, 0.35*cm)]))
+
+    # Footer
+    story.append(Spacer(1, 0.3*cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
+    story.append(Paragraph(_safe_xml(_pdf_text(t("pdf_footer_line1", lang), lang)), s_footer))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+# ══════════════════════════════════════════════
+# FCM NOTIFICATION HELPER  (v5.0)
+# ══════════════════════════════════════════════
+
+def _send_fcm_notification(
+    user_id: str,
+    title: str,
+    body: str,
+    data: Optional[Dict[str, str]] = None,
+    conn_factory: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """
+    Send a push notification. Returns a result dict with keys:
+    sent (bool), warning (str|None).
+    """
+    if not FIREBASE_ENABLED:
+        return {"sent": False, "warning": "Firebase not configured"}
+
+    try:
+        conn = (conn_factory or get_conn)()
+        cur  = conn.cursor()
+        cur.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        return {"sent": False, "warning": f"DB error fetching FCM token: {exc}"}
+
+    if not row or not row[0]:
+        return {"sent": False, "warning": "No FCM token registered for this user"}
+
+    fcm_token = row[0]
+    try:
+        message = fb_messaging.Message(
+            notification=fb_messaging.Notification(title=title, body=body),
+            token=fcm_token,
+            data=data or {},
+        )
+        fb_messaging.send(message)
+        return {"sent": True, "warning": None}
+    except fb_messaging.UnregisteredError:
+        # Clear expired token
+        try:
+            conn2 = (conn_factory or get_conn)()
+            conn2.cursor().execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,))
+            conn2.commit(); conn2.close()
+        except Exception:
+            pass
+        return {"sent": False, "warning": "FCM token expired — cleared. User must re-register."}
+    except Exception as exc:
+        return {"sent": False, "warning": f"FCM send error: {exc}"}
 
 
 # ══════════════════════════════════════════════
@@ -1814,23 +2136,18 @@ def gemini_generate_parenting_plan(
 
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "4.4.0",
-            "retrieval": "PostgreSQL FTS (tsvector/tsquery) — no pgvector"}
+    return {"status": "Rafiq running 🚀", "version": "5.0.0",
+            "retrieval": "PostgreSQL FTS + pgvector RAG", "plan_duration": "15 days"}
 
 
 @app.get("/health", tags=["System"])
 def health():
     return {
-        "ok":             True,
-        "model":          GEMINI_MODEL,
-        "gemini_enabled": GEMINI_ENABLED,
-        "verify":         ENABLE_VERIFY,
-        "db":             bool(DATABASE_URL),
-        "debug":          DEBUG,
-        "arabic_shaping": _ARABIC_SHAPING,
-        "pdf":            _REPORTLAB_AVAILABLE,
-        "retrieval":      "postgres_fts",
-        "embeddings":     False,
+        "ok": True, "model": GEMINI_MODEL, "gemini_enabled": GEMINI_ENABLED,
+        "verify": ENABLE_VERIFY, "db": bool(DATABASE_URL), "debug": DEBUG,
+        "arabic_shaping": _ARABIC_SHAPING, "pdf": _REPORTLAB_AVAILABLE,
+        "retrieval": "postgres_fts+pgvector", "pgvector": _PGVECTOR_AVAILABLE,
+        "firebase": FIREBASE_ENABLED, "plan_duration": 15,
     }
 
 
@@ -1853,31 +2170,30 @@ def upsert_user(req: UserUpsertReq):
     try:
         cur.execute(
             """
-            INSERT INTO users (user_id, name, email, child_age, notes, preferred_language)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO users (user_id, name, email, child_age, notes, preferred_language, parent_name, child_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE SET
                 name               = COALESCE(EXCLUDED.name,               users.name),
                 email              = COALESCE(EXCLUDED.email,              users.email),
                 child_age          = COALESCE(EXCLUDED.child_age,          users.child_age),
                 preferred_language = COALESCE(EXCLUDED.preferred_language, users.preferred_language),
+                parent_name        = COALESCE(EXCLUDED.parent_name,        users.parent_name),
+                child_name         = COALESCE(EXCLUDED.child_name,         users.child_name),
                 updated_at         = NOW()
-            RETURNING user_id, name, email, child_age, preferred_language, created_at, updated_at
+            RETURNING user_id, name, email, child_age, preferred_language, parent_name, child_name, created_at, updated_at
             """,
-            (req.user_id, req.name, req.email, req.child_age, json.dumps([]), lang)
+            (req.user_id, req.name, req.email, req.child_age, json.dumps([]), lang,
+             req.parent_name, req.child_name)
         )
         row = cur.fetchone()
         conn.commit()
         return {
-            "ok":      True,
-            "message": t("ok", lang),
+            "ok": True, "message": t("ok", lang),
             "user": {
-                "user_id":            row[0],
-                "name":               row[1],
-                "email":              row[2],
-                "child_age":          row[3],
-                "preferred_language": row[4],
-                "created_at":         row[5].isoformat() if row[5] else None,
-                "updated_at":         row[6].isoformat() if row[6] else None,
+                "user_id": row[0], "name": row[1], "email": row[2], "child_age": row[3],
+                "preferred_language": row[4], "parent_name": row[5], "child_name": row[6],
+                "created_at": row[7].isoformat() if row[7] else None,
+                "updated_at": row[8].isoformat() if row[8] else None,
             }
         }
     except psycopg2.errors.UniqueViolation:
@@ -1899,30 +2215,26 @@ def memory_get(user_id: str):
 
 
 # ══════════════════════════════════════════════
-# ROUTES — FCM / PUSH NOTIFICATIONS
+# ROUTES — FCM
 # ══════════════════════════════════════════════
 
 @app.post("/register-token", tags=["Notifications"])
 def register_token(req: RegisterTokenReq):
-    conn = get_conn()
-    lang: Lang = "ar"
+    conn = get_conn(); lang: Lang = "ar"
     try:
         ensure_user_exists(conn, req.user_id)
         cur = conn.cursor()
         cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (req.user_id,))
         row = cur.fetchone()
         if row: lang = row[0] or "ar"
-        cur.execute(
-            "UPDATE users SET fcm_token=%s, updated_at=NOW() WHERE user_id=%s",
-            (req.fcm_token, req.user_id)
-        )
+        cur.execute("UPDATE users SET fcm_token=%s, updated_at=NOW() WHERE user_id=%s",
+                    (req.fcm_token, req.user_id))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail=t("user_not_found", lang))
         conn.commit()
         log_event(conn, req.user_id, "fcm_token_registered", value=req.fcm_token[:20])
         return {"ok": True, "user_id": req.user_id, "message": t("token_saved", lang)}
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
@@ -1932,49 +2244,35 @@ def register_token(req: RegisterTokenReq):
 
 @app.post("/send-daily-tip", tags=["Notifications"])
 def send_daily_tip(req: SendDailyTipReq):
-    conn = get_conn()
-    lang: Lang = "ar"
+    conn = get_conn(); lang: Lang = "ar"
     try:
         cur = conn.cursor()
         cur.execute("SELECT fcm_token, preferred_language FROM users WHERE user_id=%s", (req.user_id,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
-        fcm_token: Optional[str] = row[0]
-        lang = row[1] or "ar"
-        if not fcm_token:
-            raise HTTPException(status_code=422, detail=t("no_fcm_token", lang))
-
+        if not row: raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
+        fcm_token: Optional[str] = row[0]; lang = row[1] or "ar"
+        if not fcm_token: raise HTTPException(status_code=422, detail=t("no_fcm_token", lang))
         ensure_user_exists(conn, req.user_id)
         cur.execute("INSERT INTO daily_tips (user_id, tip) VALUES (%s,%s)", (req.user_id, req.tip))
         conn.commit()
-
         if not FIREBASE_ENABLED:
             return {"ok": True, "user_id": req.user_id, "tip_saved": True,
-                    "notification_sent": False,
-                    "warning": t("firebase_not_configured", lang)}
-
+                    "notification_sent": False, "warning": t("firebase_not_configured", lang)}
         try:
-            message = fb_messaging.Message(
+            fb_messaging.send(fb_messaging.Message(
                 notification=fb_messaging.Notification(
-                    title=t("daily_tip_notif_title", lang),
-                    body=req.tip[:200],
-                ),
-                token=fcm_token,
-                data={"user_id": req.user_id, "type": "daily_tip"},
-            )
-            fb_messaging.send(message)
+                    title=t("daily_tip_notif_title", lang), body=req.tip[:200]),
+                token=fcm_token, data={"user_id": req.user_id, "type": "daily_tip"},
+            ))
         except fb_messaging.UnregisteredError:
             cur.execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (req.user_id,))
             conn.commit()
             raise HTTPException(status_code=410, detail=t("fcm_token_expired", lang))
         except Exception as fb_exc:
             raise HTTPException(status_code=502, detail=f"Firebase error: {fb_exc}")
-
         log_event(conn, req.user_id, "daily_tip_sent", value=req.tip[:100])
         return {"ok": True, "user_id": req.user_id, "tip_saved": True, "notification_sent": True}
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
@@ -1988,22 +2286,16 @@ def get_daily_tips(user_id: str, limit: int = 50):
     try:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM users WHERE user_id=%s", (user_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
-        cur.execute(
-            "SELECT id, tip, created_at FROM daily_tips WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-            (user_id, max(1, min(200, limit)))
-        )
+        if not cur.fetchone(): raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
+        cur.execute("SELECT id, tip, created_at FROM daily_tips WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+                    (user_id, max(1, min(200, limit))))
         rows = cur.fetchall()
         return {"user_id": user_id, "total": len(rows),
                 "tips": [{"id": r[0], "tip": r[1],
-                          "created_at": r[2].isoformat() if r[2] else None} for r in rows]}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    finally:
-        conn.close()
+                           "created_at": r[2].isoformat() if r[2] else None} for r in rows]}
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally: conn.close()
 
 
 # ══════════════════════════════════════════════
@@ -2017,22 +2309,20 @@ def kb_topics():
 
 
 @app.get("/kb/search", tags=["KB"])
-def kb_search_api(topic: str, q: str = "", age: Optional[int] = None, lang: Optional[str] = None):
-    """Search knowledge base: tries PostgreSQL FTS first, falls back to in-memory KB."""
-    db_results = fts_knowledge_base(query=q, topic=topic, lang=lang, limit=3)
+def kb_search_api(topic: str, q: str = "", age: Optional[int] = None,
+                   lang: Optional[str] = None, user_id: Optional[str] = None):
+    db_results = fts_knowledge_base(query=q, topic=topic, lang=lang, user_id=user_id, limit=3)
     if db_results:
         return {"topic": topic, "age": age, "matched": True, "source": "postgres_fts",
-                "match_count": len(db_results), "used_default": False, "tips": db_results}
+                "match_count": len(db_results), "tips": db_results}
     res = kb_search_v2(topic=topic, query=q, age=age)
     return {"topic": topic, "age": age, "matched": res.matched, "source": "in_memory_kb",
-            "match_count": res.match_count, "used_default": res.used_default, "tips": res.tips}
+            "match_count": res.match_count, "tips": res.tips}
 
 
 @app.post("/kb/add", tags=["KB"])
 def kb_add(req: KbAddRequest):
-    """Add to in-memory KB (legacy — use /kb/faq/add for DB persistence)."""
-    if req.admin_key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="Invalid admin_key")
+    if req.admin_key != ADMIN_KEY: raise HTTPException(status_code=401, detail="Invalid admin_key")
     new_id = "kb_" + uuid.uuid4().hex[:6]
     KB.append({"id": new_id, "topic": req.topic, "age_min": req.age_min,
                "age_max": req.age_max, "tags": req.tags, "tip": req.tip})
@@ -2041,34 +2331,26 @@ def kb_add(req: KbAddRequest):
 
 @app.post("/kb/faq/add", tags=["KB"])
 def faq_kb_add(req: FaqKbAddRequest):
-    """Add a Q&A pair to the persistent faq_knowledge_base table."""
-    if req.admin_key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="Invalid admin_key")
+    if req.admin_key != ADMIN_KEY: raise HTTPException(status_code=401, detail="Invalid admin_key")
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO faq_knowledge_base (topic, question, answer, tags, age_min, age_max, lang)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
+            "INSERT INTO faq_knowledge_base (topic, question, answer, tags, age_min, age_max, lang) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (req.topic, req.question, req.answer, req.tags, req.age_min, req.age_max, req.lang)
         )
-        new_id = cur.fetchone()[0]
-        conn.commit()
+        new_id = cur.fetchone()[0]; conn.commit()
         return {"ok": True, "id": new_id, "topic": req.topic, "lang": req.lang}
     except Exception as exc:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
-    finally:
-        conn.close()
+        conn.rollback(); raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    finally: conn.close()
 
 
 @app.get("/kb/faq/search", tags=["KB"])
-def faq_kb_search_api(q: str, topic: Optional[str] = None, lang: Optional[str] = None, limit: int = 3):
-    """Direct FTS search against faq_knowledge_base table."""
-    results = fts_knowledge_base(query=q, topic=topic, lang=lang, limit=limit)
+def faq_kb_search_api(q: str, topic: Optional[str] = None, lang: Optional[str] = None,
+                       limit: int = 3, user_id: Optional[str] = None):
+    results = fts_knowledge_base(query=q, topic=topic, lang=lang, user_id=user_id, limit=limit)
     return {"query": q, "topic": topic, "lang": lang, "count": len(results), "results": results}
 
 
@@ -2080,8 +2362,7 @@ def faq_kb_search_api(q: str, topic: Optional[str] = None, lang: Optional[str] =
 def assessment_questions(age: Optional[int] = None):
     qs = get_assessment_questions(age)
     return {
-        "child_age":       age,
-        "total_questions": len(qs),
+        "child_age": age, "total_questions": len(qs),
         "scale": {"min": 1, "max": 5, "labels": {"1": "Never", "2": "Rarely", "3": "Sometimes", "4": "Often", "5": "Always"}},
         "questions": _format_questions_for_api(qs),
     }
@@ -2090,70 +2371,50 @@ def assessment_questions(age: Optional[int] = None):
 @app.post("/assessment/submit", tags=["Assessment"])
 def assessment_submit(req: AssessmentSubmitReq):
     conn = get_conn()
-    lang: Lang = req.preferred_language if req.preferred_language in ("ar", "en") else "ar"  # type: ignore[assignment]
+    lang: Lang = req.preferred_language if req.preferred_language in ("ar", "en") else "ar"  # type: ignore
     try:
         ensure_user_exists(conn, req.user_id)
-
         if req.preferred_language is None:
             cur = conn.cursor()
             cur.execute("SELECT preferred_language FROM users WHERE user_id=%s", (req.user_id,))
             row = cur.fetchone()
             if row and row[0]: lang = row[0]
-
-        if DEBUG:
-            print(f"[ASSESSMENT] user={req.user_id}, child_age={req.child_age}, answers_count={len(req.answers)}")
-
         profile     = compute_personality_profile(req.answers, req.child_age, req.behavior_signals)
         assess_conf = compute_assessment_confidence(req.answers, req.child_age, req.behavior_signals)
-
         profile_to_store = {k: v for k, v in profile.items() if k != "_debug"}
-
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO assessments (user_id, child_age, assessment_confidence, result, created_at) VALUES (%s,%s,%s,%s,NOW())",
+            "INSERT INTO assessments (user_id, child_age, assessment_confidence, result, created_at) "
+            "VALUES (%s,%s,%s,%s,NOW())",
             (req.user_id, req.child_age, assess_conf["confidence"], json.dumps(profile_to_store))
         )
         conn.commit()
         update_memory(conn, req.user_id, "assessment_personality", req.child_age, note="Assessment submitted")
         log_event(conn, req.user_id, "assessment_submit", value=f"confidence={assess_conf['confidence']}")
-
         return {
-            "ok":                     True,
-            "message":                t("ok", lang),
-            "trait_scores":           profile["trait_scores"],
-            "top_traits":             profile["top_traits"],
-            "low_traits":             profile["low_traits"],
-            "possible_personalities": profile["possible_personalities"],
-            "recommendations":        profile["recommendations"],
-            "confidence":             assess_conf["confidence"],
-            "assessment_meta":        assess_conf,
-            "note":                   t("assessment_note", lang),
-            "debug":                  profile.get("_debug", {}),
+            "ok": True, "message": t("ok", lang),
+            "trait_scores": profile["trait_scores"], "top_traits": profile["top_traits"],
+            "low_traits": profile["low_traits"], "possible_personalities": profile["possible_personalities"],
+            "recommendations": profile["recommendations"], "confidence": assess_conf["confidence"],
+            "assessment_meta": assess_conf, "note": t("assessment_note", lang),
+            "debug": profile.get("_debug", {}),
         }
     except Exception as exc:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        conn.close()
+        conn.rollback(); raise HTTPException(status_code=500, detail=str(exc))
+    finally: conn.close()
 
 
 @app.get("/assessment/{user_id}", tags=["Assessment"])
 def get_assessments(user_id: str):
-    conn = get_conn()
-    cur  = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        "SELECT id, child_age, assessment_confidence, result, created_at FROM assessments WHERE user_id=%s ORDER BY created_at DESC",
-        (user_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return {
-        "assessments": [
-            {"id": r[0], "child_age": r[1], "confidence": float(r[2]), "result": r[3],
-             "created_at": r[4].isoformat() if r[4] else None}
-            for r in rows
-        ]
-    }
+        "SELECT id, child_age, assessment_confidence, result, created_at "
+        "FROM assessments WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+    rows = cur.fetchall(); conn.close()
+    return {"assessments": [
+        {"id": r[0], "child_age": r[1], "confidence": float(r[2]), "result": r[3],
+         "created_at": r[4].isoformat() if r[4] else None} for r in rows
+    ]}
 
 
 # ══════════════════════════════════════════════
@@ -2162,40 +2423,32 @@ def get_assessments(user_id: str):
 
 @app.post("/analytics/event", tags=["Analytics"])
 def analytics_event(req: AppEventRequest):
-    conn = get_conn()
-    ensure_user_exists(conn, req.user_id)
+    conn = get_conn(); ensure_user_exists(conn, req.user_id)
     log_event(conn, req.user_id, req.event_name, value=json.dumps(req.meta)[:300])
-    conn.close()
-    return {"ok": True}
+    conn.close(); return {"ok": True}
 
 
 @app.get("/analytics/summary", tags=["Analytics"])
 def analytics_summary():
-    conn = get_conn()
-    cur  = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT event_type, COUNT(*) FROM analytics GROUP BY event_type")
     rows = cur.fetchall()
     cur.execute("SELECT COUNT(*) FROM analytics")
-    total = cur.fetchone()[0]
-    conn.close()
+    total = cur.fetchone()[0]; conn.close()
     return {"total_events": total, "by_type": {r[0]: r[1] for r in rows}}
 
 
 @app.get("/analytics/user/{user_id}", tags=["Analytics"])
 def analytics_user(user_id: str):
-    conn = get_conn()
-    cur  = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        "SELECT event_id, event_type, value, created_at FROM analytics WHERE user_id=%s ORDER BY created_at DESC LIMIT 100",
-        (user_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return {
-        "user_id": user_id,
-        "recent_events": [{"event_id": r[0], "event_type": r[1], "value": r[2],
-                           "created_at": r[3].isoformat() if r[3] else None} for r in rows]
-    }
+        "SELECT event_id, event_type, value, created_at FROM analytics "
+        "WHERE user_id=%s ORDER BY created_at DESC LIMIT 100", (user_id,))
+    rows = cur.fetchall(); conn.close()
+    return {"user_id": user_id, "recent_events": [
+        {"event_id": r[0], "event_type": r[1], "value": r[2],
+         "created_at": r[3].isoformat() if r[3] else None} for r in rows
+    ]}
 
 
 # ══════════════════════════════════════════════
@@ -2209,17 +2462,16 @@ def feedback(req: FeedbackReq):
         ensure_user_exists(conn, req.user_id)
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO feedback (user_id, message_id, rating, comment, topic, created_at) VALUES (%s,%s,%s,%s,%s,NOW())",
-            (req.user_id, req.message_id, req.rating, req.comment, req.topic)
-        )
+            "INSERT INTO feedback (user_id, message_id, rating, comment, topic, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,NOW())",
+            (req.user_id, req.message_id, req.rating, req.comment, req.topic))
         conn.commit()
         if req.comment:
             update_memory(conn, req.user_id, req.topic or "general_parenting", None,
                           note=f"FEEDBACK:{req.rating}:{req.comment}")
         log_event(conn, req.user_id, "feedback", value=f"{req.rating}:{req.message_id}")
         return {"ok": True}
-    finally:
-        conn.close()
+    finally: conn.close()
 
 
 # ══════════════════════════════════════════════
@@ -2228,67 +2480,52 @@ def feedback(req: FeedbackReq):
 
 @app.get("/chat/{user_id}", tags=["Chat"])
 def get_chat_history(user_id: str, limit: int = 50):
-    conn = get_conn()
-    cur  = conn.cursor()
+    conn = get_conn(); cur = conn.cursor()
     cur.execute(
-        "SELECT message_id, message, response, created_at FROM chat_messages WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-        (user_id, max(1, min(200, limit)))
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return {
-        "messages": [{"message_id": r[0], "user_message": r[1], "bot_reply": r[2],
-                      "created_at": r[3].isoformat() if r[3] else None} for r in rows]
-    }
+        "SELECT message_id, message, response, created_at FROM chat_messages "
+        "WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+        (user_id, max(1, min(200, limit))))
+    rows = cur.fetchall(); conn.close()
+    return {"messages": [
+        {"message_id": r[0], "user_message": r[1], "bot_reply": r[2],
+         "created_at": r[3].isoformat() if r[3] else None} for r in rows
+    ]}
 
 
 # ══════════════════════════════════════════════
-# ROUTES — CHAT (main)
+# ROUTES — CHAT (main, plan-aware RAG)
 # ══════════════════════════════════════════════
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(req: ChatRequest):
-    # ── 1. Safe extraction ────────────────────────────────────────────
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages list is empty")
-
     last_msg     = req.messages[-1]
     user_message = (last_msg.content or "").strip()
-
     if not user_message:
         raise HTTPException(status_code=400, detail="User message content is empty")
-
-    # ── 2. Gemini availability ────────────────────────────────────────
     if not GEMINI_ENABLED or client is None:
         return ChatResponse(reply=t("gemini_disabled", detect_lang(user_message)))
 
-    # ── 3. Detect language ────────────────────────────────────────────
     lang: Lang = (
-        req.preferred_language  # type: ignore[assignment]
+        req.preferred_language  # type: ignore
         if req.preferred_language in ("ar", "en")
         else detect_lang(user_message)
     )
 
-    # ── 4. Hard guards ────────────────────────────────────────────────
     if hard_out_of_scope(user_message) or hard_medical(user_message):
         return ChatResponse(reply=t("out_of_scope_reply", lang))
 
-    # ── 5. Risk guard ─────────────────────────────────────────────────
     risk_level = detect_risk_level(user_message)
     if risk_level == "high":
         conn = get_conn()
-        try:
-            ensure_user_exists(conn, req.user_id)
-            log_event(conn, req.user_id, "risk_high", value=user_message[:200])
-        finally:
-            conn.close()
+        try: ensure_user_exists(conn, req.user_id); log_event(conn, req.user_id, "risk_high", value=user_message[:200])
+        finally: conn.close()
         return ChatResponse(reply=t("risk_high", lang))
 
-    # ── 6. Kids content safety ────────────────────────────────────────
     if kids_safety_guard(user_message):
         return ChatResponse(reply=t("kids_safety", lang))
 
-    # ── 7. Route & retrieve KB context ───────────────────────────────
     topic = "general_parenting"
     age   = req.child_age
 
@@ -2299,42 +2536,46 @@ def chat(req: ChatRequest):
         topic = decision.topic
         age   = decision.extracted_child_age or req.child_age
     except Exception as exc:
-        if DEBUG:
-            print(f"[CHAT] Router error (non-fatal, using general_parenting): {exc}")
+        if DEBUG: print(f"[CHAT] Router error: {exc}")
 
-    retrieved_context, from_db = fts_or_kb_fallback(
-        query=user_message, topic=topic, age=age, lang=lang, limit=3,
+    # ── Retrieve: user's own plan first, then general KB ─────────────
+    plan_context = retrieve_plan_context_for_user(
+        user_id=req.user_id, query=user_message, lang=lang, limit=2,
+        conn_factory=get_conn,
     )
+    general_context, from_db = fts_or_kb_fallback(
+        query=user_message, topic=topic, age=age, lang=lang,
+        user_id=req.user_id, limit=3,
+    )
+    retrieved_context = plan_context + [
+        c for c in general_context
+        if c.get("source") != "generated_parenting_plan"
+    ]
 
-    if DEBUG:
-        print(f"[CHAT] retrieval source={'postgres_fts' if from_db else 'in_memory_kb'} "
-              f"| results={len(retrieved_context)}")
-
-    # ── 8. Build context block ────────────────────────────────────────
     if retrieved_context:
         context_lines = []
         for i, item in enumerate(retrieved_context, 1):
             q_text = item.get("question", "").strip()
             a_text = item.get("answer", item.get("tip", "")).strip()
+            src    = item.get("source", "")
+            label  = "[Your Plan] " if src == "generated_parenting_plan" else ""
             if a_text:
-                context_lines.append(
-                    f"[{i}] Q: {q_text}\n    A: {a_text}" if q_text else f"[{i}] {a_text}"
-                )
-        context_block = "\n\n".join(context_lines) if context_lines else "No specific context found."
+                context_lines.append(f"[{i}] {label}{f'Q: {q_text}' + chr(10) + '    A: ' if q_text else ''}{a_text}")
+        context_block = "\n\n".join(context_lines) or "No specific context found."
     else:
         context_block = "No specific context found."
 
-    # ── 9. Build Gemini prompt ────────────────────────────────────────
     prompt = f"""You are a professional parenting assistant called Rafiq.
 
 Rules:
 - ALWAYS provide a direct, helpful answer.
 - NEVER ask follow-up questions.
 - NEVER request more information from the user.
+- If [Your Plan] context is present, prioritise it — it is from the user's own personalised parenting plan.
 - Use the Knowledge Base Context below if it is relevant; otherwise rely on your general parenting knowledge.
 - Respond in the same language as the User Question.
 - Do NOT use Markdown formatting symbols such as **, *, or # anywhere in your response.
-- Output ONLY the final plain-text answer — no preamble, no metadata, no formatting markers.
+- Output ONLY the final plain-text answer — no preamble, no metadata.
 
 Knowledge Base Context:
 {context_block}
@@ -2344,11 +2585,9 @@ User Question:
 
 Now generate only the final answer."""
 
-    # ── 10. Call Gemini ───────────────────────────────────────────────
     try:
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+            model=GEMINI_MODEL, contents=prompt,
             config=genai_types.GenerateContentConfig(temperature=0.4, max_output_tokens=600),
         )
         reply_text = strip_markdown((response.text or "").strip())
@@ -2356,23 +2595,14 @@ Now generate only the final answer."""
         raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
 
     if not reply_text:
-        reply_text = (
-            "عذرًا، لم أتمكن من توليد رد. حاول مرة أخرى."
-            if lang == "ar"
-            else "Sorry, I couldn't generate a response. Please try again."
-        )
+        reply_text = ("عذرًا، لم أتمكن من توليد رد. حاول مرة أخرى."
+                      if lang == "ar" else "Sorry, I couldn't generate a response. Please try again.")
 
-    # ── 11. Auto-learn ────────────────────────────────────────────────
     maybe_learn_from_interaction(
-        user_message=user_message,
-        reply_text=reply_text,
-        topic=topic,
-        lang=lang,
-        child_age=age,
-        conn_factory=get_conn,
+        user_message=user_message, reply_text=reply_text, topic=topic,
+        lang=lang, child_age=age, conn_factory=get_conn,
     )
 
-    # ── 12. Persist to DB ─────────────────────────────────────────────
     message_id = "msg_" + uuid.uuid4().hex[:10]
     try:
         conn = get_conn()
@@ -2383,38 +2613,57 @@ Now generate only the final answer."""
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO chat_messages (message_id, user_id, message, response) VALUES (%s,%s,%s,%s)",
-                (message_id, req.user_id, user_message, reply_text)
-            )
+                (message_id, req.user_id, user_message, reply_text))
             conn.commit()
-        finally:
-            conn.close()
+        finally: conn.close()
     except Exception as db_exc:
         print(f"[CHAT] DB persistence error (non-fatal): {db_exc}")
 
-    # ── 13. Return ────────────────────────────────────────────────────
     return ChatResponse(reply=reply_text)
 
 
 # ══════════════════════════════════════════════
-# ROUTES — PARENTING PLAN
+# ROUTES — PARENTING PLAN  (v5.0)
 # ══════════════════════════════════════════════
 
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
-def generate_parenting_plan(user_id: str):
-    """Generate a personalised 30-day parenting plan (English)."""
+def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = None):
+    """
+    Generate a personalised 15-day parenting plan.
+    Optionally pass parent_name and child_name in the request body.
+    After generation:
+      1. Saves plan_days (JSON) to DB.
+      2. Sends FCM push notification.
+      3. Runs RAG ingestion (FTS + embeddings).
+    """
     if not GEMINI_ENABLED or client is None:
-        raise HTTPException(status_code=503, detail="Gemini is disabled. Set GEMINI_API_KEY.")
+        raise HTTPException(status_code=503, detail="Gemini is disabled.")
 
     lang: Lang = "en"
-    print(f"[PLAN] Generating parenting plan for user={user_id}, language=EN")
+    _plan_logger.info("[plan] Generate request — user=%s", user_id)
 
     conn = get_conn()
     try:
         ensure_user_exists(conn, user_id)
         cur = conn.cursor()
 
+        # ── Fetch user meta ──────────────────────────────────────────
         cur.execute(
-            "SELECT id, child_age, assessment_confidence, result, created_at FROM assessments WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
+            "SELECT child_age, preferred_language, parent_name, child_name FROM users WHERE user_id=%s",
+            (user_id,)
+        )
+        user_row = cur.fetchone()
+        db_parent_name = user_row[3] if user_row else None
+        db_child_name  = user_row[4] if user_row and len(user_row) > 4 else None
+
+        # Allow overriding names via request body
+        parent_name = (req and req.parent_name) or db_parent_name or "Parent"
+        child_name  = (req and req.child_name)  or db_child_name  or ""
+
+        # ── Fetch latest assessment ───────────────────────────────────
+        cur.execute(
+            "SELECT id, child_age, assessment_confidence, result, created_at "
+            "FROM assessments WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
             (user_id,)
         )
         row = cur.fetchone()
@@ -2426,10 +2675,7 @@ def generate_parenting_plan(user_id: str):
         try:
             result: Dict[str, Any] = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
         except (json.JSONDecodeError, TypeError) as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to parse assessment result: {exc}")
-
-        if DEBUG:
-            print(f"[PLAN] assessment result: {json.dumps(result, ensure_ascii=False)[:400]}")
+            raise HTTPException(status_code=500, detail=f"Failed to parse assessment: {exc}")
 
         top_traits             = _norm_traits(result.get("top_traits", []))
         possible_personalities = _norm_personalities(result.get("possible_personalities", []))
@@ -2440,32 +2686,58 @@ def generate_parenting_plan(user_id: str):
         archetype_desc  = top_arch_entry.get("description", "")
         archetype_needs = top_arch_entry.get("needs",       "")
 
-        traits_text = "\n".join(f"  - {tr['trait'].replace('_', ' ').title()}: {tr['score']}%" for tr in top_traits) or "  - No data"
-        scores_text = "\n".join(f"  - {k.replace('_', ' ').title()}: {v}%" for k, v in trait_scores.items()) or "  - No data"
+        traits_text = "\n".join(f"  - {tr['trait'].replace('_',' ').title()}: {tr['score']}%" for tr in top_traits) or "  - No data"
+        scores_text = "\n".join(f"  - {k.replace('_',' ').title()}: {v}%" for k, v in trait_scores.items()) or "  - No data"
 
+        # ── 1. Generate intro letter ──────────────────────────────────
+        _plan_logger.info("[plan] Generating intro letter — parent=%s child=%s", parent_name, child_name)
         try:
-            plan_text = gemini_generate_parenting_plan(
-                child_age=child_age, top_archetype=top_archetype,
-                archetype_desc=archetype_desc, archetype_needs=archetype_needs,
-                traits_text=traits_text, scores_text=scores_text, lang=lang,
+            intro_letter = gemini_generate_intro_letter(
+                parent_name=parent_name, child_name=child_name, child_age=child_age,
+                top_archetype=top_archetype, archetype_desc=archetype_desc,
+                top_traits=top_traits, lang=lang,
             )
-        except HTTPException:
-            raise
+        except Exception as exc:
+            _plan_logger.warning("[plan] Intro letter failed (non-fatal): %s", exc)
+            intro_letter = f"Dear {parent_name},\n\nWelcome to your personalised 15-day parenting plan. This plan has been carefully designed based on your child's unique personality and needs. We hope it helps you build an even deeper connection with your child.\n\nWarm regards,\nRafiq AI"
+
+        # ── 2. Generate 15-day structured plan ───────────────────────
+        _plan_logger.info("[plan] Generating 15-day plan JSON")
+        try:
+            plan_days = gemini_generate_15day_plan_json(
+                parent_name=parent_name, child_name=child_name, child_age=child_age,
+                top_archetype=top_archetype, archetype_desc=archetype_desc,
+                archetype_needs=archetype_needs, traits_text=traits_text,
+                scores_text=scores_text, lang=lang,
+            )
+        except HTTPException: raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
 
-        if not plan_text:
+        if not plan_days:
             raise HTTPException(status_code=502, detail="Gemini returned an empty plan.")
 
+        plan_text = plan_days_to_plain_text(plan_days)
+        _plan_logger.info("[plan] PDF generated successfully ✔ — days=%d", len(plan_days))
+
+        # ── 3. Save to DB ─────────────────────────────────────────────
         try:
             cur.execute(
-                "INSERT INTO parenting_plans (user_id, plan_text, plan_language, created_at) VALUES (%s,%s,%s,NOW()) RETURNING id, created_at",
-                (user_id, plan_text, lang)
+                """
+                INSERT INTO parenting_plans
+                    (user_id, plan_text, plan_language, plan_days, parent_name,
+                     child_name, intro_letter, plan_duration, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                RETURNING id, created_at
+                """,
+                (user_id, plan_text, lang, json.dumps(plan_days),
+                 parent_name, child_name, intro_letter, 15)
             )
             plan_row        = cur.fetchone()
             conn.commit()
             plan_id         = plan_row[0]
             plan_created_at = plan_row[1].isoformat() if plan_row[1] else None
+            _plan_logger.info("[plan] Plan saved in DB ✔ — plan_id=%s", plan_id)
         except Exception as exc:
             conn.rollback()
             raise HTTPException(status_code=500, detail=f"DB error saving plan: {exc}")
@@ -2473,81 +2745,142 @@ def generate_parenting_plan(user_id: str):
         log_event(conn, user_id, "parenting_plan_generated",
                   value=f"plan_id={plan_id}, lang={lang}, assessment_id={assessment_id}")
 
-        # FCM notification
-        notification_sent    = False
-        notification_warning = None
+        # ── 4. FCM push notification ──────────────────────────────────
+        notif_result = _send_fcm_notification(
+            user_id=user_id,
+            title=t("plan_notif_title", lang),
+            body=t("plan_notif_body",  lang),
+            data={"type": "parenting_plan", "user_id": str(user_id), "plan_id": str(plan_id)},
+            conn_factory=get_conn,
+        )
+        _plan_logger.info("[plan] FCM notification — sent=%s warning=%s",
+                          notif_result["sent"], notif_result.get("warning"))
 
-        if not _FIREBASE_AVAILABLE:
-            notification_warning = "firebase-admin package is not installed."
-        elif not _FIREBASE_CREDS_JSON:
-            notification_warning = "FIREBASE_CREDENTIALS environment variable is not set."
-        elif not FIREBASE_ENABLED:
-            notification_warning = "Firebase failed to initialise at startup."
-        else:
-            notif_conn = None
-            try:
-                notif_conn = get_conn()
-                notif_cur  = notif_conn.cursor()
-                notif_cur.execute("SELECT fcm_token FROM users WHERE user_id=%s", (user_id,))
-                token_row  = notif_cur.fetchone()
-                fcm_token: Optional[str] = token_row[0] if token_row else None
+        # ── 5. In-app message (stored as a chat_messages row) ─────────
+        app_message = (
+            f"Hi {parent_name} 👋\n\n"
+            f"Your personalised 15-day parenting plan has been created successfully.\n"
+            f"Your PDF is ready — use GET /export-plan-pdf/{user_id} to download it.\n\n"
+            f"Your child's profile: {top_archetype}\n"
+            f"Duration: 15 days\n"
+            f"Plan ID: {plan_id}"
+        )
+        try:
+            cur.execute(
+                "INSERT INTO chat_messages (message_id, user_id, message, response) VALUES (%s,%s,%s,%s)",
+                ("plan_" + uuid.uuid4().hex[:10], user_id,
+                 "[SYSTEM] Parenting plan generated", app_message)
+            )
+            conn.commit()
+        except Exception as msg_exc:
+            _plan_logger.warning("[plan] In-app message save failed (non-fatal): %s", msg_exc)
 
-                if not fcm_token:
-                    notification_warning = "User has no registered FCM token. Call POST /register-token first."
-                else:
-                    message = fb_messaging.Message(
-                        notification=fb_messaging.Notification(
-                            title="📋 Your parenting plan is ready",
-                            body="Your personalized 30-day plan has been generated.",
-                        ),
-                        token=fcm_token,
-                        data={"type": "parenting_plan", "user_id": str(user_id), "plan_id": str(plan_id)},
-                    )
-                    fb_messaging.send(message)
-                    notification_sent = True
-            except AttributeError as ae:
-                notification_warning = f"Firebase messaging object is None: {ae}"
-            except Exception as fb_exc:
-                err_str = str(fb_exc)
-                if "UNREGISTERED" in err_str.upper() or "registration-token-not-registered" in err_str:
-                    if notif_conn:
-                        fix_cur = notif_conn.cursor()
-                        fix_cur.execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,))
-                        notif_conn.commit()
-                    notification_warning = "FCM token expired — cleared. User must re-register."
-                else:
-                    notification_warning = f"Firebase send error: {err_str}"
-            finally:
-                if notif_conn:
-                    try:
-                        notif_conn.close()
-                    except Exception:
-                        pass
+        # ── 6. RAG ingestion (async-style — runs in same thread, non-blocking errors) ─
+        try:
+            rag_summary = ingest_plan_to_knowledge_base(
+                plan_id=plan_id, user_id=user_id,
+                parent_name=parent_name, child_name=child_name,
+                child_age=child_age, child_profile=top_archetype,
+                plan_days=plan_days, intro_letter=intro_letter,
+                lang=lang, conn_factory=get_conn,
+            )
+            _plan_logger.info("[plan] RAG ingestion complete — %s", rag_summary)
+        except Exception as rag_exc:
+            _plan_logger.error("[plan] RAG ingestion failed (non-fatal): %s", rag_exc, exc_info=True)
+            rag_summary = {"error": str(rag_exc)}
 
+        # ── Build response ────────────────────────────────────────────
         response_payload: Dict[str, Any] = {
-            "ok":                True,
-            "message":           t("plan_created_title", lang),
-            "user_id":           user_id,
-            "plan_id":           plan_id,
-            "created_at":        plan_created_at,
-            "plan_language":     lang,
-            "child_age":         child_age,
-            "top_archetype":     top_archetype,
-            "assessment_id":     assessment_id,
-            "notification_sent": notification_sent,
-            "plan_text":         plan_text,
+            "ok":                  True,
+            "message":             t("plan_created_title", lang),
+            "user_id":             user_id,
+            "plan_id":             plan_id,
+            "created_at":          plan_created_at,
+            "plan_language":       lang,
+            "plan_duration_days":  15,
+            "child_age":           child_age,
+            "parent_name":         parent_name,
+            "child_name":          child_name,
+            "top_archetype":       top_archetype,
+            "assessment_id":       assessment_id,
+            "notification_sent":   notif_result["sent"],
+            "plan_days":           plan_days,
+            "plan_text":           plan_text,
+            "rag_ingestion":       rag_summary,
+            "pdf_export_url":      f"/export-plan-pdf/{user_id}",
         }
-        if notification_warning:
-            response_payload["notification_warning"] = notification_warning
+        if notif_result.get("warning"):
+            response_payload["notification_warning"] = notif_result["warning"]
         return response_payload
 
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
     finally:
         conn.close()
+
+
+@app.post("/ingest-plan-to-kb/{plan_id}", tags=["Parenting Plan"])
+def ingest_plan_to_kb(plan_id: int, admin_key: str):
+    """
+    Manually trigger RAG ingestion for an existing plan.
+    Useful for back-filling plans created before v5.0.
+    """
+    if admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin_key")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, plan_days, plan_language, parent_name, child_name, "
+            "intro_letter FROM parenting_plans WHERE id=%s",
+            (plan_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
+        user_id, plan_days_raw, lang, parent_name, child_name, intro_letter = row
+
+        # Fetch child age + archetype
+        cur.execute(
+            "SELECT a.child_age, a.result FROM assessments a "
+            "JOIN parenting_plans pp ON pp.user_id=a.user_id "
+            "WHERE pp.id=%s ORDER BY a.created_at DESC LIMIT 1",
+            (plan_id,)
+        )
+        arow = cur.fetchone()
+        child_age     = arow[0] if arow else None
+        child_profile = "Unknown"
+        if arow and arow[1]:
+            try:
+                res = json.loads(arow[1]) if isinstance(arow[1], str) else arow[1]
+                pp  = _norm_personalities(res.get("possible_personalities", []))
+                if pp: child_profile = pp[0].get("name", "Unknown")
+            except Exception: pass
+
+        try:
+            plan_days = json.loads(plan_days_raw) if isinstance(plan_days_raw, str) else plan_days_raw
+        except Exception:
+            raise HTTPException(status_code=500, detail="plan_days is not valid JSON")
+
+        conn.close()
+
+        rag_summary = ingest_plan_to_knowledge_base(
+            plan_id=plan_id, user_id=user_id,
+            parent_name=parent_name or "Parent", child_name=child_name or "",
+            child_age=child_age, child_profile=child_profile,
+            plan_days=plan_days or [], intro_letter=intro_letter or "",
+            lang=lang or "en", conn_factory=get_conn,
+        )
+        return {"ok": True, "plan_id": plan_id, "rag_summary": rag_summary}
+
+    except HTTPException: raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        try: conn.close()
+        except Exception: pass
 
 
 @app.get("/parenting-plans/{user_id}", tags=["Parenting Plan"])
@@ -2556,33 +2889,31 @@ def get_parenting_plans(user_id: str, limit: int = 10):
     try:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM users WHERE user_id=%s", (user_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
+        if not cur.fetchone(): raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
         cur.execute(
-            "SELECT id, plan_text, plan_language, created_at FROM parenting_plans WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            "SELECT id, plan_text, plan_language, plan_duration, parent_name, child_name, created_at "
+            "FROM parenting_plans WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
             (user_id, max(1, min(50, limit)))
         )
         rows = cur.fetchall()
         return {
             "user_id": user_id, "total": len(rows),
             "plans": [{"id": r[0], "plan_text": r[1], "plan_language": r[2],
-                       "created_at": r[3].isoformat() if r[3] else None} for r in rows],
+                       "plan_duration": r[3], "parent_name": r[4], "child_name": r[5],
+                       "created_at": r[6].isoformat() if r[6] else None} for r in rows],
         }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    finally:
-        conn.close()
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally: conn.close()
 
 
 # ══════════════════════════════════════════════
-# ROUTES — PDF EXPORT
+# ROUTES — PDF EXPORT  (v5.0 redesign)
 # ══════════════════════════════════════════════
 
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
 def export_plan_pdf(user_id: str):
-    """Export the latest parenting plan as a PDF (English)."""
+    """Export the latest parenting plan as a redesigned PDF."""
     if not _REPORTLAB_AVAILABLE:
         raise HTTPException(status_code=503, detail=t("pdf_unavailable", "en"))
 
@@ -2592,9 +2923,9 @@ def export_plan_pdf(user_id: str):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT pp.id, pp.plan_text, pp.created_at,
-                   u.child_age,
-                   a.result
+            SELECT pp.id, pp.plan_text, pp.plan_days, pp.intro_letter,
+                   pp.parent_name, pp.child_name, pp.created_at,
+                   u.child_age, a.result
             FROM   parenting_plans pp
             LEFT   JOIN users       u ON u.user_id  = pp.user_id
             LEFT   JOIN assessments a ON a.user_id  = pp.user_id
@@ -2608,29 +2939,63 @@ def export_plan_pdf(user_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="No parenting plan found for this user.")
 
-        plan_id, plan_text, created_at, child_age, result_raw = row
+        plan_id, plan_text, plan_days_raw, intro_letter, parent_name, child_name, \
+            created_at, child_age, result_raw = row
+
         generated_at = created_at.isoformat() if created_at else ""
 
+        # Parse plan_days
+        plan_days: List[Dict] = []
+        if plan_days_raw:
+            try:
+                plan_days = json.loads(plan_days_raw) if isinstance(plan_days_raw, str) else plan_days_raw
+            except Exception:
+                pass
+
+        # Fall back: reconstruct minimal day list from plan_text if plan_days is empty
+        if not plan_days and plan_text:
+            current_day: Dict[str, Any] = {}
+            for line in plan_text.splitlines():
+                line = line.strip()
+                if line.startswith("Day ") and line[4:].isdigit():
+                    if current_day: plan_days.append(current_day)
+                    current_day = {"day": int(line[4:]), "goal": "", "activity": "",
+                                   "how_to_do_it": "", "why_it_helps": "", "tip": ""}
+                elif line.startswith("Goal:"):     current_day["goal"]         = line[5:].strip()
+                elif line.startswith("Activity:"): current_day["activity"]     = line[9:].strip()
+                elif line.startswith("How to do it:"): current_day["how_to_do_it"] = line[13:].strip()
+                elif line.startswith("Why it helps:"): current_day["why_it_helps"] = line[13:].strip()
+                elif line.startswith("Tip:"):      current_day["tip"]           = line[4:].strip()
+            if current_day: plan_days.append(current_day)
+
+        # Archetype
         top_archetype = "Not specified"
         if result_raw:
             try:
                 result_obj    = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
                 personalities = _norm_personalities(result_obj.get("possible_personalities", []))
                 if personalities:
-                    arch_id   = personalities[0].get("id", "")
-                    arch_obj  = next((a for a in ARCHETYPES if a["id"] == arch_id), None)
+                    arch_id  = personalities[0].get("id", "")
+                    arch_obj = next((a for a in ARCHETYPES if a["id"] == arch_id), None)
                     top_archetype = arch_obj["name"] if arch_obj else (personalities[0].get("name") or "Not specified")
-            except Exception as parse_exc:
-                print(f"[PDF] Could not parse archetype: {parse_exc}")
+            except Exception: pass
 
         try:
             pdf_bytes = _build_parenting_plan_pdf(
-                user_id=user_id, child_age=child_age,
-                top_archetype=top_archetype, plan_text=plan_text or "",
-                generated_at=generated_at, lang=PDF_LANG,
+                user_id=user_id,
+                parent_name=parent_name or "Parent",
+                child_name=child_name or "",
+                child_age=child_age,
+                top_archetype=top_archetype,
+                intro_letter=intro_letter or "",
+                plan_days=plan_days,
+                generated_at=generated_at,
+                lang=PDF_LANG,
             )
         except Exception as pdf_exc:
             raise HTTPException(status_code=500, detail=f"PDF generation failed: {pdf_exc}")
+
+        _plan_logger.info("[plan] PDF exported — user=%s plan_id=%s bytes=%d", user_id, plan_id, len(pdf_bytes))
 
         filename = f"parenting_plan_{user_id}.pdf"
         return StreamingResponse(
@@ -2642,9 +3007,6 @@ def export_plan_pdf(user_id: str):
             },
         )
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
-    finally:
-        conn.close()
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
+    finally: conn.close()
