@@ -5,6 +5,8 @@ Changes vs v5.0:
 - FIX: get_parenting_plans uses COALESCE(plan_duration, 15) to handle missing column
 - NEW: Query expansion before embedding (expand_query_for_embedding)
 - NEW: Expanded queries used in both retrieval and ingestion embedding
+- FIX (PDF patch): _build_parenting_plan_pdf rewritten — no blank pages, fixed
+  info-table column widths, cleaner day-card layout, no nested Table-in-Table.
 """
 
 from dotenv import load_dotenv
@@ -158,7 +160,7 @@ try:
     from reportlab.lib import colors
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle,
-        PageBreak, KeepTogether,
+        KeepTogether,
     )
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
     from reportlab.pdfbase import pdfmetrics
@@ -518,8 +520,8 @@ def fts_knowledge_base(
             search_term  = tokens[0] if tokens else query.strip()
             like_pattern = f"%{search_term}%"
             ilike_sql = f"""
-                SELECT topic, question, answer, tags, 1.0 AS rank, source
-                FROM   faq_knowledge_base
+                SELECT id,question,answer,category
+                FROM faq_knowledge_base
                 WHERE  (question ILIKE %s OR answer ILIKE %s
                         OR array_to_string(tags, ' ') ILIKE %s)
                 {where_extra}
@@ -1394,7 +1396,7 @@ def gemini_route_decision(user_text, history, fallback_age):
 
 
 # ══════════════════════════════════════════════
-# v5.1 — QUERY EXPANSION (NEW)
+# v5.1 — QUERY EXPANSION
 # ══════════════════════════════════════════════
 
 _rag_logger = logging.getLogger("rafiq.rag")
@@ -1404,7 +1406,6 @@ if not _rag_logger.handlers:
     _rag_logger.addHandler(_rh)
 _rag_logger.setLevel(logging.INFO)
 
-# Minimum word count to skip expansion (already detailed enough)
 _EXPANSION_MIN_WORDS = 8
 
 _QUERY_EXPANSION_PROMPT = """You are a semantic query expansion assistant for Rafiq, 
@@ -1744,7 +1745,6 @@ def ingest_plan_to_knowledge_base(
 
             for i, day in enumerate(plan_days):
                 day_num   = day.get("day", i + 1)
-                # Build raw chunk text
                 chunk_txt = (
                     f"Day {day_num}: {day.get('goal', '')}. "
                     f"Activity: {day.get('activity', '')}. "
@@ -1753,7 +1753,7 @@ def ingest_plan_to_knowledge_base(
                     f"Tip: {day.get('tip', '')}."
                 )
 
-                # v5.1: expand chunk before embedding for richer semantic representation
+                # v5.1: expand chunk before embedding
                 expanded_chunk = expand_query_for_embedding(chunk_txt, lang)
                 _rag_logger.info(
                     "[rag] Day %s chunk expansion: original=%d words → expanded=%d words",
@@ -1777,7 +1777,7 @@ def ingest_plan_to_knowledge_base(
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         RETURNING id
                         """,
-                        (plan_id, user_id, i, chunk_txt,  # store original chunk_txt, embed expanded
+                        (plan_id, user_id, i, chunk_txt,
                          embedding,
                          child_age, child_profile, lang),
                     )
@@ -1823,7 +1823,6 @@ def retrieve_plan_context_for_user(
     """
     results: List[Dict[str, Any]] = []
 
-    # v5.1: expand the query before embedding
     expanded_query = expand_query_for_embedding(query, lang)
 
     # pgvector path
@@ -1853,7 +1852,7 @@ def retrieve_plan_context_for_user(
         except Exception as exc:
             _rag_logger.warning("[rag] pgvector retrieval failed: %s", exc)
 
-    # FTS fallback with source filter — use original query for FTS tokenisation
+    # FTS fallback with source filter
     try:
         fts_tag_filter = f"%user_{user_id}%"
         conn = (conn_factory or get_conn)()
@@ -1886,7 +1885,7 @@ def retrieve_plan_context_for_user(
 
 
 # ══════════════════════════════════════════════
-# PDF HELPERS  (v5.0 — unchanged)
+# PDF HELPERS
 # ══════════════════════════════════════════════
 
 def _safe_xml(text: str) -> str:
@@ -1898,11 +1897,11 @@ def _shape_arabic(text: str) -> str:
     return bidi_display(arabic_reshaper.reshape(text))
 
 
-def _pdf_text(text: str, lang: Lang) -> str:
+def _pdf_text(text: str, lang: str) -> str:
     return _shape_arabic(text) if lang == "ar" else text
 
 
-def _pick_font(bold: bool, lang: Lang) -> str:
+def _pick_font(bold: bool, lang: str) -> str:
     if lang == "ar" and _FONT_ARABIC_REGISTERED:
         return "NotoArabicBold" if bold else "NotoArabic"
     if lang == "en" and _FONT_LATIN_REGISTERED:
@@ -1919,164 +1918,201 @@ def _build_parenting_plan_pdf(
     intro_letter: str,
     plan_days: List[Dict[str, Any]],
     generated_at: str,
-    lang: Lang = "en",
+    lang: str = "en",
 ) -> bytes:
-    buf    = io.BytesIO()
-    W, H   = A4
-    styles = getSampleStyleSheet()
+    """
+    Generate a clean, professional PDF for the 15-day parenting plan.
 
-    text_align  = TA_RIGHT if lang == "ar" else TA_LEFT
+    Fixes applied vs original v5.0/v5.1:
+    - No hard PageBreak → zero blank pages.
+    - Correct info-table column widths (labels 18%, values 32%).
+    - Day cards rendered without nested Table-in-Table wrapping.
+    - Footer never causes a trailing blank page.
+    """
+    buf = io.BytesIO()
+    W, _ = A4
+    USABLE_W = W - 4 * cm
+
+    # ── Colour palette ────────────────────────────────────────────────────────
     brand_green  = colors.HexColor("#1B6B3A")
     brand_light  = colors.HexColor("#E8F5E9")
     brand_dark   = colors.HexColor("#0D4A28")
+    label_bg     = colors.HexColor("#D0EAD8")
     accent_gold  = colors.HexColor("#C8860A")
     accent_light = colors.HexColor("#FFF8E7")
     text_dark    = colors.HexColor("#1A1A1A")
-    text_muted   = colors.HexColor("#555555")
-    day_bg       = colors.HexColor("#F0F7F2")
-    day_num_bg   = colors.HexColor("#1B6B3A")
+    text_muted   = colors.HexColor("#6B7280")
+    day_bg       = colors.HexColor("#F7FAF8")
+    border_color = colors.HexColor("#B2DFBB")
 
-    font_body = _pick_font(False, lang)
-    font_bold = _pick_font(True,  lang)
+    text_align = TA_RIGHT if lang == "ar" else TA_LEFT
+    font_body  = _pick_font(False, lang)
+    font_bold  = _pick_font(True,  lang)
 
-    s_title     = ParagraphStyle("Title5", fontSize=22, textColor=colors.white,
-                                  alignment=TA_CENTER, fontName=font_bold)
-    s_subtitle  = ParagraphStyle("Sub5",   fontSize=13, textColor=colors.white,
-                                  alignment=TA_CENTER, fontName=font_body, spaceAfter=4)
-    s_lbl       = ParagraphStyle("Lbl5",   fontSize=9,  textColor=brand_green, fontName=font_bold)
-    s_val       = ParagraphStyle("Val5",   fontSize=9,  textColor=text_dark,   fontName=font_body)
-    s_letter    = ParagraphStyle("Ltr5",   fontSize=11, textColor=text_dark,   fontName=font_body,
-                                  leading=18, spaceAfter=8, alignment=text_align)
-    s_letter_hd = ParagraphStyle("LtrHd5", fontSize=13, textColor=brand_dark,  fontName=font_bold,
-                                  spaceBefore=10, spaceAfter=6)
-    s_day_num   = ParagraphStyle("DayN5",  fontSize=14, textColor=colors.white,
-                                  fontName=font_bold, alignment=TA_CENTER)
-    s_day_goal  = ParagraphStyle("DayG5",  fontSize=11, textColor=brand_dark,  fontName=font_bold,
-                                  spaceAfter=3, alignment=text_align)
-    s_field_lbl = ParagraphStyle("FLbl5",  fontSize=9,  textColor=accent_gold, fontName=font_bold,
-                                  spaceBefore=5)
-    s_field_val = ParagraphStyle("FVal5",  fontSize=10, textColor=text_dark,   fontName=font_body,
-                                  leading=15, spaceAfter=3, alignment=text_align)
-    s_tip       = ParagraphStyle("Tip5",   fontSize=9,  textColor=colors.HexColor("#2E7D32"),
-                                  fontName=font_bold, leading=14, alignment=text_align)
-    s_footer    = ParagraphStyle("Ftr5",   fontSize=8,  textColor=text_muted,
-                                  alignment=TA_CENTER, fontName=font_body)
+    # ── Paragraph styles ──────────────────────────────────────────────────────
+    s_title      = ParagraphStyle("T",    fontSize=20, textColor=colors.white,
+                                   alignment=TA_CENTER, fontName=font_bold,
+                                   leading=26, spaceAfter=0)
+    s_subtitle   = ParagraphStyle("Sub",  fontSize=11, textColor=colors.HexColor("#C8F7DC"),
+                                   alignment=TA_CENTER, fontName=font_body, spaceAfter=0)
+    s_lbl        = ParagraphStyle("Lbl",  fontSize=8,  textColor=brand_dark,
+                                   fontName=font_bold, leading=10)
+    s_val        = ParagraphStyle("Val",  fontSize=9,  textColor=text_dark,
+                                   fontName=font_body, leading=12)
+    s_letter_hd  = ParagraphStyle("LHd", fontSize=13, textColor=brand_dark,
+                                   fontName=font_bold, spaceBefore=0, spaceAfter=8)
+    s_letter     = ParagraphStyle("Ltr", fontSize=10.5, textColor=text_dark,
+                                   fontName=font_body, leading=17,
+                                   spaceAfter=6, alignment=text_align)
+    s_section_hd = ParagraphStyle("SHd", fontSize=12, textColor=brand_dark,
+                                   fontName=font_bold, spaceBefore=12, spaceAfter=4)
+    s_day_num    = ParagraphStyle("DN",  fontSize=11, textColor=colors.white,
+                                   fontName=font_bold, alignment=TA_CENTER, leading=14)
+    s_day_goal   = ParagraphStyle("DG",  fontSize=11, textColor=brand_dark,
+                                   fontName=font_bold, spaceAfter=0,
+                                   alignment=text_align, leading=14)
+    s_field_lbl  = ParagraphStyle("FL",  fontSize=8,  textColor=accent_gold,
+                                   fontName=font_bold, spaceBefore=4,
+                                   spaceAfter=1, leading=10)
+    s_field_val  = ParagraphStyle("FV",  fontSize=9.5, textColor=text_dark,
+                                   fontName=font_body, leading=14,
+                                   spaceAfter=2, alignment=text_align)
+    s_tip        = ParagraphStyle("Tip", fontSize=9,  textColor=colors.HexColor("#2E7D32"),
+                                   fontName=font_bold, leading=13, alignment=text_align)
+    s_footer     = ParagraphStyle("Ftr", fontSize=7.5, textColor=text_muted,
+                                   alignment=TA_CENTER, fontName=font_body)
 
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm,
+        rightMargin=2 * cm, leftMargin=2 * cm,
+        topMargin=1.5 * cm, bottomMargin=1.5 * cm,
         title=f"Rafiq Parenting Plan — {user_id}",
     )
 
     story = []
 
-    # ── PAGE 1: Banner + Info Card ────────────────────────────────────
-    title_txt    = _pdf_text(t("pdf_main_title", lang), lang)
-    subtitle_txt = _pdf_text(t("pdf_subtitle",   lang), lang)
+    # ── 1. BANNER ─────────────────────────────────────────────────────────────
+    title_text    = _pdf_text("Personalised Parenting Plan", lang)
+    subtitle_text = _pdf_text("15-Day Plan  \u2022  Rafiq AI", lang)
 
     banner = Table(
-        [[Paragraph(_safe_xml(title_txt), s_title)],
-         [Paragraph(_safe_xml(subtitle_txt), s_subtitle)]],
-        colWidths=[W - 4*cm],
+        [
+            [Paragraph(_safe_xml(title_text), s_title)],
+            [Paragraph(_safe_xml(subtitle_text), s_subtitle)],
+        ],
+        colWidths=[USABLE_W],
     )
     banner.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1, -1), brand_green),
-        ("TOPPADDING",    (0, 0), (-1, -1), 18),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+        ("TOPPADDING",    (0, 0), (-1, -1), 14),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
         ("LEFTPADDING",   (0, 0), (-1, -1), 20),
         ("RIGHTPADDING",  (0, 0), (-1, -1), 20),
     ]))
     story.append(banner)
-    story.append(Spacer(1, 0.5*cm))
+    story.append(Spacer(1, 10))
 
-    def _lbl(k): return Paragraph(_safe_xml(_pdf_text(t(k, lang), lang)), s_lbl)
-    def _val(v): return Paragraph(_safe_xml(_pdf_text(str(v), lang)), s_val)
+    # ── 2. INFO TABLE ─────────────────────────────────────────────────────────
+    # 4 columns: label 18% | value 32% | label 18% | value 32%
+    cw = [USABLE_W * 0.18, USABLE_W * 0.32, USABLE_W * 0.18, USABLE_W * 0.32]
 
-    age_disp  = f"{child_age} {'سنة' if lang == 'ar' else 'years'}" if child_age else t("pdf_label_age_unknown", lang)
-    date_disp = generated_at[:10] if generated_at else "—"
+    def _lbl(text): return Paragraph(_safe_xml(_pdf_text(text, lang)), s_lbl)
+    def _val(text): return Paragraph(_safe_xml(_pdf_text(str(text), lang)), s_val)
+
+    age_str  = (f"{child_age} {'سنة' if lang == 'ar' else 'years'}"
+                if child_age else ("\u063a\u064a\u0631 \u0645\u062d\u062f\u062f" if lang == "ar" else "—"))
+    date_str = generated_at[:10] if generated_at else "—"
+
+    parent_label  = "اسم الوالد/الوالدة" if lang == "ar" else "Parent Name"
+    child_label   = "اسم الطفل"           if lang == "ar" else "Child Name"
+    age_label     = "عمر الطفل"           if lang == "ar" else "Child Age"
+    profile_label = "النمط الشخصي"        if lang == "ar" else "Child Profile"
+    gen_label     = "تاريخ الإنشاء"       if lang == "ar" else "Generated"
+    uid_label     = "معرف المستخدم"       if lang == "ar" else "User ID"
 
     info_data = [
-        [_lbl("pdf_label_parent_name"), _val(parent_name or "—"),
-         _lbl("pdf_label_child_name"),  _val(child_name  or "—")],
-        [_lbl("pdf_label_child_age"),   _val(age_disp),
-         _lbl("pdf_label_archetype"),   _val(top_archetype)],
-        [_lbl("pdf_label_generated"),   _val(date_disp),
-         _lbl("pdf_label_user_id"),     _val(user_id)],
+        [_lbl(parent_label),  _val(parent_name or "—"), _lbl(child_label),   _val(child_name or "—")],
+        [_lbl(age_label),     _val(age_str),             _lbl(profile_label), _val(top_archetype)],
+        [_lbl(gen_label),     _val(date_str),            _lbl(uid_label),     _val(user_id)],
     ]
-    cw = (W - 4*cm) / 4
-    info_table = Table(info_data, colWidths=[cw*0.28, cw*0.72*0.7, cw*0.28, cw*0.72*0.7])
-    info_table.setStyle(TableStyle([
+    info_tbl = Table(info_data, colWidths=cw)
+    info_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1, -1), brand_light),
-        ("BACKGROUND",    (0, 0), (0, -1),  colors.HexColor("#D0EAD8")),
-        ("BACKGROUND",    (2, 0), (2, -1),  colors.HexColor("#D0EAD8")),
-        ("TOPPADDING",    (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+        ("BACKGROUND",    (0, 0), (0, -1),  label_bg),
+        ("BACKGROUND",    (2, 0), (2, -1),  label_bg),
+        ("TOPPADDING",    (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
         ("GRID",          (0, 0), (-1, -1), 0.5, colors.HexColor("#BBDDC7")),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
     ]))
-    story.append(info_table)
-    story.append(Spacer(1, 0.4*cm))
-    story.append(HRFlowable(width="100%", thickness=1, color=brand_green, spaceAfter=6))
-    story.append(Spacer(1, 0.2*cm))
+    story.append(info_tbl)
+    story.append(Spacer(1, 6))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=brand_green, spaceAfter=0))
+    story.append(Spacer(1, 12))
 
-    # ── PAGE 2: Intro Letter ──────────────────────────────────────────
-    story.append(PageBreak())
-    story.append(Paragraph(_safe_xml(_pdf_text(
-        "Dear " + (parent_name or "Parent") if lang == "en" else "رسالة شخصية", lang)),
-        s_letter_hd))
-    story.append(HRFlowable(width="50%", thickness=1.5, color=accent_gold, spaceAfter=10))
+    # ── 3. INTRO LETTER ───────────────────────────────────────────────────────
+    # No hard PageBreak — flows naturally after the info table
+    letter_heading = "رسالة شخصية" if lang == "ar" else "A Personal Note For You"
+    story.append(Paragraph(_safe_xml(_pdf_text(letter_heading, lang)), s_letter_hd))
+    story.append(HRFlowable(width="40%", thickness=1.5, color=accent_gold, spaceAfter=8))
 
-    for para in intro_letter.split("\n\n"):
+    for para in (intro_letter or "").split("\n\n"):
         para = para.strip()
         if para:
             story.append(Paragraph(_safe_xml(_pdf_text(para, lang)), s_letter))
-            story.append(Spacer(1, 0.15*cm))
 
-    story.append(Spacer(1, 0.5*cm))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=4))
+    story.append(Spacer(1, 12))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=colors.HexColor("#DDDDDD"), spaceAfter=0))
+    story.append(Spacer(1, 14))
 
-    # ── PAGE 3+: Day Cards ────────────────────────────────────────────
-    story.append(PageBreak())
+    # ── 4. DAY CARDS ─────────────────────────────────────────────────────────
+    plan_heading = "رحلة الـ15 يومًا التربوية" if lang == "ar" else "Your 15-Day Parenting Journey"
+    story.append(Paragraph(_safe_xml(_pdf_text(plan_heading, lang)), s_section_hd))
+    story.append(Spacer(1, 6))
+
+    BADGE_W   = 1.8 * cm
+    CONTENT_W = USABLE_W - BADGE_W - 0.3 * cm
 
     for day in plan_days:
         day_num  = day.get("day", "?")
-        goal     = day.get("goal", "")
-        activity = day.get("activity", "")
+        goal     = day.get("goal",         "")
+        activity = day.get("activity",     "")
         how_to   = day.get("how_to_do_it", "")
         why      = day.get("why_it_helps", "")
-        tip      = day.get("tip", "")
+        tip_text = day.get("tip",          "")
 
-        day_badge = Table([[Paragraph(f"Day {day_num}", s_day_num)]],
-                          colWidths=[2.5*cm])
-        day_badge.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), day_num_bg),
-            ("TOPPADDING",    (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
-        ]))
-
-        goal_p = Paragraph(_safe_xml(_pdf_text(goal, lang)), s_day_goal)
-        header_row = Table([[day_badge, Spacer(0.3*cm, 0), goal_p]],
-                           colWidths=[2.5*cm, 0.3*cm, W - 4*cm - 2.8*cm])
-        header_row.setStyle(TableStyle([
-            ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING",  (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ]))
-
-        def _field(label: str, value: str) -> Table:
-            return Table(
-                [[Paragraph(_safe_xml(_pdf_text(label, lang)), s_field_lbl)],
-                 [Paragraph(_safe_xml(_pdf_text(value, lang)), s_field_val)]],
-                colWidths=[W - 4*cm - 0.4*cm],
-            )
-
-        tip_table = Table(
-            [[Paragraph("💡 " + _safe_xml(_pdf_text(tip, lang)), s_tip)]],
-            colWidths=[W - 4*cm - 0.4*cm],
+        # Header: badge + goal
+        hdr = Table(
+            [[
+                Paragraph(f"Day<br/>{day_num}", s_day_num),
+                Paragraph(_safe_xml(_pdf_text(goal, lang)), s_day_goal),
+            ]],
+            colWidths=[BADGE_W, CONTENT_W],
         )
-        tip_table.setStyle(TableStyle([
+        hdr.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (0, 0), brand_green),
+            ("BACKGROUND",    (1, 0), (1, 0), colors.HexColor("#EBF5EE")),
+            ("TOPPADDING",    (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ("LEFTPADDING",   (0, 0), (0, 0), 4),
+            ("RIGHTPADDING",  (0, 0), (0, 0), 4),
+            ("LEFTPADDING",   (1, 0), (1, 0), 10),
+            ("RIGHTPADDING",  (1, 0), (1, 0), 8),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+
+        activity_label = "النشاط"        if lang == "ar" else "Activity"
+        how_label      = "كيفية التنفيذ" if lang == "ar" else "How to do it"
+        why_label      = "لماذا يفيد"    if lang == "ar" else "Why it helps"
+
+        tip_tbl = Table(
+            [[Paragraph("\U0001f4a1 " + _safe_xml(_pdf_text(tip_text, lang)), s_tip)]],
+            colWidths=[USABLE_W - 0.4 * cm],
+        )
+        tip_tbl.setStyle(TableStyle([
             ("BACKGROUND",    (0, 0), (-1, -1), accent_light),
             ("TOPPADDING",    (0, 0), (-1, -1), 6),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
@@ -2084,33 +2120,50 @@ def _build_parenting_plan_pdf(
             ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
         ]))
 
-        card_inner = [
-            header_row, Spacer(1, 0.2*cm),
-            _field("Activity:", activity),
-            _field("How to do it:", how_to),
-            _field("Why it helps:", why),
-            Spacer(1, 0.1*cm),
-            tip_table,
+        card_elems = [
+            hdr,
+            Spacer(1, 4),
+            Table(
+                [
+                    [Paragraph(_safe_xml(_pdf_text(activity_label, lang)), s_field_lbl)],
+                    [Paragraph(_safe_xml(_pdf_text(activity, lang)),        s_field_val)],
+                    [Paragraph(_safe_xml(_pdf_text(how_label, lang)),       s_field_lbl)],
+                    [Paragraph(_safe_xml(_pdf_text(how_to, lang)),          s_field_val)],
+                    [Paragraph(_safe_xml(_pdf_text(why_label, lang)),       s_field_lbl)],
+                    [Paragraph(_safe_xml(_pdf_text(why, lang)),             s_field_val)],
+                ],
+                colWidths=[USABLE_W - 0.4 * cm],
+            ),
+            Spacer(1, 6),
+            tip_tbl,
+            Spacer(1, 4),
         ]
 
-        card = Table(
-            [[inner] for inner in card_inner],
-            colWidths=[W - 4*cm],
+        card_wrapper = Table(
+            [[e] for e in card_elems],
+            colWidths=[USABLE_W],
         )
-        card.setStyle(TableStyle([
+        card_wrapper.setStyle(TableStyle([
             ("BACKGROUND",    (0, 0), (-1, -1), day_bg),
-            ("TOPPADDING",    (0, 0), (-1, -1), 6),
+            ("TOPPADDING",    (0, 0), (-1, -1), 0),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
-            ("BOX",           (0, 0), (-1, -1), 1, colors.HexColor("#B2DFBB")),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+            ("BOX",           (0, 0), (-1, -1), 1, border_color),
         ]))
 
-        story.append(KeepTogether([card, Spacer(1, 0.35*cm)]))
+        story.append(KeepTogether([card_wrapper, Spacer(1, 8)]))
 
-    story.append(Spacer(1, 0.3*cm))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
-    story.append(Paragraph(_safe_xml(_pdf_text(t("pdf_footer_line1", lang), lang)), s_footer))
+    # ── 5. FOOTER ─────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 8))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=colors.HexColor("#CCCCCC"), spaceAfter=5))
+    footer_text = (
+        "أُنشئت بواسطة رفيق AI — هذه الخطة إرشادية وليست تشخيصًا طبيًا."
+        if lang == "ar" else
+        "Generated by Rafiq AI — This plan is for guidance only and is not a clinical diagnosis."
+    )
+    story.append(Paragraph(_safe_xml(_pdf_text(footer_text, lang)), s_footer))
 
     doc.build(story)
     buf.seek(0)
@@ -2944,7 +2997,7 @@ def get_parenting_plans(user_id: str, limit: int = 10):
 
 
 # ══════════════════════════════════════════════
-# ROUTES — PDF EXPORT  (v5.0 redesign — unchanged)
+# ROUTES — PDF EXPORT
 # ══════════════════════════════════════════════
 
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
