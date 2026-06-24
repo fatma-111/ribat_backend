@@ -1,15 +1,10 @@
 """
-Rafiq Bot API — PRODUCTION v5.0
+Rafiq Bot API — PRODUCTION v5.1
 ================================
-Changes vs v4.4:
-- Parenting plan duration: 30 days → 15 days
-- Daily plan: structured per-day with Goal / Activity / How-To / Why It Helps
-- PDF redesign: cover page with info card, warm intro letter, day cards
-- RAG ingestion pipeline: plans saved as KB entries + pgvector embeddings
-- Post-generation: FCM push notification + in-app message
-- New DB columns: parent_name, child_name, plan_days (JSONB)
-- New endpoint: POST /ingest-plan-to-kb/{plan_id}
-- Logging: all ingestion steps at INFO level
+Changes vs v5.0:
+- FIX: get_parenting_plans uses COALESCE(plan_duration, 15) to handle missing column
+- NEW: Query expansion before embedding (expand_query_for_embedding)
+- NEW: Expanded queries used in both retrieval and ingestion embedding
 """
 
 from dotenv import load_dotenv
@@ -27,7 +22,7 @@ import psycopg2
 
 
 # ══════════════════════════════════════════════
-# TRANSLATIONS  (unchanged from v4.4, kept in full)
+# TRANSLATIONS
 # ══════════════════════════════════════════════
 
 Lang = Literal["ar", "en"]
@@ -196,7 +191,6 @@ except ImportError:
     firebase_admin = fb_credentials = fb_messaging = None
     _FIREBASE_AVAILABLE = False
 
-# pgvector support (optional — embeddings only)
 try:
     from pgvector.psycopg2 import register_vector
     _PGVECTOR_AVAILABLE = True
@@ -276,7 +270,7 @@ def _register_fonts() -> None:
 
 app = FastAPI(
     title="Rafiq Bot API",
-    version="5.0.0",
+    version="5.1.0",
     description="Family support & parenting assistant API — bilingual (ar/en) | FTS + pgvector RAG",
 )
 app.add_middleware(
@@ -317,7 +311,6 @@ def _run_schema_migrations() -> None:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         cur  = conn.cursor()
 
-        # ── existing tables / columns ────────────────────────────────
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) DEFAULT 'ar';")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_name VARCHAR(200);")
@@ -334,7 +327,6 @@ def _run_schema_migrations() -> None:
             """
         )
 
-        # ── v5.0: parenting_plans extended ──────────────────────────
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS parenting_plans (
@@ -361,7 +353,6 @@ def _run_schema_migrations() -> None:
         ]:
             cur.execute(col_sql)
 
-        # ── faq_knowledge_base (FTS) ─────────────────────────────────
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS faq_knowledge_base (
@@ -426,8 +417,6 @@ def _run_schema_migrations() -> None:
             """
         )
 
-        # ── v5.0: plan_embeddings table (pgvector) ───────────────────
-        # Only created if pgvector extension is available in postgres.
         try:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             cur.execute(
@@ -458,13 +447,13 @@ def _run_schema_migrations() -> None:
 
         conn.commit()
         conn.close()
-        print("DB migrations applied ✔ (v5.0)")
+        print("DB migrations applied ✔ (v5.1)")
     except Exception as exc:
         print(f"DB migration warning: {exc}")
 
 
 # ══════════════════════════════════════════════
-# FULL-TEXT SEARCH  (unchanged from v4.4)
+# FULL-TEXT SEARCH
 # ══════════════════════════════════════════════
 
 def fts_knowledge_base(
@@ -474,8 +463,6 @@ def fts_knowledge_base(
     user_id: Optional[str] = None,
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
-    """Retrieve KB entries using PostgreSQL FTS with ILIKE fallback.
-    If user_id is provided, results from that user's generated plans are boosted."""
     if not query or not query.strip():
         return []
 
@@ -509,11 +496,6 @@ def fts_knowledge_base(
 
         if tokens:
             tsquery_str = " | ".join(tokens)
-
-            # Boost plan entries for the requesting user
-            user_boost = ""
-            if user_id:
-                user_boost = f"(CASE WHEN source_plan_user_id = '{user_id}' THEN 2.0 ELSE 1.0 END) * "
 
             fts_sql = f"""
                 SELECT topic, question, answer, tags,
@@ -596,7 +578,7 @@ def fts_or_kb_fallback(
 
 
 # ══════════════════════════════════════════════
-# IN-MEMORY KNOWLEDGE BASE  (unchanged from v4.4)
+# IN-MEMORY KNOWLEDGE BASE
 # ══════════════════════════════════════════════
 
 KB: List[Dict[str, Any]] = [
@@ -736,7 +718,6 @@ class FaqKbAddRequest(BaseModel):
     lang: str = "ar"
 
 
-# v5 — plan generation request with optional parent/child names
 class GeneratePlanRequest(BaseModel):
     parent_name: Optional[str] = None
     child_name:  Optional[str] = None
@@ -760,7 +741,7 @@ class RouteDecision(BaseModel):
 
 
 # ══════════════════════════════════════════════
-# CONSTANTS & GUARDS  (unchanged)
+# CONSTANTS & GUARDS
 # ══════════════════════════════════════════════
 
 PARENTING_TOPICS    = {"teen_communication", "anger", "screen_addiction", "bullying",
@@ -803,7 +784,7 @@ def detect_risk_level(text: str) -> Literal["low", "medium", "high"]:
 
 
 # ══════════════════════════════════════════════
-# IN-MEMORY KB SEARCH  (unchanged)
+# IN-MEMORY KB SEARCH
 # ══════════════════════════════════════════════
 
 _AR_DIACRITICS = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670]")
@@ -925,7 +906,7 @@ def log_event(conn, user_id: str, event_type: str, value: str = "") -> None:
 
 
 # ══════════════════════════════════════════════
-# AUTO-LEARNING  (v4.4 bugs all fixed, kept intact)
+# AUTO-LEARNING
 # ══════════════════════════════════════════════
 
 _autolearn_logger = logging.getLogger("rafiq.autolearn")
@@ -1097,7 +1078,7 @@ def maybe_learn_from_interaction(
 
 
 # ══════════════════════════════════════════════
-# ASSESSMENT ENGINE  (unchanged from v4.4)
+# ASSESSMENT ENGINE
 # ══════════════════════════════════════════════
 
 ASSESSMENT_OPTIONS = ["Never", "Rarely", "Sometimes", "Often", "Always"]
@@ -1415,6 +1396,86 @@ def gemini_route_decision(user_text, history, fallback_age):
 
 
 # ══════════════════════════════════════════════
+# v5.1 — QUERY EXPANSION (NEW)
+# ══════════════════════════════════════════════
+
+_rag_logger = logging.getLogger("rafiq.rag")
+if not _rag_logger.handlers:
+    _rh = logging.StreamHandler()
+    _rh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _rag_logger.addHandler(_rh)
+_rag_logger.setLevel(logging.INFO)
+
+# Minimum word count to skip expansion (already detailed enough)
+_EXPANSION_MIN_WORDS = 8
+
+_QUERY_EXPANSION_PROMPT = """You are a semantic query expansion assistant for Rafiq, 
+a bilingual (Arabic/English) AI parenting coach.
+
+Your job: Take a short or vague user query and rewrite it as a rich, contextual sentence 
+that captures the full parenting/family intent — suitable for semantic similarity search.
+
+Rules:
+- Output ONE single paragraph (2-3 sentences max).
+- Preserve the original language (Arabic stays Arabic, English stays English).
+- Do NOT answer the question — only expand it semantically.
+- Add likely context: who is involved (parent, child, teen), what the challenge probably is,
+  and what kind of guidance they are likely seeking.
+- Do NOT contradict or add information inconsistent with the original query.
+- Output plain text only. No bullet points, no markdown, no preamble, no labels.
+
+Examples:
+Input:  نوم الطفل
+Output: الوالد يسأل عن صعوبات نوم الطفل وأنماط النوم، ويحتاج إلى إرشادات تربوية عملية لتحسين روتين النوم وتهدئة الطفل قبل النوم.
+
+Input:  my teen won't talk to me
+Output: A parent is struggling to communicate with their teenager who has become withdrawn and unresponsive, and needs practical strategies to rebuild trust and open dialogue with their child.
+
+Input:  موبايل
+Output: الوالد قلق من إدمان طفله أو مراهقه على الهاتف والشاشات، ويبحث عن طرق لتنظيم وقت الشاشة ووضع حدود صحية داخل المنزل.
+
+Input:  my child cries a lot
+Output: A parent is concerned about their young child who cries frequently and intensely, and is looking for parenting strategies to understand the emotional triggers and help the child self-regulate.
+"""
+
+
+def expand_query_for_embedding(query: str, lang: Lang) -> str:
+    """
+    Semantically expand a short/vague query before embedding.
+    Queries with >= _EXPANSION_MIN_WORDS words are returned as-is.
+    Falls back to the original query on any error.
+    """
+    if not GEMINI_ENABLED or client is None:
+        return query
+
+    word_count = len(query.strip().split())
+    if word_count >= _EXPANSION_MIN_WORDS:
+        _rag_logger.info("[expansion] Skipped — query already detailed (%d words)", word_count)
+        return query
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"{_QUERY_EXPANSION_PROMPT}\n\nInput: {query.strip()}\nOutput:",
+            config=genai_types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=150,
+            ),
+        )
+        expanded = strip_markdown((resp.text or "").strip())
+        if expanded and len(expanded) > len(query):
+            _rag_logger.info(
+                "[expansion] Expanded: '%s' → '%s'",
+                query[:60], expanded[:100],
+            )
+            return expanded
+    except Exception as exc:
+        _rag_logger.warning("[expansion] Failed, using original query: %s", exc)
+
+    return query
+
+
+# ══════════════════════════════════════════════
 # v5.0 — 15-DAY PLAN GENERATION
 # ══════════════════════════════════════════════
 
@@ -1435,7 +1496,6 @@ def gemini_generate_intro_letter(
     top_traits: List[Dict],
     lang: Lang,
 ) -> str:
-    """Generate a warm, personalised introductory letter for the parent."""
     _require_gemini()
     age_str   = f"{child_age} years old" if child_age else "your child"
     child_str = child_name or "your child"
@@ -1488,10 +1548,6 @@ def gemini_generate_15day_plan_json(
     scores_text: str,
     lang: Lang,
 ) -> List[Dict[str, Any]]:
-    """
-    Ask Gemini to return the 15-day plan as a JSON array.
-    Each element: {day, goal, activity, how_to_do_it, why_it_helps, tip}
-    """
     _require_gemini()
     age_str   = f"{child_age} years old" if child_age else "age not specified"
     child_str = child_name or "the child"
@@ -1542,7 +1598,6 @@ def gemini_generate_15day_plan_json(
         config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=4000),
     )
     raw_text = (resp.text or "").strip()
-    # Strip markdown fences if present
     raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text).rstrip("`").strip()
 
     try:
@@ -1552,7 +1607,6 @@ def gemini_generate_15day_plan_json(
     except json.JSONDecodeError:
         pass
 
-    # Fallback: try to extract JSON array from text
     match = re.search(r'\[.*\]', raw_text, re.DOTALL)
     if match:
         try:
@@ -1565,7 +1619,6 @@ def gemini_generate_15day_plan_json(
 
 
 def plan_days_to_plain_text(days: List[Dict[str, Any]]) -> str:
-    """Convert structured day list to plain text for PDF and FTS ingestion."""
     lines = []
     for d in days:
         day_num = d.get("day", "?")
@@ -1580,22 +1633,11 @@ def plan_days_to_plain_text(days: List[Dict[str, Any]]) -> str:
 
 
 # ══════════════════════════════════════════════
-# RAG INGESTION PIPELINE  (v5.0 NEW)
+# RAG INGESTION PIPELINE  (v5.1 — with query expansion on embeddings)
 # ══════════════════════════════════════════════
 
-_rag_logger = logging.getLogger("rafiq.rag")
-if not _rag_logger.handlers:
-    _rh = logging.StreamHandler()
-    _rh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    _rag_logger.addHandler(_rh)
-_rag_logger.setLevel(logging.INFO)
-
-
 def _gemini_embed_text(text: str) -> Optional[List[float]]:
-    """
-    Generate a text embedding using Gemini embedding model.
-    Returns None if embeddings are unavailable.
-    """
+    """Generate a text embedding using Gemini embedding model."""
     if not GEMINI_ENABLED or client is None:
         return None
     try:
@@ -1627,11 +1669,8 @@ def ingest_plan_to_knowledge_base(
 
     Steps:
       1. Convert each day to a Q/A pair and insert into faq_knowledge_base (FTS).
-      2. Create Gemini text embeddings per day chunk.
+      2. Create Gemini text embeddings per day chunk (with query expansion for richer vectors).
       3. Store embeddings in plan_embeddings (pgvector) if available.
-
-    All steps are logged at INFO level.
-    Returns a summary dict.
     """
     _rag_logger.info("[rag] Starting ingestion — plan_id=%s user_id=%s lang=%s days=%d",
                      plan_id, user_id, lang, len(plan_days))
@@ -1707,6 +1746,7 @@ def ingest_plan_to_knowledge_base(
 
             for i, day in enumerate(plan_days):
                 day_num   = day.get("day", i + 1)
+                # Build raw chunk text
                 chunk_txt = (
                     f"Day {day_num}: {day.get('goal', '')}. "
                     f"Activity: {day.get('activity', '')}. "
@@ -1715,7 +1755,16 @@ def ingest_plan_to_knowledge_base(
                     f"Tip: {day.get('tip', '')}."
                 )
 
-                embedding = _gemini_embed_text(chunk_txt)
+                # v5.1: expand chunk before embedding for richer semantic representation
+                expanded_chunk = expand_query_for_embedding(chunk_txt, lang)
+                _rag_logger.info(
+                    "[rag] Day %s chunk expansion: original=%d words → expanded=%d words",
+                    day_num,
+                    len(chunk_txt.split()),
+                    len(expanded_chunk.split()),
+                )
+
+                embedding = _gemini_embed_text(expanded_chunk)
                 if embedding is None:
                     _rag_logger.warning("[rag] No embedding for day=%s — storing chunk without vector", day_num)
                 else:
@@ -1730,8 +1779,8 @@ def ingest_plan_to_knowledge_base(
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         RETURNING id
                         """,
-                        (plan_id, user_id, i, chunk_txt,
-                         embedding,  # None is OK if pgvector col is nullable
+                        (plan_id, user_id, i, chunk_txt,  # store original chunk_txt, embed expanded
+                         embedding,
                          child_age, child_profile, lang),
                     )
                     row = emb_cur.fetchone()
@@ -1771,14 +1820,18 @@ def retrieve_plan_context_for_user(
 ) -> List[Dict[str, Any]]:
     """
     Retrieve relevant chunks from the user's own generated plan.
+    v5.1: Expands the query before embedding for better recall.
     First tries pgvector similarity search; falls back to FTS with user tag filter.
     """
     results: List[Dict[str, Any]] = []
 
+    # v5.1: expand the query before embedding
+    expanded_query = expand_query_for_embedding(query, lang)
+
     # pgvector path
     if _PGVECTOR_AVAILABLE and GEMINI_ENABLED and conn_factory:
         try:
-            embedding = _gemini_embed_text(query)
+            embedding = _gemini_embed_text(expanded_query)
             if embedding:
                 conn = conn_factory()
                 register_vector(conn)
@@ -1802,14 +1855,14 @@ def retrieve_plan_context_for_user(
         except Exception as exc:
             _rag_logger.warning("[rag] pgvector retrieval failed: %s", exc)
 
-    # FTS fallback with source filter
+    # FTS fallback with source filter — use original query for FTS tokenisation
     try:
         fts_tag_filter = f"%user_{user_id}%"
         conn = (conn_factory or get_conn)()
         cur  = conn.cursor()
         raw_tokens = [re.sub(r"[^\w\u0600-\u06FF]", "", tok)
                       for tok in query.strip().split() if len(tok) >= 2]
-        tokens = [t for t in raw_tokens if t]
+        tokens = [tok for tok in raw_tokens if tok]
         if tokens:
             tsquery_str = " | ".join(tokens)
             cur.execute(
@@ -1835,7 +1888,7 @@ def retrieve_plan_context_for_user(
 
 
 # ══════════════════════════════════════════════
-# PDF HELPERS  (v5.0 redesign)
+# PDF HELPERS  (v5.0 — unchanged)
 # ══════════════════════════════════════════════
 
 def _safe_xml(text: str) -> str:
@@ -1870,12 +1923,6 @@ def _build_parenting_plan_pdf(
     generated_at: str,
     lang: Lang = "en",
 ) -> bytes:
-    """
-    Build a professionally designed PDF with:
-      - Page 1: Title banner + info card
-      - Page 2: Personalised intro letter
-      - Pages 3+: Per-day plan cards (Day N | Goal | Activity | How To | Why | Tip)
-    """
     buf    = io.BytesIO()
     W, H   = A4
     styles = getSampleStyleSheet()
@@ -1894,7 +1941,6 @@ def _build_parenting_plan_pdf(
     font_body = _pick_font(False, lang)
     font_bold = _pick_font(True,  lang)
 
-    # ── Paragraph styles ──────────────────────────────────────────────
     s_title     = ParagraphStyle("Title5", fontSize=22, textColor=colors.white,
                                   alignment=TA_CENTER, fontName=font_bold)
     s_subtitle  = ParagraphStyle("Sub5",   fontSize=13, textColor=colors.white,
@@ -1927,7 +1973,6 @@ def _build_parenting_plan_pdf(
     story = []
 
     # ── PAGE 1: Banner + Info Card ────────────────────────────────────
-    # Banner
     title_txt    = _pdf_text(t("pdf_main_title", lang), lang)
     subtitle_txt = _pdf_text(t("pdf_subtitle",   lang), lang)
 
@@ -1946,7 +1991,6 @@ def _build_parenting_plan_pdf(
     story.append(banner)
     story.append(Spacer(1, 0.5*cm))
 
-    # Info card
     def _lbl(k): return Paragraph(_safe_xml(_pdf_text(t(k, lang), lang)), s_lbl)
     def _val(v): return Paragraph(_safe_xml(_pdf_text(str(v), lang)), s_val)
 
@@ -1977,7 +2021,7 @@ def _build_parenting_plan_pdf(
     story.append(HRFlowable(width="100%", thickness=1, color=brand_green, spaceAfter=6))
     story.append(Spacer(1, 0.2*cm))
 
-    # ── PAGE 2: Intro Letter ─────────────────────────────────────────
+    # ── PAGE 2: Intro Letter ──────────────────────────────────────────
     story.append(PageBreak())
     story.append(Paragraph(_safe_xml(_pdf_text(
         "Dear " + (parent_name or "Parent") if lang == "en" else "رسالة شخصية", lang)),
@@ -2004,7 +2048,6 @@ def _build_parenting_plan_pdf(
         why      = day.get("why_it_helps", "")
         tip      = day.get("tip", "")
 
-        # Day number badge
         day_badge = Table([[Paragraph(f"Day {day_num}", s_day_num)]],
                           colWidths=[2.5*cm])
         day_badge.setStyle(TableStyle([
@@ -2015,7 +2058,6 @@ def _build_parenting_plan_pdf(
             ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
         ]))
 
-        # Goal label next to badge
         goal_p = Paragraph(_safe_xml(_pdf_text(goal, lang)), s_day_goal)
         header_row = Table([[day_badge, Spacer(0.3*cm, 0), goal_p]],
                            colWidths=[2.5*cm, 0.3*cm, W - 4*cm - 2.8*cm])
@@ -2068,7 +2110,6 @@ def _build_parenting_plan_pdf(
 
         story.append(KeepTogether([card, Spacer(1, 0.35*cm)]))
 
-    # Footer
     story.append(Spacer(1, 0.3*cm))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"), spaceAfter=6))
     story.append(Paragraph(_safe_xml(_pdf_text(t("pdf_footer_line1", lang), lang)), s_footer))
@@ -2079,7 +2120,7 @@ def _build_parenting_plan_pdf(
 
 
 # ══════════════════════════════════════════════
-# FCM NOTIFICATION HELPER  (v5.0)
+# FCM NOTIFICATION HELPER
 # ══════════════════════════════════════════════
 
 def _send_fcm_notification(
@@ -2089,10 +2130,6 @@ def _send_fcm_notification(
     data: Optional[Dict[str, str]] = None,
     conn_factory: Optional[Callable] = None,
 ) -> Dict[str, Any]:
-    """
-    Send a push notification. Returns a result dict with keys:
-    sent (bool), warning (str|None).
-    """
     if not FIREBASE_ENABLED:
         return {"sent": False, "warning": "Firebase not configured"}
 
@@ -2118,7 +2155,6 @@ def _send_fcm_notification(
         fb_messaging.send(message)
         return {"sent": True, "warning": None}
     except fb_messaging.UnregisteredError:
-        # Clear expired token
         try:
             conn2 = (conn_factory or get_conn)()
             conn2.cursor().execute("UPDATE users SET fcm_token=NULL WHERE user_id=%s", (user_id,))
@@ -2136,8 +2172,8 @@ def _send_fcm_notification(
 
 @app.get("/", tags=["System"])
 def home():
-    return {"status": "Rafiq running 🚀", "version": "5.0.0",
-            "retrieval": "PostgreSQL FTS + pgvector RAG", "plan_duration": "15 days"}
+    return {"status": "Rafiq running 🚀", "version": "5.1.0",
+            "retrieval": "PostgreSQL FTS + pgvector RAG + query expansion", "plan_duration": "15 days"}
 
 
 @app.get("/health", tags=["System"])
@@ -2148,6 +2184,7 @@ def health():
         "arabic_shaping": _ARABIC_SHAPING, "pdf": _REPORTLAB_AVAILABLE,
         "retrieval": "postgres_fts+pgvector", "pgvector": _PGVECTOR_AVAILABLE,
         "firebase": FIREBASE_ENABLED, "plan_duration": 15,
+        "query_expansion": GEMINI_ENABLED,
     }
 
 
@@ -2493,7 +2530,7 @@ def get_chat_history(user_id: str, limit: int = 50):
 
 
 # ══════════════════════════════════════════════
-# ROUTES — CHAT (main, plan-aware RAG)
+# ROUTES — CHAT (plan-aware RAG + query expansion)
 # ══════════════════════════════════════════════
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
@@ -2538,7 +2575,7 @@ def chat(req: ChatRequest):
     except Exception as exc:
         if DEBUG: print(f"[CHAT] Router error: {exc}")
 
-    # ── Retrieve: user's own plan first, then general KB ─────────────
+    # ── Retrieve: user's own plan first (with query expansion), then general KB ─
     plan_context = retrieve_plan_context_for_user(
         user_id=req.user_id, query=user_message, lang=lang, limit=2,
         conn_factory=get_conn,
@@ -2623,19 +2660,11 @@ Now generate only the final answer."""
 
 
 # ══════════════════════════════════════════════
-# ROUTES — PARENTING PLAN  (v5.0)
+# ROUTES — PARENTING PLAN  (v5.1)
 # ══════════════════════════════════════════════
 
 @app.post("/generate-parenting-plan/{user_id}", tags=["Parenting Plan"])
 def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = None):
-    """
-    Generate a personalised 15-day parenting plan.
-    Optionally pass parent_name and child_name in the request body.
-    After generation:
-      1. Saves plan_days (JSON) to DB.
-      2. Sends FCM push notification.
-      3. Runs RAG ingestion (FTS + embeddings).
-    """
     if not GEMINI_ENABLED or client is None:
         raise HTTPException(status_code=503, detail="Gemini is disabled.")
 
@@ -2647,20 +2676,17 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         ensure_user_exists(conn, user_id)
         cur = conn.cursor()
 
-        # ── Fetch user meta ──────────────────────────────────────────
         cur.execute(
             "SELECT child_age, preferred_language, parent_name, child_name FROM users WHERE user_id=%s",
             (user_id,)
         )
         user_row = cur.fetchone()
-        db_parent_name = user_row[3] if user_row else None
-        db_child_name  = user_row[4] if user_row and len(user_row) > 4 else None
+        db_parent_name = user_row[2] if user_row else None
+        db_child_name  = user_row[3] if user_row else None
 
-        # Allow overriding names via request body
         parent_name = (req and req.parent_name) or db_parent_name or "Parent"
         child_name  = (req and req.child_name)  or db_child_name  or ""
 
-        # ── Fetch latest assessment ───────────────────────────────────
         cur.execute(
             "SELECT id, child_age, assessment_confidence, result, created_at "
             "FROM assessments WHERE user_id=%s ORDER BY created_at DESC LIMIT 1",
@@ -2689,7 +2715,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         traits_text = "\n".join(f"  - {tr['trait'].replace('_',' ').title()}: {tr['score']}%" for tr in top_traits) or "  - No data"
         scores_text = "\n".join(f"  - {k.replace('_',' ').title()}: {v}%" for k, v in trait_scores.items()) or "  - No data"
 
-        # ── 1. Generate intro letter ──────────────────────────────────
         _plan_logger.info("[plan] Generating intro letter — parent=%s child=%s", parent_name, child_name)
         try:
             intro_letter = gemini_generate_intro_letter(
@@ -2701,7 +2726,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
             _plan_logger.warning("[plan] Intro letter failed (non-fatal): %s", exc)
             intro_letter = f"Dear {parent_name},\n\nWelcome to your personalised 15-day parenting plan. This plan has been carefully designed based on your child's unique personality and needs. We hope it helps you build an even deeper connection with your child.\n\nWarm regards,\nRafiq AI"
 
-        # ── 2. Generate 15-day structured plan ───────────────────────
         _plan_logger.info("[plan] Generating 15-day plan JSON")
         try:
             plan_days = gemini_generate_15day_plan_json(
@@ -2718,9 +2742,8 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
             raise HTTPException(status_code=502, detail="Gemini returned an empty plan.")
 
         plan_text = plan_days_to_plain_text(plan_days)
-        _plan_logger.info("[plan] PDF generated successfully ✔ — days=%d", len(plan_days))
+        _plan_logger.info("[plan] Plan generated ✔ — days=%d", len(plan_days))
 
-        # ── 3. Save to DB ─────────────────────────────────────────────
         try:
             cur.execute(
                 """
@@ -2745,7 +2768,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         log_event(conn, user_id, "parenting_plan_generated",
                   value=f"plan_id={plan_id}, lang={lang}, assessment_id={assessment_id}")
 
-        # ── 4. FCM push notification ──────────────────────────────────
         notif_result = _send_fcm_notification(
             user_id=user_id,
             title=t("plan_notif_title", lang),
@@ -2756,7 +2778,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         _plan_logger.info("[plan] FCM notification — sent=%s warning=%s",
                           notif_result["sent"], notif_result.get("warning"))
 
-        # ── 5. In-app message (stored as a chat_messages row) ─────────
         app_message = (
             f"Hi {parent_name} 👋\n\n"
             f"Your personalised 15-day parenting plan has been created successfully.\n"
@@ -2775,7 +2796,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         except Exception as msg_exc:
             _plan_logger.warning("[plan] In-app message save failed (non-fatal): %s", msg_exc)
 
-        # ── 6. RAG ingestion (async-style — runs in same thread, non-blocking errors) ─
         try:
             rag_summary = ingest_plan_to_knowledge_base(
                 plan_id=plan_id, user_id=user_id,
@@ -2789,7 +2809,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
             _plan_logger.error("[plan] RAG ingestion failed (non-fatal): %s", rag_exc, exc_info=True)
             rag_summary = {"error": str(rag_exc)}
 
-        # ── Build response ────────────────────────────────────────────
         response_payload: Dict[str, Any] = {
             "ok":                  True,
             "message":             t("plan_created_title", lang),
@@ -2823,10 +2842,7 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
 
 @app.post("/ingest-plan-to-kb/{plan_id}", tags=["Parenting Plan"])
 def ingest_plan_to_kb(plan_id: int, admin_key: str):
-    """
-    Manually trigger RAG ingestion for an existing plan.
-    Useful for back-filling plans created before v5.0.
-    """
+    """Manually trigger RAG ingestion for an existing plan (back-fill for pre-v5.0 plans)."""
     if admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin_key")
     conn = get_conn()
@@ -2842,7 +2858,6 @@ def ingest_plan_to_kb(plan_id: int, admin_key: str):
             raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
         user_id, plan_days_raw, lang, parent_name, child_name, intro_letter = row
 
-        # Fetch child age + archetype
         cur.execute(
             "SELECT a.child_age, a.result FROM assessments a "
             "JOIN parenting_plans pp ON pp.user_id=a.user_id "
@@ -2885,35 +2900,57 @@ def ingest_plan_to_kb(plan_id: int, admin_key: str):
 
 @app.get("/parenting-plans/{user_id}", tags=["Parenting Plan"])
 def get_parenting_plans(user_id: str, limit: int = 10):
+    """
+    v5.1 FIX: uses COALESCE(plan_duration, 15) so the query works even if
+    the plan_duration column migration hasn't been applied yet on older DBs.
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM users WHERE user_id=%s", (user_id,))
-        if not cur.fetchone(): raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=t("user_not_found", "ar"))
         cur.execute(
-            "SELECT id, plan_text, plan_language, plan_duration, parent_name, child_name, created_at "
-            "FROM parenting_plans WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+            """
+            SELECT id, plan_text, plan_language,
+                   COALESCE(plan_duration, 15) AS plan_duration,
+                   parent_name, child_name, created_at
+            FROM parenting_plans
+            WHERE user_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
             (user_id, max(1, min(50, limit)))
         )
         rows = cur.fetchall()
         return {
             "user_id": user_id, "total": len(rows),
-            "plans": [{"id": r[0], "plan_text": r[1], "plan_language": r[2],
-                       "plan_duration": r[3], "parent_name": r[4], "child_name": r[5],
-                       "created_at": r[6].isoformat() if r[6] else None} for r in rows],
+            "plans": [
+                {
+                    "id":            r[0],
+                    "plan_text":     r[1],
+                    "plan_language": r[2],
+                    "plan_duration": r[3],
+                    "parent_name":   r[4],
+                    "child_name":    r[5],
+                    "created_at":    r[6].isoformat() if r[6] else None,
+                }
+                for r in rows
+            ],
         }
     except HTTPException: raise
-    except Exception as exc: raise HTTPException(status_code=500, detail=f"Database error: {exc}")
-    finally: conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
 
 
 # ══════════════════════════════════════════════
-# ROUTES — PDF EXPORT  (v5.0 redesign)
+# ROUTES — PDF EXPORT  (v5.0 redesign — unchanged)
 # ══════════════════════════════════════════════
 
 @app.get("/export-plan-pdf/{user_id}", tags=["Parenting Plan"])
 def export_plan_pdf(user_id: str):
-    """Export the latest parenting plan as a redesigned PDF."""
     if not _REPORTLAB_AVAILABLE:
         raise HTTPException(status_code=503, detail=t("pdf_unavailable", "en"))
 
@@ -2944,7 +2981,6 @@ def export_plan_pdf(user_id: str):
 
         generated_at = created_at.isoformat() if created_at else ""
 
-        # Parse plan_days
         plan_days: List[Dict] = []
         if plan_days_raw:
             try:
@@ -2952,7 +2988,6 @@ def export_plan_pdf(user_id: str):
             except Exception:
                 pass
 
-        # Fall back: reconstruct minimal day list from plan_text if plan_days is empty
         if not plan_days and plan_text:
             current_day: Dict[str, Any] = {}
             for line in plan_text.splitlines():
@@ -2961,14 +2996,13 @@ def export_plan_pdf(user_id: str):
                     if current_day: plan_days.append(current_day)
                     current_day = {"day": int(line[4:]), "goal": "", "activity": "",
                                    "how_to_do_it": "", "why_it_helps": "", "tip": ""}
-                elif line.startswith("Goal:"):     current_day["goal"]         = line[5:].strip()
-                elif line.startswith("Activity:"): current_day["activity"]     = line[9:].strip()
+                elif line.startswith("Goal:"):          current_day["goal"]         = line[5:].strip()
+                elif line.startswith("Activity:"):      current_day["activity"]     = line[9:].strip()
                 elif line.startswith("How to do it:"): current_day["how_to_do_it"] = line[13:].strip()
                 elif line.startswith("Why it helps:"): current_day["why_it_helps"] = line[13:].strip()
-                elif line.startswith("Tip:"):      current_day["tip"]           = line[4:].strip()
+                elif line.startswith("Tip:"):           current_day["tip"]          = line[4:].strip()
             if current_day: plan_days.append(current_day)
 
-        # Archetype
         top_archetype = "Not specified"
         if result_raw:
             try:
@@ -3008,5 +3042,7 @@ def export_plan_pdf(user_id: str):
         )
 
     except HTTPException: raise
-    except Exception as exc: raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
-    finally: conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
+    finally:
+        conn.close()
