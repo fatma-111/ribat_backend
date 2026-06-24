@@ -1138,7 +1138,7 @@ def gemini_generate_15day_plan(
 
     resp = client.models.generate_content(
         model=GEMINI_MODEL, contents=prompt,
-        config=genai_types.GenerateContentConfig(temperature=0.6, max_output_tokens=4000),
+        config=genai_types.GenerateContentConfig(temperature=0.4, max_output_tokens=8000),
     )
     raw_text = (resp.text or "").strip()
     raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text).rstrip("`").strip()
@@ -1149,32 +1149,59 @@ def gemini_generate_15day_plan(
     print("=" * 60)
 
     plan_days: List[Dict[str, Any]] = []
+
     try:
         parsed = json.loads(raw_text)
+
         if isinstance(parsed, list) and len(parsed) > 0:
             plan_days = parsed
+
     except json.JSONDecodeError:
         match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+
         if match:
             try:
                 plan_days = json.loads(match.group(0))
             except Exception:
                 pass
 
+
+    # ── Fallback: Gemini returned normal text instead of JSON ────────────────
     if not plan_days:
-        _plan_logger.error("[plan] Gemini returned no parseable JSON. raw=%s", raw_text[:300])
-        raise HTTPException(status_code=502, detail="Gemini returned an empty or unparseable plan.")
+        _plan_logger.warning(
+            "[plan] Gemini did not return valid JSON. Saving raw response as text."
+        )
+
+        plan_text = raw_text
+
+        if not plan_text.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini returned empty response."
+            )
+
+        print("[PLAN] Using raw Gemini text as plan_text:")
+        print(plan_text[:600])
+        print("=" * 60)
+
+        return [], plan_text
+
 
     # Convert structured days to guaranteed non-empty plain text
     plan_text = _days_to_plain_text(plan_days)
 
     if not plan_text.strip():
-        raise HTTPException(status_code=502, detail="Plan text is empty after conversion.")
+        raise HTTPException(
+            status_code=502,
+            detail="Plan text is empty after conversion."
+        )
 
-    # ── DEBUG: print generated plan text ──────────────────────────────────────
+
+    # DEBUG
     print("[PLAN] Generated plan_text (first 600 chars):")
     print(plan_text[:600])
     print("=" * 60)
+
 
     return plan_days, plan_text
 
