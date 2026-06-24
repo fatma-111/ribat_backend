@@ -1995,7 +1995,7 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
 
         # ── Fetch user info ────────────────────────────────────────────────────
         cur.execute(
-            "SELECT child_age, preferred_language, parent_name, child_name "
+            "SELECT child_age, preferred_language"
             "FROM users WHERE user_id=%s",
             (user_id,),
         )
