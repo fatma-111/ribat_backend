@@ -498,10 +498,8 @@ def fts_knowledge_base(
             tsquery_str = " | ".join(tokens)
 
             fts_sql = f"""
-                SELECT topic, question, answer, tags,
-                       ts_rank_cd(search_vector, to_tsquery('simple', %s)) AS rank,
-                       source
-                FROM   faq_knowledge_base
+                SELECT id,question,answer,category
+                FROM faq_knowledge_base
                 WHERE  search_vector @@ to_tsquery('simple', %s)
                 {where_extra}
                 ORDER  BY rank DESC
