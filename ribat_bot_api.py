@@ -1993,18 +1993,22 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         ensure_user_exists(conn, user_id)
         cur = conn.cursor()
 
-        # ── Fetch user info ────────────────────────────────────────────────────
+        # ── Fetch user info (only columns that exist in users table) ──────────
         cur.execute(
-            "SELECT child_age, preferred_language"
+            "SELECT child_age, preferred_language "
             "FROM users WHERE user_id=%s",
             (user_id,),
         )
         user_row = cur.fetchone()
-        db_parent_name = user_row[2] if user_row else None
-        db_child_name  = user_row[3] if user_row else None
 
-        parent_name = (req and req.parent_name) or db_parent_name or "Parent"
-        child_name  = (req and req.child_name)  or db_child_name  or ""
+        child_age_from_user = user_row[0] if user_row else None
+        lang = (user_row[1] or "en") if user_row else "en"
+        if lang not in ("ar", "en"):
+            lang = "en"
+
+        # parent_name و child_name بييجوا من الـ request body بس
+        parent_name = (req and req.parent_name) or "Parent"
+        child_name  = (req and req.child_name)  or ""
 
         # ── Fetch latest assessment ────────────────────────────────────────────
         cur.execute(
@@ -2016,7 +2020,10 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         if not row:
             raise HTTPException(status_code=404, detail=t("no_assessment_found", lang))
 
-        assessment_id, child_age, assessment_confidence, result_raw, assessed_at = row
+        assessment_id, child_age_from_assessment, assessment_confidence, result_raw, assessed_at = row
+
+        # استخدم child_age من assessment أولاً، وإلا من users
+        child_age = child_age_from_assessment or child_age_from_user
 
         # ── Parse assessment result ────────────────────────────────────────────
         try:
@@ -2132,7 +2139,6 @@ def generate_parenting_plan(user_id: str, req: Optional[GeneratePlanRequest] = N
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
     finally:
         conn.close()
-
 
 @app.get("/parenting-plans/{user_id}", tags=["Parenting Plan"])
 def get_parenting_plans(user_id: str, limit: int = 10):
